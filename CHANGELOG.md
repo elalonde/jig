@@ -5,6 +5,54 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.4.0
+
+What changed: jig releases itself and other projects. `jig release <project>
+prepare` makes the release commit of the line (change log entry with its unit
+counts, version bump, push), waits for green CI on that commit, proves it from a
+clean clone with an offline build of the source archive, checks the release
+files, runs `jig terms check`, `jig privacy scan` and every row of `checks.tsv`,
+and stages the release files with `SHA256SUMS`. A rerun after a failed step
+works on the same release commit. `jig release <project> publish` tags the
+release in both repos, makes the GitHub release, reads it back without a login
+and moves master to the line; `publish --dry-run` prints each action and changes
+nothing; `verify <version>` compares the published files with the staged ones.
+`jig terms check` looks for the private terms in the product, its commit
+messages and built files; `jig privacy scan` looks for serials, host names,
+addresses, UUIDs and MAC addresses in fixtures and captures. `jig upgrade`
+downloads a release, checks it against its `SHA256SUMS` and installs it under
+`/opt/jig`; `jig changelog --since <version>` prints the entries after a
+version. The product gets the make targets `version-bump`, `package`,
+`package-check` and `source-archive`, and `install.sh` also installs from a
+package file. `jig new` gives a new product a CI workflow that runs
+`make check` on every push and makes the shared checks directory; `jig run-check`
+copies the exit code of a row of another account there, where prepare reads it;
+`jig orch` sends the reminders of the Open items of `state.md` that come due.
+`tools/ci-green --wait <seconds>` waits for the CI jobs of a commit. This is the
+first version published from the new public repository, whose history starts
+with one import commit.
+
+Files and formats: new `libexec/jig-release`, `libexec/jig-terms`,
+`libexec/jig-privacy`, `libexec/jig-upgrade`, `libexec/jig-changelog`,
+`lib/jig_package.py`, `lib/jig_push.py`, `tools/push-on-token.sh`, `VERSION`,
+`CHANGELOG.md`, `README.md`, `THIRD-PARTY-NOTICES` and `SOURCE-OFFER`. Changed:
+`Makefile`, `bin/jig` (changelog and upgrade always run from current),
+`tools/install.sh`, `tools/ci-green`, `lib/lint_a.py`, `libexec/jig-new`,
+`libexec/jig-run-check`, `libexec/jig-orch` and the templates of `jig new`, among
+them `.github/workflows/ci.yml` and the `Open` lines of `state.md` for the token
+and the logins. A release is staged in `~/ws/reviews/<project>/release/<X.Y.Z>/`.
+
+Migration: a host makes `/srv/jig/checks/<project>/` with the group `jig`, mode
+2775, before the first unit that runs a row of another account. A project that
+releases with jig gives its product the four make targets and a CI workflow, and
+the implementer account gets the project's token file and the push URL that
+`tools/push-on-token.sh` sets. A host moves to this version with
+`jig upgrade 0.4.0`.
+
+Requested by: Eric.
+
+Units: 6 minor, 2 patch, 17 none
+
 ## 0.3.0
 
 What changed: records and their trace. `jig trace` ties the record IDs of a
