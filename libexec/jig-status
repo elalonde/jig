@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Print one line per running unit of a project, or of every project with a conf file.
+
+usage: jig status [<project>]
+
+The fields, tab-separated under a header line: project, role, tmux (the session and
+live, ended or unreachable), started (from the lock), k/n (from the batch file, or "-"
+when there is none), last status (the last line of impl/log/status.log in this
+account's clone). A project with no running unit gets one line, with "-" for the role,
+tmux and started. The batch file is <JIG_BATCH_DIR>/<project>, /run/jig/batch by
+default; its first word is k/n. Exits 1 on a refusal, 2 on a usage error.
+"""
+
+import os
+import pathlib
+import re
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_units  # noqa: E402
+
+STATUS_LOG = "impl/log/status.log"
+FIELDS = ("project", "role", "tmux", "started", "k/n", "last status")
+PROGRESS = re.compile(r"[0-9]+/[0-9]+")
+
+
+def batch_progress(project):
+    path = pathlib.Path(os.environ.get("JIG_BATCH_DIR", "/run/jig/batch")) / project
+    try:
+        words = path.read_text(encoding="utf-8").split()
+    except OSError:
+        return "-"
+    return words[0] if words and PROGRESS.fullmatch(words[0]) else "-"
+
+
+def last_status(conf):
+    try:
+        text = (pathlib.Path(conf["REPO"]) / STATUS_LOG).read_text(encoding="utf-8")
+    except OSError:
+        return "-"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else "-"
+
+
+def project_rows(project):
+    conf = jig_units.read_conf(project)
+    progress = batch_progress(project)
+    status = last_status(conf)
+    units = jig_units.running_units(project)
+    if not units:
+        return [(project, "-", "-", "-", progress, status)]
+    rows = []
+    for running in units:
+        state = jig_units.session_state(running.account, running.session)
+        started = running.start.isoformat() if running.start else "-"
+        rows.append((project, running.role, f"{running.session} {state}", started, progress,
+                     status))
+    return rows
+
+
+def all_projects():
+    conf_dir = pathlib.Path(os.path.expanduser("~/.config/jig"))
+    return sorted(path.stem for path in conf_dir.glob("*.conf")
+                  if jig_units.PROJECT.fullmatch(path.stem))
+
+
+def main(argv):
+    if len(argv) > 1 or (argv and not jig_units.PROJECT.fullmatch(argv[0])):
+        print("usage: jig status [<project>]", file=sys.stderr)
+        return 2
+    projects = argv or all_projects()
+    rows = []
+    try:
+        for project in projects:
+            rows.extend(project_rows(project))
+    except jig_units.Refused as error:
+        print(f"jig status: {error}", file=sys.stderr)
+        return 1
+    print("\t".join(FIELDS))
+    for row in rows:
+        print("\t".join(row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

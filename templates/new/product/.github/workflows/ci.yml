@@ -1,0 +1,29 @@
+# Runs the product's whole check on every push, so that a red commit is seen at
+# once. Add here the other gates that the project gives to CI.
+name: ci
+
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      # git goes in first, so that the checkout makes a real clone, which make
+      # check needs to install the commit-msg hook.
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git make python3
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The container runs as root over a workspace that the runner owns, and git
+      # refuses such a clone unless it is marked as safe.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: make check
+        run: make check

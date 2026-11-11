@@ -1,0 +1,108 @@
+#!/bin/bash
+# Run a jig subcommand from the tree its project is pinned to, so a project in
+# the middle of a batch never sees new code.
+#
+# The pin is JIG_VERSION in ~/.config/jig/<project>.conf. The project is the
+# argument when there is one, else the -dev directory holding the working
+# directory. With no pin, the current version runs, and changelog and upgrade
+# always run from current. Before any version is installed, a source tree runs
+# its own subcommands.
+set -euo pipefail
+
+root=${JIG_ROOT:-/opt/jig}
+self_tree=$(dirname -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")")
+
+die() {
+    echo "jig: $*" >&2
+    exit 1
+}
+
+is_project() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+}
+
+# Print the word of the command line that names a project, if any.
+project_argument() {
+    case "${1:-}" in
+        trace | ctx | validate) ;;
+        terms | privacy) printf '%s' "${3:-}" ;;
+        *) printf '%s' "${2:-}" ;;
+    esac
+}
+
+# Print the project of the nearest -dev directory around the working directory.
+project_from_cwd() {
+    local dir base
+    dir=$(pwd -P 2>/dev/null) || return 0
+    while [ -n "$dir" ]; do
+        base=${dir##*/}
+        if [[ "$base" == *-dev ]] && is_project "${base%-dev}"; then
+            printf '%s' "${base%-dev}"
+            return 0
+        fi
+        dir=${dir%/*}
+    done
+}
+
+# Print the version a project is pinned to. The conf file is read, not sourced,
+# because dispatching must not run whatever that file holds.
+read_pin() {
+    local conf=$HOME/.config/jig/$1.conf value
+    [ -r "$conf" ] || return 0
+    value=$(sed -n 's/^JIG_VERSION=//p' "$conf" | tail -n 1)
+    # A comment or blanks after the value are not part of it, as in a shell.
+    value=${value%%#*}
+    value=${value%"${value##*[![:space:]]}"}
+    value=${value#[\"\']}
+    value=${value%[\"\']}
+    if [ -n "$value" ] && ! [[ "$value" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+        die "bad JIG_VERSION in $conf: $value"
+    fi
+    printf '%s' "$value"
+}
+
+project=$(project_argument "$@")
+if [ -z "$project" ] || ! is_project "$project"; then
+    project=$(project_from_cwd)
+fi
+# changelog and upgrade are about the installed versions, not about one project.
+# They run from current whatever the pin, because an older pinned version may not
+# have them, and the upgrade is what moves the pin.
+case "${1:-}" in
+    changelog | upgrade) project="" ;;
+esac
+
+pin=""
+if [ -n "$project" ]; then
+    pin=$(read_pin "$project")
+fi
+
+if [ -n "$pin" ]; then
+    tree=$root/$pin
+    # A missing pin is an error, not a reason to run some other version.
+    [ -d "$tree" ] || die "$project is pinned to $pin, which is not installed under $root"
+elif [ -d "$root/current" ]; then
+    tree=$(realpath -- "$root/current")
+elif [ -d "$self_tree/libexec" ]; then
+    tree=$self_tree
+else
+    die "no version installed under $root"
+fi
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: jig <subcommand> [<args>]    (tree: $tree)" >&2
+    for found in "$tree"/libexec/jig-*; do
+        [ -e "$found" ] && echo "  ${found##*/jig-}" >&2
+    done
+    exit 2
+fi
+
+subcommand=$1
+shift
+[[ "$subcommand" =~ ^[a-z][a-z0-9-]*$ ]] || die "bad subcommand: $subcommand"
+target=$tree/libexec/jig-$subcommand
+[ -x "$target" ] || die "no subcommand $subcommand in $tree"
+# An installed tree must stay as it was installed, so that installing the same
+# version again finds it equal; Python would add byte code to it.
+export PYTHONDONTWRITEBYTECODE=1
+exec "$target" "$@"

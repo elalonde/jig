@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Run one named check of a project inside a unit, and record its exit code in a file.
+
+usage: jig run-check <project> <name> [<word> ...]
+
+The checks are the rows of checks.tsv at the root of the project's -dev clone, the REPO
+of the conf file: name, command, account, time cap in seconds. The command is a shell
+command line; it runs with sh -c in that root, with the words after <name> quoted and
+appended, so that a unit can narrow a check to the parts it touched.
+
+A unit is a tmux session named <project>-<role>-<ID>, and the ID comes from that name,
+so this runs only inside such a session of the same project, and only a row of the
+account that runs it. The output goes to ~/ws/reviews/<project>/<ID>-<name>.txt, with
+the wall time of the run as its last line, and the exit code alone to
+~/ws/reviews/<project>/<ID>-<name>.exit, which jig report reads. A run that passes its
+cap is killed with its process group and records 124. This exits with the recorded
+code; a refusal writes no exit file and exits 1, or 2 for a usage error.
+
+A row of an account other than IMPL_ACCOUNT of the conf file (implementer when the file
+names none) also leaves a copy of its exit file in <root>/checks/<project>/<name>.exit,
+where the implementer, who does not run that row, reads it before a release. <root> is
+JIG_SRV, or /srv/jig. The copy holds two lines: the exit code, and the commit that HEAD
+of the -dev clone named when the check started, as 40 hex digits, so that the reader can
+tell whether the result still stands for the tree it releases. The copy of an earlier
+run is removed first, and the new one is written by a rename, as the exit file is. When
+the copy cannot be written, the exit file is still written, the reason goes to stderr,
+and this exits 1 whatever the check's code was, since the result did not reach its
+reader.
+"""
+
+import os
+import pathlib
+import pwd
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_ids  # noqa: E402
+import jig_units  # noqa: E402
+
+USAGE = "usage: jig run-check <project> <name> [<word> ...]"
+CHECK_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
+ROLES = ("spec", "impl", "rev")
+SESSION_NAME = re.compile(
+    rf"(?P<project>.+)-(?:{'|'.join(ROLES)})-(?P<id>{jig_ids.UNIT_ID.pattern})")
+
+# The code that timeout(1) gives for a command it stopped, so a reader knows it.
+TIMED_OUT = 124
+# A killed check gets this long after SIGTERM to clean up before SIGKILL.
+GRACE_SECONDS = 5
+SRV_ROOT = "/srv/jig"
+# The account the conf template names; a conf file that names none means it.
+DEFAULT_IMPL_ACCOUNT = "implementer"
+FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def unit_id(project):
+    """Return the ID of the unit whose tmux session this runs in, or refuse."""
+    if not os.environ.get("TMUX"):
+        jig_units.refuse("tmux", "not inside tmux; a check runs inside its unit's session")
+    shown = subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True,
+                           text=True, check=False)
+    session = shown.stdout.strip()
+    if shown.returncode != 0 or not session:
+        jig_units.refuse("tmux", "cannot read the tmux session name")
+    match = SESSION_NAME.fullmatch(session)
+    if not match:
+        jig_units.refuse("session", f"{session} is not a unit session <project>-<role>-<ID>")
+    if match["project"] != project:
+        jig_units.refuse("session", f"{session} is a session of {match['project']}, "
+                                    f"not of {project}")
+    return match["id"]
+
+
+def read_row(repo, name):
+    """Return the command, account and cap of the checks.tsv row of that name, or refuse."""
+    path = pathlib.Path(repo) / "checks.tsv"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        jig_units.refuse("row", f"cannot read {path}: {error.strerror}")
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if fields[0] != name:
+            continue
+        if len(fields) != 4 or not fields[3].isdigit() or int(fields[3]) == 0:
+            jig_units.refuse("row", f"the row {name} of {path} is not "
+                                    f"name, command, account, cap in seconds")
+        return fields[1], fields[2], int(fields[3])
+    jig_units.refuse("row", f"{path} has no row {name}")
+    return None
+
+
+def run(command, repo, output, cap):
+    """Run the command in its own process group; return its exit code and wall seconds."""
+    started = time.monotonic()
+    with open(output, "wb") as stream:
+        process = subprocess.Popen(["sh", "-c", command], cwd=repo, stdin=subprocess.DEVNULL,
+                                   stdout=stream, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            code = process.wait(timeout=cap)
+        except subprocess.TimeoutExpired:
+            # The group holds every process the command started, so none outlives the cap
+            # and keeps writing to the output or holding a lock.
+            kill_group(process)
+            code = TIMED_OUT
+    wall = time.monotonic() - started
+    # A signal shows as a negative code; the shell's 128 + signal is what a reader expects.
+    return (128 - code if code < 0 else code), wall
+
+
+def kill_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    # A process that ignored SIGTERM, or a child that outlived the shell, ends here.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def add_wall_line(output, wall):
+    with open(output, "rb+") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() > 0:
+            stream.seek(-1, os.SEEK_END)
+            if stream.read(1) != b"\n":
+                stream.write(b"\n")
+        stream.write(f"wall: {round(wall)}s\n".encode())
+
+
+def write_exit(path, code):
+    """Write the exit file by a rename, so that a reader never sees half of it."""
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(f"{code}\n", encoding="utf-8")
+    partial.replace(path)
+
+
+def head_commit(repo):
+    """Return the commit that HEAD of the clone names, or None when git cannot say."""
+    shown = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, check=False)
+    commit = shown.stdout.strip()
+    return commit if shown.returncode == 0 and FULL_COMMIT.fullmatch(commit) else None
+
+
+def write_copy(path, code, commit):
+    """Write the copy for the other account's reader; return the reason it failed, or None."""
+    if commit is None:
+        return f"cannot write {path}: cannot read the head commit of the -dev clone"
+    # A name of this run's own, so that a partial file another account left behind
+    # cannot block the write.
+    partial = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            # The umask may take the group's read bit away; the reader is in the group.
+            os.fchmod(stream.fileno(), 0o664)
+            stream.write(f"{code}\n{commit}\n")
+        os.replace(partial, path)
+    except OSError as error:
+        partial.unlink(missing_ok=True)
+        return f"cannot write {path}: {error.strerror}"
+    return None
+
+
+def run_check(project, name, words):
+    unit = unit_id(project)
+    conf = jig_units.read_conf(project)
+    repo = conf["REPO"]
+    command, account, cap = read_row(repo, name)
+    current = pwd.getpwuid(os.getuid()).pw_name
+    if account != current:
+        jig_units.refuse("account", f"the row {name} runs in the account {account}, "
+                                    f"not in {current}")
+    if words:
+        command = f"{command} {shlex.join(words)}"
+
+    reviews = pathlib.Path(os.path.expanduser(f"~/ws/reviews/{project}"))
+    exit_file = reviews / f"{unit}-{name}.exit"
+    output = reviews / f"{unit}-{name}.txt"
+    try:
+        reviews.mkdir(parents=True, exist_ok=True)
+        # An exit file of an earlier run would stand for this one if this run died.
+        exit_file.unlink(missing_ok=True)
+    except OSError as error:
+        jig_units.refuse("reviews", f"cannot prepare {reviews}: {error.strerror}")
+
+    copy, commit = None, None
+    if account != (conf.get("IMPL_ACCOUNT") or DEFAULT_IMPL_ACCOUNT):
+        root = pathlib.Path(os.environ.get("JIG_SRV") or SRV_ROOT)
+        copy = root / "checks" / project / f"{name}.exit"
+        commit = head_commit(repo)
+        # A copy of an earlier run would stand for this one if this run died. When it
+        # cannot be removed, the write after the run fails the same way and says why.
+        try:
+            copy.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    code, wall = run(command, repo, output, cap)
+    add_wall_line(output, wall)
+    write_exit(exit_file, code)
+    print(f"jig run-check: {name} exited {code} in {round(wall)}s; output in {output}")
+    if copy is None:
+        return code
+    problem = write_copy(copy, code, commit)
+    if problem:
+        print(f"jig run-check: {problem}", file=sys.stderr)
+        return 1
+    print(f"jig run-check: copy of the exit file in {copy}")
+    return code
+
+
+def main(argv):
+    if len(argv) < 2 or not jig_units.PROJECT.fullmatch(argv[0]) \
+            or not CHECK_NAME.fullmatch(argv[1]):
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        return run_check(argv[0], argv[1], argv[2:])
+    except jig_units.Refused as error:
+        print(f"jig run-check: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

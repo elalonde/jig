@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Hold a project's batch, so that jig batch starts no further unit.
+
+usage: jig hold <project>
+       jig unhold <project>
+
+jig hold writes the hold file <JIG_HOLD_DIR>/<project>, /run/jig/hold by default,
+which jig batch checks before each start; the unit that runs goes on to its report.
+jig unhold removes the file. The host makes the hold directory at boot. Running
+either one twice is harmless: the second run says the state is already set.
+Exits 0 when the hold is set or cleared, 1 on a refusal, 2 on a usage error.
+"""
+
+import argparse
+import datetime
+import os
+import pathlib
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_units  # noqa: E402
+
+
+def hold_file(project):
+    return pathlib.Path(os.environ.get("JIG_HOLD_DIR", "/run/jig/hold")) / project
+
+
+def parse_args(argv, name):
+    parser = argparse.ArgumentParser(prog=name)
+    parser.add_argument("project")
+    args = parser.parse_args(argv)
+    if not jig_units.PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    return args
+
+
+def hold(project):
+    path = hold_file(project)
+    if path.exists():
+        print(f"jig hold: {project} is held already ({path})")
+        return 0
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        path.write_text(f"held {now}\n", encoding="utf-8")
+    except OSError as error:
+        print(f"jig hold: refused: cannot write {path}: {error.strerror}", file=sys.stderr)
+        return 1
+    print(f"jig hold: {project} is held; jig batch starts no further unit ({path})")
+    return 0
+
+
+def unhold(project):
+    path = hold_file(project)
+    if not path.exists():
+        print(f"jig unhold: {project} is not held")
+        return 0
+    try:
+        path.unlink()
+    except OSError as error:
+        print(f"jig unhold: refused: cannot remove {path}: {error.strerror}", file=sys.stderr)
+        return 1
+    print(f"jig unhold: {project} is no longer held")
+    return 0
+
+
+def main(argv, clear=False):
+    args = parse_args(argv, "jig unhold" if clear else "jig hold")
+    return unhold(args.project) if clear else hold(args.project)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

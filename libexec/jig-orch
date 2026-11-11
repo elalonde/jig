@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""The supervisor of a project's orchestrator session.
+
+usage: jig orch <project> start | stop | status
+
+  start   refuses when impl/orch/ORCHESTRATOR.md is not in the project's clone, when a
+          loop already runs, or when tmux session <project>-orch exists already; else it
+          starts the loop in the background
+  stop    ends the loop and the session the loop started
+  status  exit 0 when a loop runs, 3 when none does; with the last line of its log
+
+  1  a refusal; 2 a usage error
+
+The loop starts Claude Code in tmux <project>-orch, Opus at high effort, with
+ORCHESTRATOR.md as its first message, --remote-control <project>-orch and the
+orchestrator's directories as --add-dir. When the session exits, the loop copies its
+transcript and starts it again; the third exit in 10 minutes stops the loop instead.
+
+Forks of the old session. A session that exits while it still has background work can
+be carried on by Claude Code with Remote Control in a background process, started with
+--fork-session --resume and the old transcript; that process would act on the project
+beside the new session. So when the session exits, and for JIG_ORCH_FORK_WINDOW seconds
+after the new session starts, the loop sends SIGTERM to each process of its own account
+that has the argument --resume followed by the old session's ID or by a path that ends
+in /<ID>.jsonl, and logs one line with its pid and the old ID. A process that ends
+before the signal is no failure. It touches no other process, also none that resumes
+another session.
+
+New files. The loop sends one line into the session for each new file in
+<root>/in/<project>/ (inbox: <file> (<bytes>, sha256 <8 hex>)) and for each readback, the
+output file that jig run writes for a block, in <root>/out/<project>/ (readback: <ID>).
+A line goes out once the file has held still for one poll. A file is new when its path,
+inode or modification time differs from those of the file last announced at that path:
+a readback written again gets a second line, an inbox file that grew may get one, and a
+file removed and written again is new. orch/announced keeps the path, inode and
+modification time of each announced file, so a file that lands while no loop runs is
+announced at the next start. At the first start, with no record yet, the files already
+there are taken as announced. A record line of the older form, a path alone, stands for
+the file that is at that path now, so an upgrade announces nothing again.
+
+Reports. Every JIG_ORCH_REPORT_POLL seconds the loop fetches the branch BRANCH of the
+conf file from origin of the project's clone, into refs/jig-orch/<BRANCH> only, and
+sends "report: <ID> <status>" for each new commit whose subject is exactly "log: <ID>",
+the commit that ends a unit. The status is the text before the first colon of line 1 of
+impl/log/<ID>-report.md at that commit (the whole line when it has no colon), read as
+jig close reads it, or "unreadable" when the file cannot be read. The fetch moves no
+other ref and writes no FETCH_HEAD, so it never disturbs a fetch of the same clone by
+jig wait, jig batch or a person. A fetch that fails, or that takes longer than 30 s (or
+the report poll, when that is shorter), is logged once for each run of failures and
+tried again at the next poll. orch/reported keeps the commits announced, so each gets
+one line across restarts. With no record yet, the first fetch that works takes the log
+commits already on origin as announced, except those whose commit time is at or after
+the loop's start, so a report that lands while the first fetches fail is not lost.
+
+Hourly. Every JIG_ORCH_HOURLY seconds the loop ticks, and each tick does one of two
+things. When something changed since the last tick, the tick queues the line "hourly
+update", which asks the orchestrator to write its update; the queue holds at most one
+such line, so ticks while a dialog shows add none. When nothing changed, the tick does
+not wake the model: it appends one idle line to impl/orch/updates.log in the project's
+clone, and sends nothing. Something changed when the loop delivered an inbox, readback
+or report line into the session (a line not delivered, and the hourly update line
+itself, do not count), or when refs/jig-orch/<BRANCH> moved and git diff --name-only
+from its last position names a file other than impl/orch/updates.log. The first fetch
+that works only sets that position, as it sets the report record; a failed fetch
+changes nothing. The idle line reads
+
+  <date -Iseconds> idle: waits for <what> since <time>
+
+where <what> is "unit <ID>" when the newest line of impl/log/status.log at the fetched
+ref starts a unit ("<time> <ID> start started <commit>"; jig close ends it with
+"<time> <ID> end <status> <commit>"), and "the orchestrator" otherwise; <time> is the
+last change, or the start of the loop when there was none. The loop only appends to
+the file and never commits it: the orchestrator commits it with its next commit, and
+jig start, jig close and jig report work beside the uncommitted change.
+
+Reminders. At its start and at each hourly tick the loop reads impl/orch/state.md in the
+project's clone, the working tree and not a commit, and looks at each list item under
+the heading "## Open". An item whose text holds "act by <YYYY-MM-DD>" (the last such date
+counts) with that date today or earlier gets one line "reminder: <the item>", its lines
+joined into one. orch/reminded keeps each item text with its date once its line went
+out, so neither a later tick nor a restart sends it again; a new date, or a new text,
+sends it once more. A reminder line does not count as a change for the hourly tick. A
+state.md that cannot be read is logged once until it can be read again.
+
+Delivery. Every line waits in one queue. A dialog in the session (no input bar) is
+reported at once, in one line to the tee and to the log, and never answered; nothing is
+sent while it lasts. A line that fails before any key is typed (the session does not
+exist, for example between a rollover and the next poll, it shows no input bar, or tmux
+send-keys fails) goes back to the head of the queue and is tried again at the next poll;
+a report commit goes into orch/reported only once its line is sent. A line that fails
+after its text was typed is logged once, to the tee and the log, and not tried again,
+so that no line is sent twice. JIG_SRV names <root> (/srv/jig); JIG_ORCH_POLL the seconds between
+polls (5); JIG_ORCH_REPORT_POLL the seconds between fetches (60); JIG_ORCH_HOURLY the
+seconds between ticks (3600); JIG_ORCH_FORK_WINDOW the seconds after a restart in which
+the loop still looks for forks of the old session (60).
+
+Files, under ~/ws/reviews/<project>/: orch/supervisor.log, orch/loop.lock (the pid of
+the loop), orch/announced, orch/reported, orch/reminded, orch/fetch.err (the error output of the last
+fetch), out/orch.txt (the tee), transcripts/orch/<run>/. In the project's clone: the
+idle lines in impl/orch/updates.log.
+"""
+
+import datetime
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_dirs  # noqa: E402
+import jig_ids  # noqa: E402
+import jig_tmux  # noqa: E402
+import jig_units  # noqa: E402
+
+worker = jig_units.worker
+
+# jig close holds the reader of a report's status line; the report line uses the same one.
+sys.dont_write_bytecode = True
+_loader = importlib.machinery.SourceFileLoader(
+    "jig_close", str(pathlib.Path(__file__).resolve().parent / "jig-close"))
+_spec = importlib.util.spec_from_loader("jig_close", _loader)
+closing = importlib.util.module_from_spec(_spec)
+_loader.exec_module(closing)
+
+DONE, REFUSED, USAGE, NO_LOOP = 0, 1, 2, 3
+
+MODEL = "claude-opus-5-5"
+EFFORT = "high"
+SRV_ROOT = "/srv/jig"
+POLL_SECONDS = 5.0
+REPORT_POLL_SECONDS = 60.0
+HOURLY_SECONDS = 3600.0
+HOURLY_LINE = "hourly update"
+# The orchestrator's log of hourly updates in its clone, where the loop also writes idle
+# lines; a commit that changes only this file is not news for the hourly update.
+UPDATES_LOG = "impl/orch/updates.log"
+STATUS_LOG = "impl/log/status.log"
+# A fetch that hangs on the network is ended after this, so that the next poll tries again.
+FETCH_CAP_SECONDS = 30.0
+# A line of orch/announced: inode, modification time in nanoseconds, path.
+RECORD_LINE = re.compile(r"(\d+) (\d+) (.+)")
+# A session that exits this often within the window stops the loop.
+QUICK_EXITS = 3
+QUICK_WINDOW_SECONDS = 600
+START_WAIT_SECONDS = 5.0
+# Long enough for a fork that Claude Code starts while the old session exits to show up.
+FORK_WINDOW_SECONDS = 60.0
+STOP_WAIT_SECONDS = 30.0
+
+
+def setting(name, default):
+    text = os.environ.get(name)
+    if not text:
+        return default
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        raise jig_units.Refused(f"refused: setting: {name} must be a positive number of "
+                                f"seconds, not {text}")
+    return value
+
+
+def now_text():
+    return datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def waited_for(status_text):
+    """Say what the project waits for, from the text of impl/log/status.log.
+
+    A line there reads "<time> <ID> start|end <status> <commit>". When the newest line
+    starts a unit, nothing has ended that unit since, and the project waits for it;
+    after an end line, or with no log, the next step is the orchestrator's.
+    """
+    lines = [line for line in (status_text or "").splitlines() if line.strip()]
+    if lines:
+        words = lines[-1].split()
+        if len(words) >= 4 and words[2] == "start" and jig_ids.is_unit_id(words[1]):
+            return f"unit {words[1]}"
+    return "the orchestrator"
+
+
+# The date to act on an item of the Open part of state.md.
+ACT_BY = re.compile(r"\bact by (\d{4}-\d\d-\d\d)\b", re.IGNORECASE)
+OPEN_HEADING = "## Open"
+LIST_ITEM = re.compile(r"[-*] ")
+
+
+def open_items(text):
+    """Return each list item under the heading Open of state.md, its lines joined.
+
+    An item starts with "- " or "* " at the start of a line and goes on over the
+    indented lines after it; a blank line, a line of another form or the next heading
+    ends it.
+    """
+    items, inside, current = [], False, None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            inside, current = line.strip() == OPEN_HEADING, None
+        elif not inside:
+            continue
+        elif LIST_ITEM.match(line):
+            current = [line[2:]]
+            items.append(current)
+        elif current is not None and line.strip() and line[0].isspace():
+            current.append(line)
+        else:
+            current = None
+    return [" ".join(" ".join(parts).split()) for parts in items]
+
+
+def due_items(text, today):
+    """Return (item, date) for each Open item of state.md whose act-by date has come."""
+    due = []
+    for item in open_items(text):
+        dates = ACT_BY.findall(item)
+        if not dates:
+            continue
+        try:
+            date = datetime.date.fromisoformat(dates[-1])
+        except ValueError:
+            # A date that does not exist, such as a 31 April, is no date to act on.
+            continue
+        if date <= today:
+            due.append((item, dates[-1]))
+    return due
+
+
+def resumes(arguments, session_id):
+    """Say whether a command line continues the Claude Code session with this ID.
+
+    Claude Code takes the session to continue after --resume, as its ID or as the path
+    of its transcript, <ID>.jsonl.
+    """
+    return any(argument == "--resume"
+               and (following == session_id or following.endswith(f"/{session_id}.jsonl"))
+               for argument, following in zip(arguments, arguments[1:]))
+
+
+def own_processes():
+    """Yield (pid, arguments) for each process of this account, as /proc shows it now.
+
+    A process that ends while it is read is left out.
+    """
+    uid = os.getuid()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid != uid:
+                continue
+            with open(f"/proc/{name}/cmdline", "rb") as stream:
+                raw = stream.read()
+        except OSError:
+            continue
+        # The arguments end with a NUL each; a zombie has none.
+        yield int(name), [os.fsdecode(part) for part in raw.split(b"\0")[:-1]]
+
+
+def try_lock(path):
+    """Return a descriptor that holds the loop's lock, or None while a loop holds it."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+class Orch:
+    def __init__(self, project):
+        self.project = project
+        self.session = f"{project}-orch"
+        conf = jig_units.read_conf(project)
+        self.clone = pathlib.Path(conf["REPO"])
+        self.branch = conf["BRANCH"]
+        # A ref of the loop's own, so that its fetch moves nothing that other fetches use.
+        self.watch_ref = f"refs/jig-orch/{self.branch}"
+        self.standing = self.clone / "impl" / "orch" / "ORCHESTRATOR.md"
+        reviews = pathlib.Path.home() / "ws" / "reviews" / project
+        self.state = reviews / "orch"
+        self.lock = self.state / "loop.lock"
+        self.log_path = self.state / "supervisor.log"
+        self.started_file = self.state / "session"
+        self.announced_file = self.state / "announced"
+        self.reported_file = self.state / "reported"
+        self.reminded_file = self.state / "reminded"
+        self.state_md = self.clone / "impl" / "orch" / "state.md"
+        self.fetch_err = self.state / "fetch.err"
+        self.tee = reviews / "out" / "orch.txt"
+        self.transcripts = reviews / "transcripts" / "orch"
+        root = os.environ.get("JIG_SRV") or SRV_ROOT
+        self.watched = (("inbox", pathlib.Path(root) / "in" / project),
+                        ("readback", pathlib.Path(root) / "out" / project))
+        self.directories = [root + path[len(SRV_ROOT):] if path.startswith(SRV_ROOT + "/")
+                            else path for path in jig_dirs.of_role("orch", project)]
+
+    # The log and the tee.
+
+    def log(self, text, tee=False):
+        line = f"{now_text()} {text}\n"
+        with open(self.log_path, "a", encoding="utf-8") as stream:
+            stream.write(line)
+        if tee:
+            self.tee.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.tee, "a", encoding="utf-8") as stream:
+                stream.write(f"\njig orch: {line}")
+
+    def last_log_line(self):
+        try:
+            lines = self.log_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        return lines[-1] if lines else None
+
+    # The session.
+
+    def alive(self):
+        return worker.tmux("has-session", "-t", f"={self.session}").returncode == 0
+
+    def session_id(self):
+        result = worker.tmux("display-message", "-p", "-t", f"={self.session}:",
+                             "#{session_id}")
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def ours(self):
+        """Say whether the session is the one the loop started last, not one of a person."""
+        try:
+            started = self.started_file.read_text(encoding="utf-8").split()
+        except OSError:
+            return False
+        return bool(started) and started[0] == self.session_id()
+
+    def open_session(self):
+        self.run = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        self.claude_session = str(uuid.uuid4())
+        try:
+            worker.set_effort(str(self.clone), MODEL, EFFORT)
+        except worker.Refused as error:
+            self.log(f"cannot set the effort: {error}", tee=True)
+            return
+        channel = f"jig-orch-{self.session}"
+        add_dirs = "".join(f"--add-dir {shlex.quote(directory)} "
+                           for directory in worker.existing_dirs(self.directories))
+        inner = (
+            f"export PATH={shlex.quote(os.environ.get('PATH', ''))}:$PATH; "
+            "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
+            f"tmux wait-for {shlex.quote(channel)}; "
+            f"exec claude {add_dirs}--model {MODEL} --effort {EFFORT} "
+            f"--name {shlex.quote(self.session)} --remote-control {shlex.quote(self.session)} "
+            f"--session-id {self.claude_session} "
+            f'"$(cat {shlex.quote(str(self.standing))})"'
+        )
+        created = worker.tmux("new-session", "-d", "-P", "-F", "#{session_id}",
+                              "-s", self.session, "-x", "200", "-y", "50",
+                              "-c", str(self.clone), worker.session_command(inner))
+        if created.returncode != 0:
+            self.log(f"cannot start session {self.session}: {worker.last_line(created)}",
+                     tee=True)
+            return
+        self.started_file.write_text(f"{created.stdout.strip()} {self.claude_session}\n",
+                                     encoding="utf-8")
+        self.tee.parent.mkdir(parents=True, exist_ok=True)
+        worker.tmux("pipe-pane", "-o", "-t", f"={self.session}:",
+                    f"cat >> {shlex.quote(str(self.tee))}")
+        worker.tmux("wait-for", "-S", channel)
+        self.log(f"started session {self.session}, Claude Code session {self.claude_session}")
+
+    def copy_transcript(self):
+        found = sorted(pathlib.Path.home().glob(
+            f".claude/projects/*/{self.claude_session}.jsonl"))
+        if not found:
+            self.log(f"no transcript of Claude Code session {self.claude_session} to copy")
+            return
+        target = self.transcripts / self.run
+        target.mkdir(parents=True, exist_ok=True)
+        for path in found:
+            shutil.copy2(path, target / path.name)
+        self.log(f"copied the transcript to {target}")
+
+    # The forks of an old session.
+
+    def end_forks(self, session_id):
+        """Send SIGTERM to each process of this account that resumes the session."""
+        for pid, arguments in own_processes():
+            if pid == os.getpid() or (pid, session_id) in self.ended_forks \
+                    or not resumes(arguments, session_id):
+                continue
+            # Signalled once: a pid seen again at the next poll gets no second line.
+            self.ended_forks.add((pid, session_id))
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                self.log(f"pid {pid}, a fork of the old Claude Code session {session_id}, "
+                         f"ended before the signal")
+                continue
+            except OSError as error:
+                self.log(f"cannot end pid {pid}, a fork of the old Claude Code session "
+                         f"{session_id}: {error.strerror}", tee=True)
+                continue
+            self.log(f"sent SIGTERM to pid {pid}, a fork of the old Claude Code session "
+                     f"{session_id}")
+
+    def watch_forks(self):
+        """Look for forks of each old session whose window after the restart is open."""
+        moment = time.monotonic()
+        self.fork_watch = {session_id: end for session_id, end in self.fork_watch.items()
+                           if moment < end}
+        for session_id in self.fork_watch:
+            self.end_forks(session_id)
+
+    # The inbox and the readbacks.
+
+    def files(self, directory):
+        """Return {path: (inode, mtime in ns, size)} of the directory's files.
+
+        Return None when the directory cannot be read.
+        """
+        found = {}
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_file(follow_symlinks=False) and not entry.name.startswith("."):
+                        status = entry.stat(follow_symlinks=False)
+                        found[entry.path] = (status.st_ino, status.st_mtime_ns, status.st_size)
+        except OSError:
+            return None
+        return found
+
+    def read_announced(self):
+        """Return {path: (inode, mtime in ns)} of the files announced by earlier loops.
+
+        Return None when there is no record.
+        """
+        try:
+            text = self.announced_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            self.log(f"cannot read {self.announced_file}: {error.strerror}; starting a new "
+                     "record", tee=True)
+            return None
+        record = {}
+        for line in text.splitlines():
+            match = RECORD_LINE.fullmatch(line)
+            if match:
+                record[match[3]] = (int(match[1]), int(match[2]))
+                continue
+            if not line:
+                continue
+            # Before inodes were kept a line was a path alone. It stands for the file at
+            # that path now, so that the first start after an upgrade sends no line again.
+            try:
+                status = os.stat(line, follow_symlinks=False)
+            except OSError:
+                continue
+            record[line] = (status.st_ino, status.st_mtime_ns)
+        return record
+
+    def write_announced(self):
+        temporary = self.announced_file.with_name(self.announced_file.name + ".new")
+        try:
+            temporary.write_text("".join(f"{inode} {mtime} {path}\n" for path, (inode, mtime)
+                                         in sorted(self.seen.items())), encoding="utf-8")
+            os.replace(temporary, self.announced_file)
+        except OSError as error:
+            self.log(f"cannot write {self.announced_file}: {error.strerror}", tee=True)
+
+    def scan(self):
+        """Queue a line for each new file that held still since the last poll.
+
+        A file is new when its inode or modification time differs from those announced
+        for its path, so a readback written again, or an inbox file that grew, is
+        announced again. A path whose file is gone drops out of the record, so a file
+        written there later is new even when it gets the same inode back.
+        A directory that cannot be read is skipped, so that its files are not new again.
+        """
+        before = dict(self.seen)
+        for kind, directory in self.watched:
+            present = self.files(directory)
+            if present is None:
+                continue
+            inside = {path for path in [*self.seen, *self.waiting]
+                      if os.path.dirname(path) == str(directory)}
+            for path in inside - set(present):
+                self.seen.pop(path, None)
+                self.waiting.pop(path, None)
+            for path, (inode, mtime, size) in sorted(present.items()):
+                if self.seen.get(path) == (inode, mtime):
+                    continue
+                if self.waiting.get(path) != (inode, mtime, size):
+                    self.waiting[path] = (inode, mtime, size)
+                    continue
+                del self.waiting[path]
+                self.seen[path] = (inode, mtime)
+                self.queue.append((self.announcement(kind, path, size), None))
+        if self.seen != before:
+            self.write_announced()
+
+    def announcement(self, kind, path, size):
+        if kind == "readback":
+            name = os.path.basename(path)
+            return f"readback: {name[:-4] if name.endswith('.txt') else name}"
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as stream:
+                for block in iter(lambda: stream.read(1 << 16), b""):
+                    digest.update(block)
+        except OSError as error:
+            return f"inbox: {path} ({size}, sha256 unreadable: {error.strerror})"
+        return f"inbox: {path} ({size}, sha256 {digest.hexdigest()[:8]})"
+
+    # The report commits on origin. A unit ends with a commit whose subject is "log: <ID>"
+    # and that holds impl/log/<ID>-report.md; the first line of that file is its status.
+
+    def read_reported(self):
+        """Return the commits announced by earlier loops, or None when there is no record."""
+        try:
+            return set(self.reported_file.read_text(encoding="utf-8").split())
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            self.log(f"cannot read {self.reported_file}: {error.strerror}; starting a new "
+                     "record", tee=True)
+            return None
+
+    def write_reported(self):
+        temporary = self.reported_file.with_name(self.reported_file.name + ".new")
+        try:
+            temporary.write_text("".join(f"{commit}\n" for commit in sorted(self.reported)),
+                                 encoding="utf-8")
+            os.replace(temporary, self.reported_file)
+        except OSError as error:
+            self.log(f"cannot write {self.reported_file}: {error.strerror}", tee=True)
+
+    def read_reminded(self):
+        """Return the (item, date) pairs that earlier loops sent, from lines "<date> <item>"."""
+        try:
+            lines = self.reminded_file.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return set()
+        except OSError as error:
+            self.log(f"cannot read {self.reminded_file}: {error.strerror}; starting a new "
+                     "record", tee=True)
+            return set()
+        return {(item, date) for date, _, item in (line.partition(" ") for line in lines)
+                if item}
+
+    def write_reminded(self):
+        temporary = self.reminded_file.with_name(self.reminded_file.name + ".new")
+        try:
+            temporary.write_text("".join(f"{date} {item}\n"
+                                         for item, date in sorted(self.reminded)),
+                                 encoding="utf-8")
+            os.replace(temporary, self.reminded_file)
+        except OSError as error:
+            self.log(f"cannot write {self.reminded_file}: {error.strerror}", tee=True)
+
+    # The reminders of dated Open items in state.md. Each queued line carries its
+    # (item, date) pair, which goes into the record only once the line is sent, so a
+    # reminder that a stop drops while it waits goes out after the restart.
+
+    def remind(self):
+        try:
+            text = self.state_md.read_text(encoding="utf-8")
+        except OSError as error:
+            problem = f"reminders: cannot read {self.state_md}: {error.strerror}"
+            if problem != self.remind_problem:
+                self.remind_problem = problem
+                self.log(problem)
+            return
+        self.remind_problem = None
+        waiting = {mark for _, mark in self.queue if isinstance(mark, tuple)}
+        for item, date in due_items(text, datetime.date.today()):
+            if (item, date) in self.reminded or (item, date) in waiting:
+                continue
+            self.queue.append((f"reminder: {item}", (item, date)))
+            self.log(f"reminders: queued the item due {date}")
+
+    def start_fetch(self):
+        # Without the empty --refmap, git would also move refs/remotes/origin/<branch>
+        # through the remote's fetch mapping, under a fetch that jig wait may be running.
+        command = ["git", "-C", str(self.clone), "fetch", "-q", "--no-write-fetch-head",
+                   "--no-auto-maintenance", "--refmap=", "origin",
+                   f"+refs/heads/{self.branch}:{self.watch_ref}"]
+        # A fetch that asked for a password or a host key would wait for an answer forever.
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+                   GIT_SSH_COMMAND="ssh -o BatchMode=yes")
+        try:
+            with open(self.fetch_err, "wb") as errors:
+                # A group of its own lets a fetch that hangs be ended with its ssh child.
+                self.fetching = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                                 stdout=subprocess.DEVNULL, stderr=errors,
+                                                 env=env, start_new_session=True)
+        except OSError as error:
+            self.fetching = None
+            self.fetch_failed(f"cannot run git: {error.strerror}")
+            return
+        self.fetch_deadline = time.monotonic() + self.fetch_cap
+
+    def end_fetch(self):
+        """End a fetch that still runs, with every process it started."""
+        if self.fetching is None:
+            return
+        if self.fetching.poll() is None:
+            try:
+                os.killpg(self.fetching.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.fetching.wait()
+        self.fetching = None
+
+    def fetch_failed(self, failure):
+        # One line for a run of failures: an origin that is down for an hour would
+        # otherwise fill the log and the tee with the same line.
+        if not self.fetch_failing:
+            self.log(f"cannot fetch {self.branch} from origin in {self.clone}: {failure}; "
+                     f"report lines wait until a fetch works, tried every "
+                     f"{self.report_poll:g} s", tee=True)
+        self.fetch_failing = True
+
+    def watch_reports(self):
+        """Start a fetch when one is due, and look for new report commits after it.
+
+        The fetch runs beside the loop, so that inbox lines and the dialog check go on
+        while it waits on the network.
+        """
+        moment = time.monotonic()
+        if self.fetching is None:
+            if moment >= self.next_fetch:
+                self.next_fetch = moment + self.report_poll
+                self.start_fetch()
+            return
+        code = self.fetching.poll()
+        if code is None and moment < self.fetch_deadline:
+            return
+        self.end_fetch()
+        if code is None:
+            self.fetch_failed(f"no answer within {self.fetch_cap:g} s")
+            return
+        if code != 0:
+            try:
+                lines = self.fetch_err.read_text(encoding="utf-8", errors="replace").split("\n")
+            except OSError:
+                lines = []
+            lines = [line for line in lines if line.strip()]
+            self.fetch_failed(lines[-1] if lines else f"git fetch exit {code}")
+            return
+        if self.fetch_failing:
+            self.log(f"fetch of {self.branch} from origin works again")
+        self.fetch_failing = False
+        self.watch_changes()
+        self.find_reports()
+
+    def find_reports(self):
+        listed = worker.git(self.clone, "log", "--reverse", "--extended-regexp",
+                            "--grep=^log: ", "--format=%H %ct %s", self.watch_ref)
+        if listed.returncode != 0:
+            self.fetch_failed(f"cannot list {self.watch_ref}: {worker.last_line(listed)}")
+            return
+        commits = []
+        for line in listed.stdout.splitlines():
+            commit, _, rest = line.partition(" ")
+            moment, _, subject = rest.partition(" ")
+            unit = subject[len("log: "):] if subject.startswith("log: ") else ""
+            if jig_ids.is_unit_id(unit) and moment.isdigit():
+                commits.append((commit, int(moment), unit))
+        if self.reported is None:
+            # The record is made from origin as the first fetch that works finds it. A log
+            # commit made since the loop started is left out, so that a report that landed
+            # while the first fetches failed still gets its line.
+            self.reported = {commit for commit, moment, _ in commits
+                             if moment < int(self.loop_started)}
+            self.write_reported()
+        for commit, _, unit in commits:
+            if commit in self.reported or commit in self.pending:
+                continue
+            status = closing.report_status(self.clone, commit, unit) or "unreadable"
+            self.pending.add(commit)
+            self.queue.append((f"report: {unit} {status}", commit))
+
+    # The hourly tick. Something changed since the last tick when the loop delivered a
+    # line into the session, other than the hourly update itself, or when origin got a
+    # commit that changes a file other than the update log. Then the tick wakes the
+    # model with "hourly update"; else the loop writes the idle line itself, so that a
+    # quiet hour costs no model time.
+
+    def note_change(self):
+        self.changed = True
+        self.last_change = now_text()
+
+    def watch_changes(self):
+        """Compare the fetched ref with the one at the last fetch that worked."""
+        head = worker.git_out(self.clone, "rev-parse", "-q", "--verify", self.watch_ref)
+        if not head or head == self.origin_head:
+            return
+        old, self.origin_head = self.origin_head, head
+        # The first fetch that works sets the baseline, as it sets the report record.
+        if old is None:
+            return
+        changed = worker.git(self.clone, "diff", "--name-only", "--no-renames", old, head)
+        # When the two cannot be compared, a change is the safer guess: it costs one
+        # hourly update, where a wrong idle line would hide work.
+        if changed.returncode != 0 or any(name != UPDATES_LOG
+                                          for name in changed.stdout.splitlines()):
+            self.note_change()
+
+    def tick(self):
+        moment = time.monotonic()
+        if moment < self.next_tick:
+            return
+        self.next_tick = moment + self.hourly
+        self.remind()
+        if self.changed:
+            self.changed = False
+            # One hourly update at a time: ticks while a dialog holds the queue add none.
+            if any(line == HOURLY_LINE for line, _ in self.queue):
+                self.log("hourly: something changed; the hourly update still waits to be sent")
+            else:
+                self.queue.append((HOURLY_LINE, None))
+                self.log("hourly: something changed; queued the hourly update")
+            return
+        shown = worker.git(self.clone, "show", f"{self.watch_ref}:{STATUS_LOG}")
+        line = (f"{now_text()} idle: waits for "
+                f"{waited_for(shown.stdout if shown.returncode == 0 else None)} "
+                f"since {self.last_change}\n")
+        path = self.clone / UPDATES_LOG
+        try:
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write(line)
+        except OSError as error:
+            self.log(f"hourly: nothing changed; cannot write the idle line to {path}: "
+                     f"{error.strerror}", tee=True)
+            return
+        self.log(f"hourly: nothing changed since {self.last_change}; wrote the idle line")
+
+    # The loop.
+
+    def stop_request(self, signum, frame):
+        self.stopping = True
+
+    def failed_before_typing(self, failure):
+        """Say whether deliver() failed before it typed a key into the session.
+
+        Such a line can go again without being sent twice. The session that does not
+        exist is the common case: it ended for a rollover between two polls, and the
+        loop starts the fresh one at the next poll.
+        """
+        return (failure in (f"session {self.session} does not exist",
+                            f"session {self.session} shows no input bar")
+                or failure.startswith("tmux send-keys failed"))
+
+    def deliver_queue(self):
+        while self.queue and not self.stopping:
+            # The mark of a line is its report commit, the (item, date) pair of a
+            # reminder, or None.
+            line, commit = self.queue.pop(0)
+            failure = jig_tmux.deliver(self.session, line)
+            if failure and self.failed_before_typing(failure):
+                # The line goes back to the head of the queue, so that the lines keep
+                # their order, and the pass ends; the next poll tries again. It is
+                # logged once, not at every poll that it waits.
+                self.queue.insert(0, (line, commit))
+                if self.held != line:
+                    self.held = line
+                    self.log(f"held for the next poll ({failure}): {line}")
+                return
+            self.held = None
+            if failure:
+                # The text was typed, so a second attempt could send the line twice.
+                self.log(f"not delivered ({failure}): {line}", tee=True)
+            else:
+                self.log(f"delivered: {line}")
+                if line != HOURLY_LINE and not isinstance(commit, tuple):
+                    self.note_change()
+            # A report commit goes into the record only once its line has been sent, or
+            # typed by an attempt that failed after it, so a line that a stop drops while
+            # it waits in the queue is sent after the restart.
+            if isinstance(commit, tuple):
+                self.reminded.add(commit)
+                self.write_reminded()
+            elif commit:
+                self.pending.discard(commit)
+                self.reported.add(commit)
+                self.write_reported()
+
+    def loop(self, poll, report_poll, hourly, fork_window):
+        self.stopping = False
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, self.stop_request)
+        self.loop_started = time.time()
+        self.log(f"loop started, pid {os.getpid()}")
+        # Paths that are gone drop out of the record at the first scan of their directory.
+        self.seen = self.read_announced()
+        if self.seen is None:
+            self.seen = {}
+            for _, directory in self.watched:
+                for path, (inode, mtime, _) in (self.files(directory) or {}).items():
+                    self.seen[path] = (inode, mtime)
+        # Written at once, so that a record of the older form is not read a second time.
+        self.write_announced()
+        self.reported, self.pending = self.read_reported(), set()
+        self.report_poll = report_poll
+        self.fetch_cap = min(FETCH_CAP_SECONDS, report_poll)
+        self.fetching, self.fetch_failing, self.next_fetch = None, False, 0.0
+        self.waiting, self.queue, self.held = {}, [], None
+        self.hourly, self.next_tick = hourly, time.monotonic() + hourly
+        self.changed, self.last_change, self.origin_head = False, now_text(), None
+        self.fork_window, self.fork_watch, self.ended_forks = fork_window, {}, set()
+        self.reminded, self.remind_problem = self.read_reminded(), None
+        self.remind()
+        try:
+            return self.supervise(poll)
+        finally:
+            self.end_fetch()
+
+    def supervise(self, poll):
+        exits = []
+        self.open_session()
+        no_bar, reported = 0, False
+        while not self.stopping:
+            self.tick()
+            self.watch_forks()
+            if not self.alive():
+                old = self.claude_session
+                self.end_forks(old)
+                self.copy_transcript()
+                moment = time.monotonic()
+                exits = [past for past in exits if moment - past < QUICK_WINDOW_SECONDS]
+                exits.append(moment)
+                self.log(f"session {self.session} exited ({len(exits)} in 10 minutes)")
+                if len(exits) >= QUICK_EXITS:
+                    self.log(f"stopped: session {self.session} exited {QUICK_EXITS} times in "
+                             f"10 minutes, so the loop does not start it again; see the tee, "
+                             f"then jig orch {self.project} start", tee=True)
+                    return REFUSED
+                self.open_session()
+                # A fork can show up after the exit, so the loop keeps looking for a while.
+                self.fork_watch[old] = time.monotonic() + self.fork_window
+                no_bar, reported = 0, False
+                continue
+            self.scan()
+            self.watch_reports()
+            screen = jig_tmux.capture(self.session)
+            if screen is None:
+                time.sleep(poll)
+                continue
+            if jig_tmux.has_input_bar(screen):
+                no_bar, reported = 0, False
+                self.deliver_queue()
+            else:
+                no_bar += 1
+                if no_bar >= jig_tmux.DIALOG_POLLS and not reported:
+                    reported = True
+                    self.log(f"dialog: session {self.session} shows no input bar; jig orch "
+                             f"does not answer it: tmux attach -t {self.session}", tee=True)
+            time.sleep(poll)
+        if self.ours():
+            worker.tmux("kill-session", "-t", f"={self.session}")
+            self.copy_transcript()
+        self.log("loop stopped by jig orch stop")
+        return DONE
+
+    # The commands.
+
+    def loop_pid(self):
+        try:
+            return int(self.lock.read_text(encoding="utf-8").split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def start(self):
+        if not self.standing.is_file():
+            worker.refuse("orchestrator", f"no standing prompt at {self.standing}")
+        self.state.mkdir(parents=True, exist_ok=True)
+        descriptor = try_lock(self.lock)
+        if descriptor is None:
+            worker.refuse("loop", f"a loop runs already, pid {self.loop_pid()}")
+        try:
+            if self.alive():
+                worker.refuse("session", f"tmux session {self.session} exists, and no loop "
+                                         f"started it")
+            with open(self.log_path, "a", encoding="utf-8") as log:
+                child = subprocess.Popen(
+                    [sys.executable, str(pathlib.Path(__file__).resolve()), self.project,
+                     "loop", str(descriptor)],
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                    pass_fds=(descriptor,), start_new_session=True)
+        finally:
+            os.close(descriptor)
+        deadline = time.monotonic() + START_WAIT_SECONDS
+        while child.poll() is None and not self.alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if child.poll() is not None:
+            print(f"jig orch: the loop ended at once: {self.last_log_line()}", file=sys.stderr)
+            return REFUSED
+        print(f"jig orch: started the loop, pid {child.pid}, for session {self.session} "
+              f"(tmux attach -t {self.session}); log {self.log_path}")
+        return DONE
+
+    def stop(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        descriptor = try_lock(self.lock)
+        pid = None
+        if descriptor is None:
+            pid = self.loop_pid()
+            if pid:
+                os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + STOP_WAIT_SECONDS
+            while descriptor is None and time.monotonic() < deadline:
+                time.sleep(0.2)
+                descriptor = try_lock(self.lock)
+            if descriptor is None and pid:
+                os.kill(pid, signal.SIGKILL)
+                time.sleep(0.5)
+                descriptor = try_lock(self.lock)
+        if descriptor is not None:
+            os.close(descriptor)
+        if self.alive() and self.ours():
+            worker.tmux("kill-session", "-t", f"={self.session}")
+        if pid is None:
+            print(f"jig orch: no loop runs for {self.project}")
+        else:
+            print(f"jig orch: stopped the loop, pid {pid}, and session {self.session}")
+        return DONE
+
+    def status(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        descriptor = try_lock(self.lock)
+        last = self.last_log_line() or "no log"
+        if descriptor is not None:
+            os.close(descriptor)
+            print(f"jig orch: {self.project}: no loop runs; last: {last}")
+            return NO_LOOP
+        state = "up" if self.alive() else "down"
+        print(f"jig orch: {self.project}: loop {self.loop_pid()} runs; session {self.session} "
+              f"{state}; last: {last}")
+        return DONE
+
+
+def main(argv):
+    commands = ("start", "stop", "status")
+    hidden = len(argv) == 3 and argv[1] == "loop" and argv[2].isdigit()
+    if not (len(argv) == 2 and argv[1] in commands or hidden) \
+            or not jig_units.PROJECT.fullmatch(argv[0]):
+        print("\n\n".join(__doc__.strip().split("\n\n")[1:3]), file=sys.stderr)
+        return USAGE
+    try:
+        poll = setting("JIG_ORCH_POLL", POLL_SECONDS)
+        report_poll = setting("JIG_ORCH_REPORT_POLL", REPORT_POLL_SECONDS)
+        hourly = setting("JIG_ORCH_HOURLY", HOURLY_SECONDS)
+        fork_window = setting("JIG_ORCH_FORK_WINDOW", FORK_WINDOW_SECONDS)
+        orch = Orch(argv[0])
+        if hidden:
+            # The descriptor holds the lock that start took; it stays open while this runs.
+            descriptor = int(argv[2])
+            os.ftruncate(descriptor, 0)
+            os.pwrite(descriptor, f"{os.getpid()}\n".encode(), 0)
+            return orch.loop(poll, report_poll, hourly, fork_window)
+        return getattr(orch, argv[1])()
+    except jig_units.Refused as error:
+        print(f"jig orch: {error}", file=sys.stderr)
+        return REFUSED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

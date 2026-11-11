@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Print a file under ~/ws/reviews/<project>/ of a worker account, read there by ssh.
+
+usage: jig cat <project> <account> <path>
+
+The path is relative to that directory. It refuses, before it reaches the account: an
+account the conf file does not name, an absolute path, a ".." part, and, under the spec
+writer's account, out/ and transcripts/, which can show reference text. In the account it
+refuses again, on the real path, so a link cannot lead out of the directory or into
+those two. Exits 1 on a refusal, 2 on a usage error.
+
+The rule for out/ and transcripts/ holds only while the project's clean room is on: the
+clean room is the setting that keeps reference material away from everyone but the spec
+writer. The project profile in the kickoff record sets it (see lib/jig_profile.py).
+With "clean room: off" those two directories are read like any other. When the profile
+gives no value, a line on stderr says so and the rule holds, as with the clean room on.
+"""
+
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_profile  # noqa: E402
+import jig_units  # noqa: E402
+
+CLOSED_UNDER_SPEC = ("out", "transcripts")
+
+# Runs in the worker account: $1 project, $2 path, $3 1 when out/ and transcripts/ are shut.
+# Exits 3 for a path outside the directory, 4 for out/ or transcripts/, 5 for no file.
+REMOTE = r"""
+base=$(realpath -e -- "$HOME/ws/reviews/$1" 2>/dev/null) || exit 5
+real=$(realpath -e -- "$base/$2" 2>/dev/null) || exit 5
+case $real in "$base"/*) ;; *) exit 3 ;; esac
+if [ "$3" = 1 ]; then
+    case $real in "$base"/out | "$base"/out/* | "$base"/transcripts | "$base"/transcripts/*)
+        exit 4 ;;
+    esac
+fi
+[ -f "$real" ] || exit 5
+exec cat -- "$real"
+"""
+
+REMOTE_REFUSALS = {
+    3: "the real path is outside the reviews directory",
+    4: "the real path is under out/ or transcripts/ of the spec account",
+    5: "no such file",
+    255: "cannot reach the account by ssh",
+}
+
+
+def path_parts(path):
+    """Return the parts of a relative path; refuse what could leave the directory."""
+    if not path or path.startswith("/"):
+        jig_units.refuse("path", f"{path!r} is not a path relative to the reviews directory")
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        jig_units.refuse("path", f"{path} has a '..' part")
+    if not parts:
+        jig_units.refuse("path", f"{path} names the directory itself, not a file")
+    return parts
+
+
+def cat(project, account, path):
+    conf = jig_units.read_conf(project)
+    if account not in jig_units.accounts(conf):
+        jig_units.refuse("account", f"the conf file of {project} names no account {account}")
+    parts = path_parts(path)
+    # True for the spec account while its clean room is on. The profile is read only for
+    # that account, as the switch changes nothing for the others.
+    spec = jig_units.is_spec_account(conf, account) and jig_profile.clean_room_on(conf)
+    if spec and parts[0] in CLOSED_UNDER_SPEC:
+        jig_units.refuse("path", f"{parts[0]}/ under the {account} account can show "
+                                 f"reference text")
+    code, out, _ = jig_units.run_remote(
+        account, ["sh", "-c", REMOTE, "sh", project, "/".join(parts), "1" if spec else "0"])
+    if code != 0:
+        jig_units.refuse("path", f"{path} in {account}: "
+                                 f"{REMOTE_REFUSALS.get(code, f'exit {code}')}")
+    return out
+
+
+def main(argv):
+    if len(argv) != 3 or not jig_units.PROJECT.fullmatch(argv[0]):
+        print("usage: jig cat <project> <account> <path>", file=sys.stderr)
+        return 2
+    try:
+        out = cat(*argv)
+    except jig_units.Refused as error:
+        print(f"jig cat: {error}", file=sys.stderr)
+        return 1
+    sys.stdout.write(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

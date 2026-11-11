@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Rebuild a project's test vectors from their inputs and prove that nothing drifted.
+
+usage: jig recompute <project> <product vector directory>
+
+A project with test vectors keeps them under vectors/ of its -dev repo, with the
+scripts that make them again in vectors/recompute/, and a copy of the vectors in the
+product, in the directory where the product's CI reads them. That directory is the
+second argument, a path from the root of the product clone (no leading "/", no "..").
+This works in the -dev clone, the REPO of ~/.config/jig/<project>.conf, and in the
+product clone nested in it at REPO/<project>. In order, it:
+
+  1. fetches the product clone's origin;
+  2. stops when a file under vectors/ is not committed (new, changed or removed),
+     when vectors/recompute/ is missing or holds no script, or when the product
+     vector directory is missing at origin/<BRANCH> of the product;
+  3. runs each script of vectors/recompute/ in name order, from the root of the
+     -dev clone, and stops at the first one that exits non-zero;
+  4. compares vectors/ with the committed tree: a file that the scripts changed,
+     added or removed is listed;
+  5. compares the product vector directory at origin/<BRANCH> with vectors/, one way:
+     each file there must equal the file at the same path under vectors/, and
+     vectors/ may hold more. A file that differs, or one that vectors/ lacks, is
+     listed.
+
+A script is a regular file directly in vectors/recompute/ whose name does not start
+with ".". It is executed directly, so its first line chooses the interpreter, and it
+must be executable. A subdirectory of vectors/recompute/ is not run: it can hold what
+the scripts share. Script output goes to stderr; the list of paths goes to stdout,
+one per line, as "vectors: differs|new|missing <path>" and "product: differs|new
+<path>", where a new product file is one that vectors/ lacks.
+
+What the scripts wrote stays in the -dev tree after exit 1 and after a failed script.
+For a new reference that is the result to commit. For drift it is the evidence, and
+the next run exits 2 until it is committed, or discarded with
+  git restore -- vectors/ && git clean -fd -- vectors/
+in the -dev clone.
+
+Exits 0 when every vector is rebuilt byte for byte and the product copy equals it;
+1 when a file differs, is new or is missing; 2 when the product cannot be fetched, a
+file under vectors/ is not committed, a directory is missing, a script fails, or on
+a usage error.
+"""
+
+import os
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_units  # noqa: E402
+
+USAGE = "usage: jig recompute <project> <product vector directory>"
+VECTORS = "vectors"
+SCRIPTS = "vectors/recompute"
+# The status on every refusal and failure, as distinct from 1, a difference found.
+FAILED = 2
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
+
+
+def git_text(repo, *args):
+    """Return git's output as text, or refuse naming the command when git fails."""
+    result = git(repo, *args)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        jig_units.refuse("git", f"git {' '.join(args[:2])} in {repo}: "
+                                f"{detail[-1] if detail else f'exit {result.returncode}'}")
+    return result.stdout.decode("utf-8", "surrogateescape")
+
+
+def product_path(argument):
+    """Return the product vector directory as a clean relative path, or None if it is not."""
+    path = pathlib.PurePosixPath(argument)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        return None
+    return str(path)
+
+
+def tree_blobs(repo, revision, directory):
+    """Return {path: object id} for every file under the directory in that commit.
+
+    The paths start at the root of the repo. A directory that the commit lacks gives {}.
+    """
+    if git(repo, "cat-file", "-t", f"{revision}:{directory}").stdout.strip() != b"tree":
+        return {}
+    listing = git_text(repo, "ls-tree", "-r", "-z", f"{revision}:{directory}")
+    blobs = {}
+    for entry in filter(None, listing.split("\0")):
+        info, path = entry.split("\t", 1)
+        kind, object_id = info.split()[1:3]
+        # A submodule or other non-file entry can never equal a vector file.
+        blobs[f"{directory}/{path}"] = object_id if kind == "blob" else f"{kind} {object_id}"
+    return blobs
+
+
+def work_files(repo, directory):
+    """Return every file under the directory in the work tree, tracked or not.
+
+    Files that .gitignore excludes are left out, as git status leaves them out.
+    """
+    listing = git_text(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+                       "--", f":(literal){directory}")
+    return sorted({path for path in listing.split("\0")
+                   if path and os.path.lexists(os.path.join(repo, path))})
+
+
+def hash_files(repo, paths):
+    """Return {path: object id} of the files as they are now in the work tree.
+
+    git status trusts a file's size and timestamps when they match its index entry;
+    hashing the content makes the compare byte for byte whatever the timestamps say.
+    """
+    if not paths:
+        return {}
+    result = subprocess.run(["git", "-C", str(repo), "hash-object", "--stdin-paths"],
+                            input="\n".join(paths).encode("utf-8", "surrogateescape") + b"\n",
+                            capture_output=True, check=False)
+    ids = result.stdout.decode("ascii", "replace").split()
+    if result.returncode != 0 or len(ids) != len(paths):
+        jig_units.refuse("git", f"cannot hash the files under {VECTORS}/ in {repo}")
+    return dict(zip(paths, ids))
+
+
+def tree_differences(repo):
+    """Return (kind, path) for each way vectors/ in the work tree differs from HEAD."""
+    committed = tree_blobs(repo, "HEAD", VECTORS)
+    present = hash_files(repo, work_files(repo, VECTORS))
+    found = set()
+    for path, object_id in present.items():
+        if path not in committed:
+            found.add(("new", path))
+        elif committed[path] != object_id:
+            found.add(("differs", path))
+    found.update(("missing", path) for path in committed if path not in present)
+    # git status also sees a change staged in the index, which the hashes above miss.
+    status = git_text(repo, "status", "--porcelain=v1", "-z", "--no-renames",
+                      "--untracked-files=all", "--", f":(literal){VECTORS}")
+    for entry in filter(None, status.split("\0")):
+        path = entry[3:]
+        if not any(known == path for _, known in found):
+            found.add(("differs" if path in committed else "new", path))
+    return sorted(found, key=lambda item: (item[1], item[0]))
+
+
+def fetch_product(product):
+    if not (pathlib.Path(product) / ".git").exists():
+        jig_units.refuse("product", f"no product clone at {product}")
+    fetched = git(product, "fetch", "-q", "origin")
+    if fetched.returncode != 0:
+        lines = fetched.stderr.decode("utf-8", "replace").strip().splitlines()
+        jig_units.refuse("product", f"cannot fetch origin in {product}: "
+                                    f"{lines[-1] if lines else f'exit {fetched.returncode}'}")
+
+
+def scripts(repo):
+    """Return the recompute scripts in name order, or refuse when there are none."""
+    folder = pathlib.Path(repo) / SCRIPTS
+    if not folder.is_dir():
+        jig_units.refuse("scripts", f"{SCRIPTS}/ is missing in {repo}")
+    found = sorted(entry for entry in folder.iterdir()
+                   if entry.is_file() and not entry.name.startswith("."))
+    if not found:
+        jig_units.refuse("scripts", f"{SCRIPTS}/ in {repo} holds no script")
+    # Every script must be able to run before the first one changes any file.
+    for entry in found:
+        if not os.access(entry, os.X_OK):
+            jig_units.refuse("scripts", f"{SCRIPTS}/{entry.name} is not executable")
+    return found
+
+
+def run_scripts(repo, found):
+    for entry in found:
+        print(f"jig recompute: running {SCRIPTS}/{entry.name}", file=sys.stderr, flush=True)
+        try:
+            result = subprocess.run([str(entry)], cwd=repo, stdin=subprocess.DEVNULL,
+                                    stdout=sys.stderr, check=False)
+        except OSError as error:
+            jig_units.refuse("script", f"{SCRIPTS}/{entry.name} did not start: "
+                                       f"{error.strerror}")
+        if result.returncode != 0:
+            jig_units.refuse("script", f"{SCRIPTS}/{entry.name} exited {result.returncode}; "
+                                       f"what the scripts wrote stays in the tree")
+
+
+def product_differences(repo, product, revision, directory):
+    """Return (kind, path) for each product file that does not equal its vectors/ file."""
+    copied = tree_blobs(product, revision, directory)
+    prefix = directory + "/"
+    relative = {path: f"{VECTORS}/{path[len(prefix):]}" for path in copied}
+    present = set(work_files(repo, VECTORS))
+    rebuilt = hash_files(repo, sorted(set(relative.values()) & present))
+    found = []
+    for path, object_id in sorted(copied.items()):
+        if relative[path] not in rebuilt:
+            found.append(("new", path))
+        elif rebuilt[relative[path]] != object_id:
+            found.append(("differs", path))
+    return found
+
+
+def recompute(project, directory):
+    conf = jig_units.read_conf(project)
+    repo, branch = conf["REPO"], conf["BRANCH"]
+    product = str(pathlib.Path(repo) / project)
+    if not (pathlib.Path(repo) / ".git").exists():
+        jig_units.refuse("repo", f"no -dev clone at {repo}")
+    fetch_product(product)
+
+    uncommitted = tree_differences(repo)
+    if uncommitted:
+        for kind, path in uncommitted:
+            print(f"jig recompute: not committed: {kind} {path}", file=sys.stderr)
+        jig_units.refuse("vectors", f"{len(uncommitted)} file(s) under {VECTORS}/ are not "
+                                    f"committed; commit them, or discard them with "
+                                    f"git restore and git clean")
+    found = scripts(repo)
+    revision = f"refs/remotes/origin/{branch}"
+    if git(product, "cat-file", "-t", f"{revision}:{directory}").stdout.strip() != b"tree":
+        jig_units.refuse("product", f"origin/{branch} of {product} has no directory "
+                                    f"{directory}")
+
+    run_scripts(repo, found)
+    differences = [("vectors", kind, path) for kind, path in tree_differences(repo)]
+    differences += [("product", kind, path)
+                    for kind, path in product_differences(repo, product, revision, directory)]
+    for side, kind, path in differences:
+        print(f"{side}: {kind} {path}")
+    if differences:
+        print(f"jig recompute: {len(differences)} file(s) differ, are new or are missing; "
+              f"what the scripts wrote stays in the tree", file=sys.stderr)
+        return 1
+    print("jig recompute: every vector is rebuilt byte for byte, and the product copy "
+          "equals it", file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if len(argv) != 2 or not jig_units.PROJECT.fullmatch(argv[0]):
+        print(USAGE, file=sys.stderr)
+        return FAILED
+    directory = product_path(argv[1])
+    if directory is None:
+        print(f"jig recompute: the product vector directory must be a path from the root "
+              f"of the product clone, without '..': {argv[1]}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return FAILED
+    try:
+        return recompute(argv[0], directory)
+    except jig_units.Refused as error:
+        print(f"jig recompute: {error}", file=sys.stderr)
+        return FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Make an approval tag in a project's -dev repo and push it, after the checks it needs.
+
+usage: jig tag <project> <tag> <commit>
+
+Eric runs this in a tag block. A tag has one of four forms: spec-pN approves the specs
+of a phase, spec-p<N>r<M> a revision of approved specs, impl-pN a phase close and
+kickoff-rN a kickoff record, where N and M are whole numbers. Only the form is checked,
+not whether the number comes next in its series.
+
+The version line comes only from BRANCH in the environment, which the tag block sets:
+a conf file of the account that runs this may name another line, or none. The origin
+URL is the remote origin of the clone that REPO names in ~/.config/jig/<project>.conf,
+or, when there is no such file or it sets no REPO, of ~/ws/src/<project>-dev. The work
+happens in a temporary clone of that origin, which is removed at the end whatever the
+outcome, so that the account's own clone stays as it was.
+
+The tag is refused when it exists on origin, or when the commit is not on the line of
+origin. A revision tag is also refused unless every spec document that differs from
+the previous approved tag has a closed review loop. A spec document is a file under
+specs/ other than the kickoff record and the status file, specs/00-kickoff.md and
+specs/00-status.md. The previous approved tag is the nearest tag of a spec form that
+is an ancestor of the commit. A document's loop is closed when a row of the table
+"Closed review loops" in specs/00-status.md names the document, the document at the
+commit to tag is the same as at the commit of the row, and the row's review left
+impl/log/<ID>-findings.md with no must-fix finding. The status file and the findings
+file are read at the commit to tag, because that is the tree the tag approves.
+
+Otherwise the annotated tag is made at the commit with the git identity of the account
+that runs this, and pushed. Exits 0 only when origin then shows the tag at the commit;
+1 on a refusal, with one line that names the reason; 2 on a usage error.
+"""
+
+import argparse
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]*")
+# The commit is given as a hash, full or abbreviated; a branch name or another
+# expression could name a different commit by the time the tag is made.
+COMMIT = re.compile(r"[0-9a-f]{4,40}")
+FORMS = re.compile(r"spec-p[0-9]+(?:r[0-9]+)?|impl-p[0-9]+|kickoff-r[0-9]+")
+SPEC_TAG = re.compile(r"spec-p[0-9]+(?:r[0-9]+)?")
+REVISION_TAG = re.compile(r"spec-p[0-9]+r[0-9]+")
+UNIT_ID = re.compile(r"[a-z0-9]{1,6}")
+STATUS = "specs/00-status.md"
+NOT_SPEC_DOCUMENTS = {"specs/00-kickoff.md", STATUS}
+LOOPS_HEADING = re.compile(r"#+[ \t]+Closed review loops[ \t]*")
+HEADING = re.compile(r"#+[ \t]")
+SEPARATOR_CELL = re.compile(r":?-+:?")
+MUST_FIX = re.compile(r"^### F-[0-9]* must-fix", re.MULTILINE)
+# An origin URL with a scheme, or in the user@host:path form of ssh; any other URL is
+# a path on disk, which a relative value would make relative to the clone.
+REMOTE_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://|[^/:]+:")
+
+
+class Refused(Exception):
+    """A check failed; the message names it."""
+
+
+def refuse(name, detail):
+    raise Refused(f"refused: {name}: {detail}")
+
+
+def git(directory, *args):
+    return subprocess.run(["git", "-C", str(directory), *args], capture_output=True,
+                          text=True, check=False)
+
+
+def git_out(directory, *args):
+    """Return the output of a git command, or an empty string when it fails."""
+    result = git(directory, *args)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def last_line(result):
+    lines = (result.stderr or result.stdout).strip().splitlines()
+    return lines[-1] if lines else f"exit {result.returncode}"
+
+
+def conf_repo(conf):
+    """Return REPO of the conf file, or an empty string when the file or the key is absent.
+
+    The file is read as data, never run, as the other jig tools read it.
+    """
+    try:
+        text = conf.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            if key.strip() == "REPO":
+                return value.strip().strip("\"'")
+    return ""
+
+
+def origin_url(project):
+    home = pathlib.Path(os.path.expanduser("~"))
+    conf = home / ".config" / "jig" / f"{project}.conf"
+    repo = conf_repo(conf)
+    if repo:
+        clone = pathlib.Path(os.path.expanduser(repo))
+    else:
+        clone = home / "ws" / "src" / f"{project}-dev"
+    # A directory that is not a clone itself could sit inside another repository, whose
+    # origin git would then report.
+    url = git_out(clone, "remote", "get-url", "origin") if (clone / ".git").exists() else ""
+    if not url:
+        refuse("origin", f"{clone} is not a clone with a remote origin; the URL comes from "
+                         f"the clone that REPO names in {conf}, or from ~/ws/src/{project}-dev "
+                         f"when that file sets no REPO")
+    if not REMOTE_URL.match(url) and not os.path.isabs(url):
+        url = str((clone / url).resolve())
+    return url
+
+
+def resolve(clone, value):
+    """Return the full hash of the one commit that value names in the clone, or ''."""
+    return git_out(clone, "rev-parse", "--verify", "-q", f"{value}^{{commit}}")
+
+
+def is_ancestor(clone, older, newer):
+    return git(clone, "merge-base", "--is-ancestor", older, newer).returncode == 0
+
+
+def previous_tag(clone, commit):
+    """Return the name and commit of the nearest spec tag that is an ancestor of commit.
+
+    Nearest means the fewest commits between the tag and the commit; a tag on the commit
+    itself is nearest of all. Returns None when no spec tag is an ancestor.
+    """
+    best = None
+    for name in sorted(git_out(clone, "tag", "--list").splitlines()):
+        if not SPEC_TAG.fullmatch(name):
+            continue
+        target = resolve(clone, f"refs/tags/{name}")
+        if not target or not is_ancestor(clone, target, commit):
+            continue
+        distance = int(git_out(clone, "rev-list", "--count", f"{target}..{commit}") or 0)
+        if best is None or distance < best[0]:
+            best = (distance, name, target)
+    return best[1:] if best else None
+
+
+def changed_documents(clone, since, commit):
+    """Return the spec documents that differ between two commits, added and removed too."""
+    listed = git(clone, "diff", "--no-renames", "--name-only", "-z", since, commit,
+                 "--", "specs/")
+    if listed.returncode != 0:
+        refuse("review", f"cannot compare specs/ of {since[:12]} and {commit[:12]}: "
+                         f"{last_line(listed)}")
+    return [path for path in listed.stdout.split("\0")
+            if path and path not in NOT_SPEC_DOCUMENTS]
+
+
+def show(clone, commit, path):
+    """Return a file's text at a commit, or None when the commit has no such file."""
+    shown = git(clone, "show", f"{commit}:{path}")
+    return shown.stdout if shown.returncode == 0 else None
+
+
+def cell_value(cell):
+    """Return a table cell's value: backticks around it only mark it as code."""
+    cell = cell.strip()
+    if len(cell) >= 2 and cell.startswith("`") and cell.endswith("`"):
+        cell = cell[1:-1].strip()
+    return cell
+
+
+def loop_rows(text):
+    """Return the records of the table "Closed review loops" as (path, commit, ID).
+
+    The table is the first one in the section of that heading. Its header row, the row
+    above the separator row, names the columns and is no record; neither is the
+    separator row. A row without three cells is no record either.
+    """
+    in_section, table = False, []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if HEADING.match(stripped):
+            if in_section:
+                break
+            in_section = LOOPS_HEADING.fullmatch(stripped) is not None
+            continue
+        if not in_section:
+            continue
+        if stripped.startswith("|"):
+            table.append(stripped)
+        elif table:
+            break
+    rows = []
+    for line in table:
+        body = line[1:-1] if line.endswith("|") and len(line) > 1 else line[1:]
+        cells = [cell_value(cell) for cell in body.split("|")]
+        if all(SEPARATOR_CELL.fullmatch(cell) for cell in cells):
+            if rows:
+                rows.pop()
+            continue
+        rows.append(cells)
+    return [tuple(cells) for cells in rows if len(cells) == 3]
+
+
+def loop_failure(clone, commit, document, rows):
+    """Return why the document has no closed loop at the commit, or None when it has.
+
+    Any row that passes is enough; otherwise the reason of the last row that names the
+    document is given.
+    """
+    reason = (f"no row in the table Closed review loops of {STATUS} at {commit[:12]}; "
+              f"the row it looks for is | {document} | <commit> | <ID> |, under a heading "
+              "with exactly that table's name")
+    blob = git_out(clone, "rev-parse", "--verify", "-q", f"{commit}:{document}")
+    for path, row_commit, unit in rows:
+        if path != document:
+            continue
+        row_full = resolve(clone, row_commit) if COMMIT.fullmatch(row_commit) else ""
+        if not row_full:
+            reason = f"the row's commit {row_commit} names no single commit of origin"
+            continue
+        if git_out(clone, "rev-parse", "--verify", "-q", f"{row_full}:{document}") != blob:
+            reason = f"differs from the document at the row's commit {row_commit}"
+            continue
+        if not UNIT_ID.fullmatch(unit):
+            reason = f"the row's ID {unit!r} is not an ID"
+            continue
+        findings = f"impl/log/{unit}-findings.md"
+        text = show(clone, commit, findings)
+        if text is None:
+            reason = f"the row's review has no {findings} at {commit[:12]}"
+            continue
+        if MUST_FIX.search(text):
+            reason = f"{findings} holds a must-fix finding"
+            continue
+        return None
+    return reason
+
+
+def check_revision(clone, commit):
+    previous = previous_tag(clone, commit)
+    if previous is None:
+        refuse("previous", f"no tag spec-pN or spec-p<N>r<M> is an ancestor of {commit[:12]}, "
+                           f"so a revision has nothing to revise")
+    name, target = previous
+    rows = loop_rows(show(clone, commit, STATUS))
+    failures = []
+    for document in changed_documents(clone, target, commit):
+        reason = loop_failure(clone, commit, document, rows)
+        if reason:
+            failures.append(f"{document}: {reason}")
+    if failures:
+        refuse("review", f"since {name}, a spec document lacks a closed review loop: "
+                         f"{'; '.join(failures)}")
+
+
+def remote_ref(listing, name):
+    """Return the hash that a git ls-remote listing gives for exactly this ref, or ''.
+
+    ls-remote matches its patterns against the end of a ref name, so a listing can hold
+    other refs that end the same way.
+    """
+    for line in listing.splitlines():
+        value, _, ref = line.partition("\t")
+        if ref == name:
+            return value
+    return ""
+
+
+def make_tag(clone, tag, commit, branch):
+    listed = git(clone, "ls-remote", "origin", f"refs/tags/{tag}")
+    if listed.returncode != 0:
+        refuse("origin", f"cannot list the tags of origin: {last_line(listed)}")
+    if remote_ref(listed.stdout, f"refs/tags/{tag}"):
+        refuse("exists", f"origin has the tag {tag} already")
+    line = f"refs/remotes/origin/{branch}"
+    if not git_out(clone, "rev-parse", "--verify", "-q", line):
+        refuse("commit", f"origin has no branch {branch}, so origin/{branch} holds no commit")
+    full = resolve(clone, commit)
+    if not full or not is_ancestor(clone, full, line):
+        refuse("commit", f"{commit} is not on origin/{branch}")
+    if REVISION_TAG.fullmatch(tag):
+        check_revision(clone, full)
+
+    made = git(clone, "tag", "-a", "-m", tag, tag, full)
+    if made.returncode != 0:
+        refuse("tag", f"cannot make {tag}: {last_line(made)}")
+    pushed = git(clone, "push", "-q", "origin", f"refs/tags/{tag}")
+    if pushed.returncode != 0:
+        refuse("push", f"origin refused {tag}: {last_line(pushed)}")
+    # The tag counts only as origin holds it, so read it back from there.
+    shown = git(clone, "ls-remote", "origin", f"refs/tags/{tag}^{{}}")
+    remote = remote_ref(shown.stdout, f"refs/tags/{tag}^{{}}") if shown.returncode == 0 else ""
+    if remote != full:
+        refuse("readback", f"origin shows {tag} at {remote[:12] or 'no commit'}, "
+                           f"not at {full[:12]}")
+    return full
+
+
+def tag(project, name, commit):
+    branch = os.environ.get("BRANCH", "")
+    if not branch:
+        refuse("branch", "BRANCH is not set in the environment; the tag block sets it")
+    if not FORMS.fullmatch(name):
+        refuse("form", f"{name} is not spec-pN, spec-p<N>r<M>, impl-pN or kickoff-rN")
+    url = origin_url(project)
+    work = tempfile.mkdtemp(prefix="jig-tag.")
+    try:
+        clone = pathlib.Path(work) / "dev"
+        cloned = subprocess.run(["git", "clone", "-q", "--no-checkout", url, str(clone)],
+                                capture_output=True, text=True, check=False)
+        if cloned.returncode != 0:
+            refuse("origin", f"cannot clone {url}: {last_line(cloned)}")
+        full = make_tag(clone, name, commit, branch)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"jig tag: {name} at {full[:12]} is on origin {url}")
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="jig tag")
+    parser.add_argument("project")
+    parser.add_argument("tag")
+    parser.add_argument("commit")
+    args = parser.parse_args(argv)
+    if not PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    if not COMMIT.fullmatch(args.commit):
+        parser.error(f"bad commit: {args.commit} is not a hash")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        tag(args.project, args.tag, args.commit)
+    except Refused as error:
+        print(f"jig tag: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

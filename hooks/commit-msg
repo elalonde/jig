@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Refuse a commit message that shows private facts or carries a foreign trailer."""
+
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+
+import lint_a  # noqa: E402
+
+sys.exit(lint_a.commit_msg_main(sys.argv[1:], ROOT))

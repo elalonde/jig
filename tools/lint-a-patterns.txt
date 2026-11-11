@@ -1,0 +1,62 @@
+# Patterns that lint A reads to check the tests of this product.
+#
+# A line that starts with a hash sign is a note, and blank lines are skipped.
+# Every pattern is a Python regular expression. Each part starts with its
+# heading line in square brackets.
+# A pattern cannot start with a square bracket, because such a line is read as
+# a mistyped heading and refused. Write a pattern that starts with a class in a
+# group instead, as (?:[A-Z]+)-[0-9]+.
+#
+# Under the heading of process IDs, one pattern per line: the IDs of the
+# process records and the approval tags. Lint A refuses one in a test string.
+# A match counts only when no letter, digit or hyphen stands directly before
+# it and no letter or digit directly after it, and only in the letter case
+# written here.
+#
+# Under the heading of control IDs, one line per ID class of the project: the
+# class name, a space and the class pattern. Lint A refuses a match in a test
+# name.
+#
+# For each product language, a heading in the form "[language NAME]" and three
+# lines: "files" with the pattern of the paths of its test files, matched in
+# full against the path from the top of the product; "names" with the pattern
+# of a test name; and "strings" with the pattern of a string. Names and strings
+# are matched across a whole test file, with the caret and the dollar sign
+# matching at each line. With no language, lint A finds no test file.
+#
+# The line "allow process IDs in test strings", anywhere in the file, turns off
+# the refusal in test strings. The refusal in test names stays.
+#
+# This file is jig's own. jig's tests are Python: every .py file directly under
+# tests/ is a test file, the helper modules among them, because they hold
+# fixture strings too. A bash test file would be tests/test_NAME.sh; there is
+# none, because jig tests its bash code from Python. The control ID part is
+# empty while the project declares no ID classes. The process IDs are what
+# jig's tools work on, so its tests may hold them in strings.
+
+[process IDs]
+D-[0-9]+
+P[0-9]+-D[0-9]+
+Q-[0-9]+
+IQ-[0-9]+
+R-[0-9]+
+OI-[0-9]+
+F-[0-9]+
+spec-p[0-9]+
+spec-p[0-9]+r[0-9]+
+impl-p[0-9]+
+kickoff-r[0-9]+
+
+[control IDs]
+
+[language python3]
+files tests/[^/]+\.py
+names (?<=def )test[A-Za-z0-9_]*
+strings """[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'
+
+[language bash]
+files tests/test_[^/]+\.sh
+names ^[ \t]*(?:function[ \t]+)?test_[A-Za-z0-9_]*
+strings "(?:[^"\\]|\\.)*"|'[^']*'
+
+allow process IDs in test strings

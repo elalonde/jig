@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Print the change log entries of the jig versions after a given one.
+
+usage: jig changelog --since <X.Y.Z>
+
+The change log is CHANGELOG.md of the current installed version,
+<JIG_ROOT>/current/CHANGELOG.md, with JIG_ROOT /opt/jig unless set, as for the
+jig command itself. Each entry starts with the line "## <X.Y.Z>", newest first.
+When the given version has an entry, the entries above it are printed, in file
+order: those are the versions released after it, a patch of an older line
+included. A version with no entry, such as one never released, gets the entries
+of the higher versions instead, in file order. Nothing newer prints nothing.
+Exits 0 when the entries are printed, 1 when the change log cannot be read or
+is not in its form, 2 on a usage error.
+"""
+
+import argparse
+import os
+import pathlib
+import re
+import sys
+
+sys.dont_write_bytecode = True
+
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+HEADING = re.compile(r"## +(\S+)\s*")
+
+
+class Failed(Exception):
+    """The change log cannot be used, so no answer would be trustworthy."""
+
+
+def version_key(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def read_entries(path):
+    """Return the entries of the change log as (version, lines), in file order.
+
+    The lines before the first entry are its title and are left out. A heading
+    of the entry level that names no version is refused, since its lines would
+    otherwise be printed under the entry above it.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise Failed(f"cannot read {path}: {getattr(error, 'strerror', None) or error}") from None
+    entries = []
+    for number, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            match = HEADING.fullmatch(line)
+            if not match or not VERSION.fullmatch(match.group(1)):
+                raise Failed(f"{path}:{number}: an entry heading is not '## <X.Y.Z>': {line}")
+            entries.append((match.group(1), [line]))
+        elif entries:
+            entries[-1][1].append(line)
+    return entries
+
+
+def newer_entries(entries, since):
+    versions = [version for version, _ in entries]
+    if since in versions:
+        return entries[:versions.index(since)]
+    return [entry for entry in entries if version_key(entry[0]) > version_key(since)]
+
+
+def version_argument(text):
+    if not VERSION.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"not a version <X.Y.Z>: {text}")
+    return text
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="jig changelog",
+                                     description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--since", required=True, type=version_argument, metavar="X.Y.Z")
+    args = parser.parse_args(argv)
+    path = pathlib.Path(os.environ.get("JIG_ROOT") or "/opt/jig") / "current" / "CHANGELOG.md"
+    try:
+        entries = read_entries(path)
+    except Failed as error:
+        print(f"jig changelog: {error}", file=sys.stderr)
+        return 1
+    blocks = []
+    for _, lines in newer_entries(entries, args.since):
+        # Blank lines at the end of an entry only separate it from the next one.
+        while lines and not lines[-1].strip():
+            lines = lines[:-1]
+        blocks.append("\n".join(lines))
+    if blocks:
+        print("\n\n".join(blocks))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

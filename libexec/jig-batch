@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""Run the rows of a batch file one at a time, from the orchestrator's account.
+
+usage: jig batch <project> <batch file>
+
+The batch file is a TSV with no header. Blank lines and lines that start with # are
+skipped. Every row has the same number of columns, 4 or 5: the ID, its prompt path, the
+expected minutes, the depends-on IDs, and with 5 columns the kind. The prompt path,
+after ~ is expanded, must be ~/ws/prompts/<project>/<ID>.md, where jig close and jig
+report read it. The depends-on IDs are separated by commas, and - means none.
+
+A row is of one of three kinds. A file of 4 columns holds only rows of kind unit; a
+file with a row of another kind has 5 columns in every row, and its unit rows say unit.
+  unit       one unit of work. A batch holds at most 6 of them.
+  pre-check  a read-only session that checks the prompt of a unit before that unit
+             starts. The unit names the pre-check's ID among its depends-on IDs.
+  review     a review of the result of the units that it names among its depends-on
+             IDs, run right after them.
+Rows of kind pre-check and review do not count toward the 6 units. A pre-check or
+review row runs in the same account as each unit row it is tied to. Nothing starts when
+any row is refused: a malformed row, more than 6 rows of kind unit, a pre-check row that
+no unit row names, a review row that names no unit row, or a pre-check or review row
+whose prompt names another account than a unit row it is tied to.
+
+Each row runs in file order, and every kind starts, waits, reports and closes alike. A
+row is skipped when it is closed OK already: the last line for its ID in
+impl/log/status.log on origin is "end OK", and a "report: <ID>" commit follows its
+newest "log: <ID>". That lets the orchestrator run the same file again after a stop. A
+row starts only when each ID it depends on reported OK in this run or is closed OK, and
+when no hold file exists. For a row that starts: jig start --expected, jig wait until
+the report commit lands (again after a wait that ends on an unchanged screen), then jig
+report. The account and role come from the prompt's first line, and jig start takes
+the model from the prompt and copies the inbox directory beside it. The next row starts
+only when jig report passed and the report says OK. A report of NEEDS SPEC blocks only
+the rows that depend on that row.
+
+A pre-check or review session writes its findings to impl/log/<ID>-findings.md and
+commits the file with its report. Once such a row has reported OK, and again whenever a
+rerun skips it as closed OK, jig batch reads that file from origin and counts its
+findings: a line that starts with "### F-<n> must-fix" is a must-fix finding, one that
+starts with "### F-<n> should-fix" is a should-fix finding, and no other line counts,
+"### F-<n> info" among them. A pre-check row with any must-fix or should-fix finding
+stops the batch, so the unit it checks never starts with its prompt unfixed. A review
+row stops the batch on a must-fix finding only. Without such findings (only info
+findings, or one line that says there is none) the batch goes on. After a stop on
+findings the orchestrator handles them and runs the remaining rows as a new batch file
+without that row and without its ID among the depends-on IDs; a rerun of the same file
+stops at the same row again.
+
+A worker that reported is closed with jig close before the next start in its account,
+and otherwise once JIG_BATCH_CLOSE_DELAY seconds (600) have passed since its report. A
+close that falls due while jig wait runs ends that jig wait first and starts it again
+after, so that the two never fetch the clone at the same time. jig batch exits only
+when every worker that reported is closed, after a stop too. Before each start it
+writes "<k>/<n> <ID>" to <JIG_BATCH_DIR>/<project> (/run/jig/batch by default), the
+file jig status shows, where k is the row's place among all the rows of the file, of
+every kind, and n their number; it removes the file at exit. The hold file is
+<JIG_HOLD_DIR>/<project> (/run/jig/hold).
+
+jig start, jig wait, jig report and jig close run from the directory this file is in,
+so a batch never mixes in tools of the installed version. Each start, report, close,
+skip and stop writes one line with a timestamp to stdout. The exit codes:
+
+  0  every row reported OK or was skipped
+  1  a refusal before the first start: the batch file, a prompt, the conf file or a setting
+  2  a usage error
+  3  a report says NEEDS ERIC
+  4  jig report failed, or the report's status is not one jig batch knows
+  5  a hold
+  6  a dialog in the session (jig wait 3)
+  7  the timeout of 3x the expected time (jig wait 4)
+  8  the session ended without a report (jig wait 6)
+  9  the worker account could not be reached (jig wait 7)
+ 10  jig wait refused (jig wait 1, or any code it does not give)
+ 11  jig start refused
+ 12  jig close refused
+ 13  no runnable row remains, and some rows did not report OK: NEEDS SPEC or blocked
+ 14  the orchestrator's clone could not read origin
+ 15  findings: a pre-check row has a must-fix or should-fix finding, or a review row a
+     must-fix finding
+ 16  a pre-check or review row reported OK or was skipped, but origin has no findings
+     file for it
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+LIBEXEC = pathlib.Path(__file__).resolve().parent
+ROOT = LIBEXEC.parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_ids  # noqa: E402
+
+# jig close holds the prompt reader and the status.log and commit lookups, so the
+# batch reads a prompt and the origin history exactly as jig close does.
+sys.dont_write_bytecode = True
+_loader = importlib.machinery.SourceFileLoader("jig_close", str(LIBEXEC / "jig-close"))
+_spec = importlib.util.spec_from_loader("jig_close", _loader)
+closing = importlib.util.module_from_spec(_spec)
+_loader.exec_module(closing)
+helpers = closing.helpers
+
+(DONE, REFUSED, USAGE, NEEDS_ERIC, REPORT_FAILED, HOLD, DIALOG, TIMEOUT, ENDED, UNREACHABLE,
+ WAIT_REFUSED, START_REFUSED, CLOSE_REFUSED, ROWS_LEFT, ORIGIN, FINDINGS,
+ NO_FINDINGS) = range(17)
+
+# The exit codes of jig wait that stop the batch, with what each means.
+WAIT_STOPS = {
+    3: (DIALOG, "a dialog in the session"),
+    4: (TIMEOUT, "the timeout of 3x the expected time"),
+    6: (ENDED, "the session ended without a report"),
+    7: (UNREACHABLE, "the worker account could not be reached"),
+}
+WAIT_REPORT = 0
+WAIT_NO_CHANGE = 5
+
+MAX_UNITS = 6
+KINDS = ("unit", "pre-check", "review")
+# The heading lines of a findings file that count. A heading must start its line, as
+# grep -c '^### F-[0-9]* must-fix' counts it, so text that mentions a heading in the
+# middle of a line is not taken for a finding.
+MUST_FIX = re.compile(r"### F-[0-9]* must-fix")
+SHOULD_FIX = re.compile(r"### F-[0-9]* should-fix")
+CLOSE_DELAY_SECONDS = 600.0
+# A jig wait that is ended for a close gets this long to exit with its git and ssh
+# children before they are killed outright.
+END_GRACE_SECONDS = 10.0
+
+
+class Stop(Exception):
+    """The batch stops: the exit code and the line that says why."""
+
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+        self.text = text
+
+
+class Row:
+    def __init__(self, number, unit, prompt, minutes, depends, kind):
+        self.number = number
+        self.kind = kind
+        self.unit = unit
+        self.prompt = prompt
+        self.minutes = minutes
+        self.depends = depends
+        self.account = None
+        self.role = None
+
+    def name(self):
+        """Return the ID as the progress lines show it, with the kind unless it is unit."""
+        return self.unit if self.kind == "unit" else f"{self.kind} {self.unit}"
+
+
+def say(text):
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"{now} {text}", flush=True)
+
+
+def parse_row(project, number, fields, seen):
+    """Return the row the fields describe, or raise ValueError with the reason."""
+    unit, prompt, minutes, depends = (field.strip() for field in fields[:4])
+    kind = fields[4].strip() if len(fields) == 5 else "unit"
+    if kind not in KINDS:
+        raise ValueError(f"unknown kind {kind!r}")
+    if not jig_ids.is_unit_id(unit):
+        raise ValueError(f"bad ID {unit!r}")
+    if unit in seen:
+        raise ValueError(f"{unit} appears twice")
+    wanted = pathlib.Path(os.path.expanduser(f"~/ws/prompts/{project}/{unit}.md"))
+    if pathlib.Path(os.path.expanduser(prompt)) != wanted:
+        raise ValueError(f"the prompt path is {prompt!r}, not ~/ws/prompts/{project}/{unit}.md")
+    if not minutes.isascii() or not minutes.isdigit() or int(minutes) <= 0:
+        raise ValueError(f"the expected minutes are {minutes!r}, not a positive integer")
+    if depends == "-":
+        named = []
+    else:
+        named = depends.split(",")
+        for item in named:
+            if not jig_ids.is_unit_id(item):
+                raise ValueError(f"bad depends-on ID {item!r}")
+        if unit in named:
+            raise ValueError(f"{unit} depends on itself")
+    return Row(number, unit, str(wanted), int(minutes), named, kind)
+
+
+def tied_units(row, rows):
+    """Return the unit rows that a pre-check or review row belongs to.
+
+    A pre-check belongs to the units that name it among their depends-on IDs, and a
+    review to the units that it names among its own. A unit row belongs to no other.
+    """
+    units = [other for other in rows if other.kind == "unit"]
+    if row.kind == "pre-check":
+        return [unit for unit in units if row.unit in unit.depends]
+    if row.kind == "review":
+        return [unit for unit in units if unit.unit in row.depends]
+    return []
+
+
+def read_batch(project, path):
+    """Return the rows of the batch file, or raise Stop for the first row that is wrong."""
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise Stop(REFUSED, f"cannot read {path}: {error}") from error
+    rows, seen, width = [], set(), None
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        where = f"{path} line {number}"
+        if len(fields) not in (4, 5):
+            raise Stop(REFUSED, f"{where}: {len(fields)} columns, not 4 or 5")
+        if width is not None and len(fields) != width:
+            raise Stop(REFUSED, f"{where}: {len(fields)} columns, where the rows before "
+                                f"have {width}")
+        width = len(fields)
+        try:
+            row = parse_row(project, number, fields, seen)
+        except ValueError as error:
+            raise Stop(REFUSED, f"{where}: {error}") from error
+        seen.add(row.unit)
+        rows.append(row)
+        if sum(1 for item in rows if item.kind == "unit") > MAX_UNITS:
+            raise Stop(REFUSED, f"{where}: more than {MAX_UNITS} rows of kind unit")
+    if not rows:
+        raise Stop(REFUSED, f"{path} has no rows")
+    # A pre-check or review row that belongs to no unit would check nothing, and a
+    # pre-check that no unit waits for would not hold back the unit it was meant for.
+    for row in rows:
+        if row.kind == "unit" or tied_units(row, rows):
+            continue
+        where = f"{path} line {row.number}"
+        if row.kind == "pre-check":
+            raise Stop(REFUSED, f"{where}: the pre-check row {row.unit} is among the "
+                                f"depends-on IDs of no row of kind unit")
+        raise Stop(REFUSED, f"{where}: the review row {row.unit} names no row of kind unit "
+                            f"among its depends-on IDs")
+    return rows
+
+
+def close_delay():
+    text = os.environ.get("JIG_BATCH_CLOSE_DELAY")
+    if not text:
+        return CLOSE_DELAY_SECONDS
+    try:
+        value = float(text)
+    except ValueError:
+        value = -1.0
+    if not value >= 0:
+        raise Stop(REFUSED, f"JIG_BATCH_CLOSE_DELAY must be a number of seconds, not {text}")
+    return value
+
+
+class Batch:
+    def __init__(self, project, rows):
+        self.project = project
+        self.rows = rows
+        try:
+            conf = helpers.read_conf(project)
+        except helpers.Refused as error:
+            raise Stop(REFUSED, str(error).removeprefix("refused: ")) from error
+        self.clone, self.branch = conf["REPO"], conf["BRANCH"]
+        self.origin = f"refs/remotes/origin/{self.branch}"
+        self.delay = close_delay()
+        self.hold = pathlib.Path(os.environ.get("JIG_HOLD_DIR", "/run/jig/hold")) / project
+        self.progress = pathlib.Path(os.environ.get("JIG_BATCH_DIR", "/run/jig/batch")) / project
+        self.wrote_progress = False
+        self.child = None
+        self.reported_ok = set()
+        self.not_run = set()
+        self.needs_spec = set()
+        # Workers that reported and are not closed yet: account, ID, and when the
+        # close falls due.
+        self.pending = []
+        for row in rows:
+            try:
+                row.account, row.role, _ = closing.read_prompt(project, row.unit)
+            except helpers.Refused as error:
+                raise Stop(REFUSED, f"line {row.number}: "
+                                    f"{str(error).removeprefix('refused: ')}") from error
+        # A pre-check reads the tree of the account its unit works in, and a review
+        # reads the result there, so a row in another account would check the wrong tree.
+        for row in rows:
+            for unit in tied_units(row, rows):
+                if unit.account != row.account:
+                    raise Stop(REFUSED, f"line {row.number}: the {row.kind} row {row.unit} "
+                                        f"runs in {row.account}, but the unit {unit.unit} "
+                                        f"it belongs to runs in {unit.account}")
+
+    def tool(self, name, *args):
+        sys.stdout.flush()
+        return subprocess.run([str(LIBEXEC / f"jig-{name}"), *args], check=False).returncode
+
+    def fetch(self):
+        try:
+            closing.fetch(self.clone)
+        except helpers.Refused as error:
+            raise Stop(ORIGIN, str(error)) from error
+
+    def closed_ok(self, unit):
+        """Say whether origin shows the unit closed with status OK and a passed report."""
+        lines = closing.unit_lines(self.clone, self.branch, unit)
+        if not lines:
+            return False
+        words = lines[-1].split()
+        if words[2] != "end" or " ".join(words[3:-1]) != "OK":
+            return False
+        logged = closing.newest_commit(self.clone, self.origin, f"log: {unit}")
+        if logged is None:
+            return False
+        reported = closing.newest_commit(self.clone, f"{logged}..{self.origin}",
+                                         f"report: {unit}")
+        return reported is not None
+
+    def close(self, account, unit):
+        self.pending = [item for item in self.pending if item[1] != unit]
+        code = self.tool("close", self.project, unit)
+        if code != 0:
+            raise Stop(CLOSE_REFUSED, f"stop: jig close refused {unit} in {account}, exit {code}")
+        say(f"closed {unit} in {account}")
+
+    def close_due(self):
+        now = time.monotonic()
+        for account, unit, due in list(self.pending):
+            if due <= now:
+                self.close(account, unit)
+
+    def close_account(self, account):
+        for item_account, unit, _ in list(self.pending):
+            if item_account == account:
+                self.close(item_account, unit)
+
+    def next_due(self):
+        return min((due for _, _, due in self.pending), default=None)
+
+    def end_child(self):
+        """End the running jig wait and every process it started, then reap it."""
+        child, self.child = self.child, None
+        if child is None or child.poll() is not None:
+            return
+        group = child.pid
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        # A git fetch that outlives jig wait would race with the close that follows.
+        deadline = time.monotonic() + END_GRACE_SECONDS
+        while True:
+            try:
+                os.killpg(group, signal.SIGKILL if time.monotonic() > deadline else 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+
+    def wait_once(self, unit):
+        """Run jig wait once; return its exit code, or None when a close ended it."""
+        self.close_due()
+        with tempfile.TemporaryFile() as output:
+            self.child = subprocess.Popen([str(LIBEXEC / "jig-wait"), self.project, unit],
+                                          stdout=output, start_new_session=True)
+            while True:
+                due = self.next_due()
+                timeout = None if due is None else max(0.0, due - time.monotonic())
+                try:
+                    code = self.child.wait(timeout=timeout)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.child.poll() is not None:
+                        continue
+                    self.end_child()
+                    say(f"ended jig wait on {unit} for a close that fell due")
+                    self.close_due()
+                    return None
+            self.child = None
+            # An unchanged screen is normal during long test runs, so it is not shown.
+            if code != WAIT_NO_CHANGE:
+                output.seek(0)
+                sys.stdout.buffer.write(output.read())
+                sys.stdout.flush()
+        return code
+
+    def wait_for(self, row):
+        while True:
+            code = self.wait_once(row.unit)
+            if code is None:
+                continue
+            if code == WAIT_REPORT:
+                return
+            if code == WAIT_NO_CHANGE:
+                say(f"no change on the screen of {row.unit}; waiting again")
+                continue
+            stop, reason = WAIT_STOPS.get(code, (WAIT_REFUSED, f"jig wait refused, exit {code}"))
+            raise Stop(stop, f"stop: {row.unit}: {reason}")
+
+    def report(self, row):
+        code = self.tool("report", self.project, row.unit)
+        if code != 0:
+            raise Stop(REPORT_FAILED, f"stop: {row.unit}: jig report failed, exit {code}")
+        self.fetch()
+        try:
+            status, _ = closing.run_status(self.clone, self.branch, row.unit, False)
+        except helpers.Refused as error:
+            raise Stop(ORIGIN, f"stop: {row.unit}: {error}") from error
+        say(f"report {row.unit}: {status}")
+        self.pending.append((row.account, row.unit, time.monotonic() + self.delay))
+        if status == "OK":
+            self.reported_ok.add(row.unit)
+        elif status == "NEEDS SPEC":
+            self.needs_spec.add(row.unit)
+            self.not_run.add(row.unit)
+        elif status == "NEEDS ERIC":
+            raise Stop(NEEDS_ERIC, f"stop: {row.unit}: NEEDS ERIC")
+        else:
+            raise Stop(REPORT_FAILED, f"stop: {row.unit}: status {status!r} is not OK, "
+                                      f"NEEDS ERIC or NEEDS SPEC")
+
+    def check_findings(self, row):
+        """Stop the batch when the findings of a pre-check or review row must be handled.
+
+        The file is read from origin, where the session committed it with its report, so
+        a rerun of the same batch file finds the same findings and stops again.
+        """
+        path = f"impl/log/{row.unit}-findings.md"
+        shown = helpers.git(self.clone, "show", f"{self.origin}:{path}")
+        if shown.returncode != 0:
+            raise Stop(NO_FINDINGS, f"stop: {row.kind} row {row.unit}: no {path} on "
+                                    f"origin/{self.branch}")
+        lines = shown.stdout.splitlines()
+        must = sum(1 for line in lines if MUST_FIX.match(line))
+        should = sum(1 for line in lines if SHOULD_FIX.match(line))
+        counts = f"{must} must-fix and {should} should-fix findings in {path}"
+        if must or (row.kind == "pre-check" and should):
+            raise Stop(FINDINGS, f"stop: {row.kind} row {row.unit}: {counts}")
+        say(f"findings of {row.kind} row {row.unit}: {counts}; going on")
+
+    def runnable(self, row):
+        """Say whether every ID the row depends on is OK; say why when one is not."""
+        for unit in row.depends:
+            if unit in self.reported_ok or self.closed_ok(unit):
+                continue
+            if unit in self.needs_spec:
+                say(f"blocked {row.unit}: {unit} reported NEEDS SPEC")
+            elif unit in self.not_run:
+                say(f"blocked {row.unit}: {unit} did not run")
+            else:
+                say(f"not started {row.unit}: its depends-on ID {unit} is not closed OK")
+            return False
+        return True
+
+    def run_row(self, number, row):
+        self.fetch()
+        if self.closed_ok(row.unit):
+            say(f"skipped {row.name()}: closed OK already")
+            self.reported_ok.add(row.unit)
+            if row.kind != "unit":
+                self.check_findings(row)
+            return
+        if not self.runnable(row):
+            self.not_run.add(row.unit)
+            return
+        if self.hold.exists():
+            raise Stop(HOLD, f"stop: {self.project} is held ({self.hold}); {row.unit} "
+                             f"did not start")
+        self.close_account(row.account)
+        self.close_due()
+        self.progress.parent.mkdir(parents=True, exist_ok=True)
+        self.progress.write_text(f"{number}/{len(self.rows)} {row.unit}\n", encoding="utf-8")
+        self.wrote_progress = True
+        code = self.tool("start", self.project, row.role, row.unit, row.prompt,
+                         "--expected", str(row.minutes))
+        if code != 0:
+            raise Stop(START_REFUSED, f"stop: jig start refused {row.unit}, exit {code}")
+        say(f"started {row.name()} ({number}/{len(self.rows)}) in {row.account}")
+        self.wait_for(row)
+        self.report(row)
+        if row.kind != "unit" and row.unit in self.reported_ok:
+            self.check_findings(row)
+
+    def run(self):
+        for number, row in enumerate(self.rows, 1):
+            self.run_row(number, row)
+        if self.not_run:
+            left = " ".join(row.unit for row in self.rows if row.unit in self.not_run)
+            raise Stop(ROWS_LEFT, f"stop: no runnable row remains; not OK: {left}")
+
+    def drain(self):
+        """Close every worker that reported, each once its delay has passed; return a stop."""
+        stop = None
+        while self.pending:
+            due = self.next_due()
+            time.sleep(max(0.0, due - time.monotonic()))
+            try:
+                self.close_due()
+            except Stop as refused:
+                say(refused.text)
+                stop = stop or refused
+        return stop
+
+    def cleanup(self):
+        self.end_child()
+        if self.wrote_progress:
+            self.progress.unlink(missing_ok=True)
+
+
+def parse_args(argv):
+    # --help shows the whole text above after its usage line: the row kinds, the stops
+    # and every exit code.
+    parser = argparse.ArgumentParser(prog="jig batch",
+                                     description=__doc__.split("\n\n", 2)[2],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("project")
+    parser.add_argument("batch_file", metavar="batch file")
+    args = parser.parse_args(argv)
+    if not helpers.PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    return args
+
+
+def on_signal(number, _frame):
+    raise SystemExit(128 + number)
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        batch = Batch(args.project, read_batch(args.project, args.batch_file))
+    except Stop as refused:
+        print(f"jig batch: refused: {refused.text}", file=sys.stderr)
+        return refused.code
+    signal.signal(signal.SIGTERM, on_signal)
+    stop = None
+    try:
+        try:
+            batch.run()
+        except Stop as stopped:
+            stop = stopped
+            say(stopped.text)
+        closing_stop = batch.drain()
+    finally:
+        batch.cleanup()
+    stop = stop or closing_stop
+    if stop is None:
+        say("done: every row reported OK or was skipped")
+        return DONE
+    return stop.code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

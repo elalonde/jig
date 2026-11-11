@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Check that a unit prompt or a unit report has the form of jig's template for it.
+
+usage: jig validate prompt <file>
+       jig validate report <file>
+
+Exit 0 when the file is valid, 1 when it is not or cannot be read, with one line
+per failure on stderr, and 2 on a usage error. This reads form only and fills no
+value of a report: that, and reading git for a report, is the work of jig report. A
+READ path is judged by its text alone, because it names a place in another account.
+
+A prompt may name no READ path under ~/ws/ref, where the reference material lives,
+while the project's clean room is on: the clean room is the setting that keeps that
+material away from everyone but the spec writer. The project is the one the prompt's
+first line names, and its profile in the kickoff record sets the clean room (see
+lib/jig_profile.py), read through the project's conf file and -dev clone. With "clean
+room: off" a path under ~/ws/ref is judged like any other, against the role's list.
+When there is no value to read, a line on stderr says so and the rule holds, as with
+the clean room on.
+
+A prompt whose first line names the implementer account must also name the
+section "Comment standard" of CLAUDE.md in its ROLE section: that session writes
+product code, and the section holds the rules its comments follow.
+"""
+
+import argparse
+import datetime
+import os
+import posixpath
+import pwd
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+
+import jig_dirs  # noqa: E402
+import jig_ids  # noqa: E402
+import jig_profile  # noqa: E402
+
+SECTIONS = ("UNATTENDED", "MODEL CHECK", "EFFORT", "ROLE", "STATE", "READ", "AUTHORITY",
+            "PREMISE CHECK", "REQUIREMENTS", "PROOF", "SESSION ECONOMY", "STEPS", "ESCALATION",
+            "REPORT")
+SECTION_LINE = re.compile("(" + "|".join(SECTIONS) + r"):(?: .*)?")
+
+FIRST_LINE = re.compile(
+    r"# (?P<id>\S+)  paste into: (?P<name>\S+) "
+    r"\((?P<account>[a-z][a-z0-9_-]*), ~/ws/src/(?P<project>[a-z0-9][a-z0-9._-]*)-dev\)"
+)
+LAST_LINE = re.compile(r"# end (?P<id>\S+)")
+ROLE_IN_NAME = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+
+# The account in the first line's parentheses decides whether the prompt is for a
+# session that writes product code. The words may wrap onto the next line of the
+# ROLE section, so any run of whitespace may stand between them.
+PARENTHESES = re.compile(r"\((?P<inside>[^)]*)\)")
+IMPLEMENTER = re.compile(r"(?<![A-Za-z0-9_-])implementer(?![A-Za-z0-9_-])")
+COMMENT_STANDARD = re.compile(r"Comment\s+standard")
+
+# Words of the READ section. Anything that can end a word in a shell or in a sentence
+# ends one here, so a path in quotes or after "tag:" is found. A part cut off this way
+# is judged alone, and fails unless it is itself in a list.
+READ_WORD = re.compile(r"[^\s'\"`()\[\]{},;:=<>|&!?]+")
+WEB_ADDRESS = re.compile(r"\bhttps?://\S+")
+
+CLASSES = ("none", "patch", "minor", "major")
+MAX_BODY_LINES = 25
+
+# A whole value in angle brackets is the template's text, left unfilled.
+FREE_TEXT = re.compile(r"(?!<.*>\Z)\S.*")
+HASH = re.compile(r"[0-9a-f]{7,40}")
+EXIT_CODE = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+CHECK_ENTRY = re.compile(rf"(?P<name>[a-z0-9][a-z0-9_-]*)={EXIT_CODE}")
+# A proof the unit could not run has no exit code to show.
+PROOF_ENTRY = re.compile(rf"(?P<name>P[1-9][0-9]*)=(?:{EXIT_CODE}|none)")
+ISO_TIME = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})"
+TIMES = re.compile(rf"(?P<start>{ISO_TIME})  end: (?P<end>{ISO_TIME})  context: (?P<context>.*)")
+
+
+def first_line_failures(line):
+    """Return the failures of the first line, and the ID it names, if any."""
+    match = FIRST_LINE.fullmatch(line)
+    if not match:
+        return [f"line 1: first line is not "
+                f"'# <ID>  paste into: <project>-<role>-<ID> (<account>, ~/ws/src/<project>-dev)': "
+                f"{line!r}"], None
+    unit_id = match["id"]
+    failures = []
+    if not jig_ids.is_unit_id(unit_id):
+        failures.append(f"line 1: {unit_id!r} is not a valid ID")
+    name = re.escape(match["project"]) + "-" + ROLE_IN_NAME + "-" + re.escape(unit_id)
+    if not re.fullmatch(name, match["name"]):
+        failures.append(f"line 1: {match['name']!r} is not <project>-<role>-{unit_id}")
+    return failures, unit_id
+
+
+def last_line_failures(number, line, first_id):
+    match = LAST_LINE.fullmatch(line)
+    if not match:
+        return [f"line {number}: last line is not '# end <ID>': {line!r}"]
+    if not jig_ids.is_unit_id(match["id"]):
+        return [f"line {number}: last line: {match['id']!r} is not a valid ID"]
+    if first_id is not None and match["id"] != first_id:
+        return [f"line {number}: last line names {match['id']!r}, the first line {first_id!r}"]
+    return []
+
+
+def section_failures(lines):
+    found = []
+    for number, line in enumerate(lines, 1):
+        match = SECTION_LINE.fullmatch(line)
+        if match:
+            found.append((number, match[1]))
+
+    labels = {label for _, label in found}
+    failures = [f"section {label} is missing" for label in SECTIONS if label not in labels]
+
+    # Comparing each section with the one before it names one failure per move,
+    # not every section a moved one now stands in front of.
+    seen = set()
+    previous = None
+    for number, label in found:
+        if label in seen:
+            failures.append(f"line {number}: section {label} appears twice")
+        seen.add(label)
+        if previous is not None and SECTIONS.index(label) < SECTIONS.index(previous):
+            failures.append(f"line {number}: section {label} is out of order: "
+                            f"it follows {previous}")
+        previous = label
+    return failures
+
+
+def section_text(lines, label):
+    """Return the number of the first line of a section and its text, or (None, "").
+
+    The section runs from its label to the next section label.
+    """
+    start, text = None, []
+    for number, line in enumerate(lines, 1):
+        match = SECTION_LINE.fullmatch(line)
+        if match and start is not None:
+            break
+        if match and match[1] == label:
+            start = number
+        if start is not None:
+            text.append(line)
+    return start, "\n".join(text)
+
+
+def comment_standard_failures(lines):
+    """Check that a prompt for the implementer account names the comment rules."""
+    match = PARENTHESES.search(lines[0]) if lines else None
+    if not match or not IMPLEMENTER.search(match["inside"]):
+        return []
+    number, text = section_text(lines, "ROLE")
+    # A missing ROLE section is already a failure of its own.
+    if number is None or COMMENT_STANDARD.search(text):
+        return []
+    return [f"line {number}: a prompt for the implementer account must name the section "
+            f"Comment standard of CLAUDE.md in its ROLE section"]
+
+
+def read_section_lines(lines):
+    """Yield the number and text of each line of READ, up to "DO NOT READ"."""
+    in_read = False
+    for number, line in enumerate(lines, 1):
+        match = SECTION_LINE.fullmatch(line)
+        if match:
+            in_read = match[1] == "READ"
+        if in_read:
+            text, stop, _ = line.partition("DO NOT READ")
+            yield number, text
+            in_read = not stop
+
+
+def read_paths(text):
+    """Return the words of a READ line that name a path to check, as they are written.
+
+    That is a word that starts with / or ~, and a relative one with a .. in it, which
+    can climb out of the repo. A full stop after a word ends the sentence; after a
+    final . or .. it would turn a parent into a child, so those keep theirs.
+    """
+    text = text.replace("${HOME}", "~").replace("$HOME", "~")
+    paths = []
+    for word in READ_WORD.findall(WEB_ADDRESS.sub(" ", text)):
+        if word.endswith(".") and not word.endswith(("/.", "/..")):
+            word = word[:-1]
+        if word[:1] in ("/", "~") or ".." in word.split("/"):
+            paths.append(word)
+    return paths
+
+
+def account_home(account):
+    try:
+        return pwd.getpwnam(account).pw_dir
+    except KeyError:
+        return f"/home/{account}"
+
+
+def from_home(path, account, working_directory):
+    """Return a path with no . or .. in it, and ~ for the account's home if it is there."""
+    home = account_home(account)
+    if path == f"~{account}" or path.startswith(f"~{account}/"):
+        path = "~" + path[len(account) + 1:]
+    elif not path.startswith(("/", "~")):
+        path = f"{working_directory}/{path}"
+    # normpath keeps a leading //, and a real path with that form means the root.
+    path = posixpath.normpath(re.sub("/+", "/", path))
+    if is_under(path, home):
+        return "~" + path[len(home):]
+    return path
+
+
+def is_under(path, directory):
+    return path == directory or path.startswith(directory.rstrip("/") + "/")
+
+
+def clean_room_on(lines):
+    """Return whether the clean room is on for the project of the prompt's first line."""
+    match = FIRST_LINE.fullmatch(lines[0]) if lines else None
+    if not match:
+        return jig_profile.no_clean_room_value()
+    return jig_profile.clean_room_on_for(match["project"])
+
+
+def read_failures(lines, clean_room):
+    """Check each READ path against the working directory and the list of the first line's role."""
+    match = FIRST_LINE.fullmatch(lines[0]) if lines else None
+    if not match:
+        return []
+    project, unit_id = match["project"], match["id"]
+    head, tail = f"{project}-", f"-{unit_id}"
+    if not (match["name"].startswith(head) and match["name"].endswith(tail)):
+        return []
+    role = match["name"][len(head):-len(tail)]
+    working_directory = f"~/ws/src/{project}-dev"
+    allowed = [working_directory, *jig_dirs.of_role(role, project)]
+
+    failures = []
+    for number, text in read_section_lines(lines):
+        for written in read_paths(text):
+            path = from_home(written, match["account"], working_directory)
+            if clean_room and is_under(path, jig_dirs.REFERENCE_ROOT):
+                failures.append(f"line {number}: READ path {written} is under "
+                                f"{jig_dirs.REFERENCE_ROOT}, which no prompt may name "
+                                f"while the clean room is on")
+            elif not any(is_under(path, directory) for directory in allowed):
+                failures.append(f"line {number}: READ path {written} is outside the repo "
+                                f"and the list of role {role}")
+    return failures
+
+
+def prompt_failures(lines):
+    first = lines[0] if lines else ""
+    last = lines[-1] if lines else ""
+    failures, first_id = first_line_failures(first)
+    failures += section_failures(lines)
+    failures += read_failures(lines, clean_room_on(lines))
+    failures += comment_standard_failures(lines)
+    failures += last_line_failures(max(len(lines), 1), last, first_id)
+    return failures
+
+
+def status_problem(line):
+    if line == "OK":
+        return None
+    for prefix in ("OK: ", "NEEDS ERIC: "):
+        if line.startswith(prefix) and FREE_TEXT.fullmatch(line[len(prefix):]):
+            return None
+    if line.startswith("NEEDS SPEC: "):
+        question = line[len("NEEDS SPEC: "):]
+        if question.startswith("IQ-") and jig_ids.RECORD_ID.fullmatch(question):
+            return None
+    return f"status is not OK[: note], NEEDS ERIC: reason or NEEDS SPEC: IQ-n: {line!r}"
+
+
+def version_problem(value):
+    return None if value == "1" else f"must be 1, not {value!r}"
+
+
+def id_problem(value):
+    return None if jig_ids.is_unit_id(value) else f"{value!r} is not a valid ID"
+
+
+def class_problem(value):
+    return None if value in CLASSES else f"must be one of {', '.join(CLASSES)}, not {value!r}"
+
+
+def commits_problem(value):
+    if value == "none":
+        return None
+    for entry in value.split(" "):
+        if not HASH.fullmatch(entry):
+            return f"{entry!r} is not a commit hash"
+    return None
+
+
+def entries_problem(value, pattern, form):
+    names = set()
+    for entry in value.split(" "):
+        match = pattern.fullmatch(entry)
+        if not match:
+            return f"{entry!r} is not {form}"
+        if match["name"] in names:
+            return f"{match['name']} appears twice"
+        names.add(match["name"])
+    return None
+
+
+def checks_problem(value):
+    if value == "none":
+        return None
+    return entries_problem(value, CHECK_ENTRY, "<name>=<exit code>")
+
+
+def proofs_problem(value):
+    return entries_problem(value, PROOF_ENTRY, "P<n>=<exit code> or P<n>=none")
+
+
+def times_problem(value):
+    match = TIMES.fullmatch(value)
+    if not match:
+        return f"not '<ISO time>  end: <ISO time>  context: <value>': {value!r}"
+    for name in ("start", "end"):
+        try:
+            datetime.datetime.fromisoformat(match[name])
+        except ValueError:
+            return f"{name} {match[name]!r} is not a real time"
+    if not re.fullmatch(r"(?!<.*>\Z)\S+", match["context"]):
+        return f"context {match['context']!r} is not one value"
+    return None
+
+
+def next_problem(value):
+    return None if FREE_TEXT.fullmatch(value) else f"needs one line of text, not {value!r}"
+
+
+HEADER_LINES = (
+    ("jig-report", version_problem),
+    ("id", id_problem),
+    ("class", class_problem),
+    ("commits", commits_problem),
+    ("checks", checks_problem),
+    ("proofs", proofs_problem),
+    ("start", times_problem),
+    ("next", next_problem),
+)
+
+
+def report_failures(lines):
+    failures = []
+    if lines:
+        problem = status_problem(lines[0])
+        if problem:
+            failures.append(f"line 1: {problem}")
+    else:
+        failures.append("line 1: missing, expected the status")
+
+    for number, (label, check) in enumerate(HEADER_LINES, 2):
+        if number > len(lines):
+            failures.append(f"line {number}: missing, expected '{label}: '")
+            continue
+        line = lines[number - 1]
+        if not line.startswith(f"{label}: "):
+            failures.append(f"line {number}: expected '{label}: ', found {line!r}")
+            continue
+        problem = check(line[len(label) + 2:])
+        if problem:
+            failures.append(f"line {number}: {label}: {problem}")
+
+    separator = len(HEADER_LINES) + 2
+    if len(lines) < separator:
+        failures.append(f"line {separator}: missing, expected '---'")
+    elif lines[separator - 1] != "---":
+        failures.append(f"line {separator}: expected '---', found {lines[separator - 1]!r}")
+    elif len(lines) - separator > MAX_BODY_LINES:
+        failures.append(f"{len(lines) - separator} lines after '---', "
+                        f"at most {MAX_BODY_LINES}")
+    return failures
+
+
+CHECKS = {"prompt": prompt_failures, "report": report_failures}
+
+
+def text_failures(kind, text):
+    """Return the failures of a prompt or report given as text; jig report checks this way."""
+    # Split on newlines only, so that a stray CR or form feed stays visible in its line.
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    failures = []
+    if any("\r" in line for line in lines):
+        failures.append("the file holds a carriage return")
+    return failures + CHECKS[kind](lines)
+
+
+def failures_of(kind, path):
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read().decode("utf-8")
+    except OSError as error:
+        return [f"cannot read: {error.strerror}"]
+    except UnicodeDecodeError:
+        return ["not UTF-8"]
+    return text_failures(kind, text)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="jig validate",
+                                     description=__doc__.split("\n", 1)[0])
+    parser.add_argument("kind", choices=sorted(CHECKS))
+    parser.add_argument("file")
+    args = parser.parse_args(argv)
+
+    failures = failures_of(args.kind, args.file)
+    for failure in failures:
+        print(f"jig validate: {args.file}: {failure}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

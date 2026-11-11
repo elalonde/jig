@@ -1,0 +1,63 @@
+#!/bin/bash
+# Run a block the orchestrator wrote for a person, after checking its hash,
+# and keep the output as a readback the orchestrator reads.
+#
+# usage: jig run <project> <ID> <hash>
+#
+# The block is <root>/blocks/<project>/<ID>.sh and the readback is
+# <root>/out/<project>/<ID>.txt, which appears when the block ends; JIG_SRV
+# names <root> (default /srv/jig).
+# <hash> is the first 8 hex digits of the block's sha256. The exit code is
+# the block's, or 1 when nothing ran, or 2 for a usage error.
+set -euo pipefail
+
+root=${JIG_SRV:-/srv/jig}
+
+usage() {
+    echo "usage: jig run <project> <ID> <hash>" >&2
+    exit 2
+}
+
+refuse() {
+    echo "jig run: $*; nothing ran" >&2
+    exit 1
+}
+
+[ "$#" -eq 3 ] || usage
+project=$1
+id=$2
+want=${3,,}
+[[ "$project" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || refuse "bad project: $project"
+[[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || refuse "bad ID: $id"
+[[ "$want" =~ ^[0-9a-f]{8}$ ]] || refuse "bad hash: $3 (8 hex digits)"
+
+block=$root/blocks/$project/$id.sh
+out_dir=$root/out/$project
+readback=$out_dir/$id.txt
+[ -f "$block" ] || refuse "no block $id for $project at $block"
+
+# Hash and run one private copy, so a block changed after the check cannot run.
+copy=$(mktemp "${TMPDIR:-/tmp}/jig-run.XXXXXX")
+trap 'rm -f -- "$copy"' EXIT
+cp -- "$block" "$copy"
+have=$(sha256sum -- "$copy" | cut -c1-8)
+[ "$have" = "$want" ] || refuse "hash $have, expected $want for $block"
+
+# The block writes into a dot name, which the supervisor does not watch, and
+# the readback gets its own name only when the block has ended: a block that
+# pauses would otherwise be announced, and read, half done.
+partial=$out_dir/.$id.txt
+mkdir -p -- "$out_dir" || refuse "cannot make $out_dir"
+: >"$partial" || refuse "cannot write $partial"
+
+codes=(0 0)
+bash -l "$copy" 2>&1 | tee -- "$partial" || codes=("${PIPESTATUS[@]}")
+if ! mv -f -- "$partial" "$readback"; then
+    echo "jig run: the readback is at $partial, not at $readback" >&2
+    [ "${codes[0]}" -ne 0 ] || exit 1
+fi
+if [ "${codes[1]}" -ne 0 ]; then
+    echo "jig run: the readback at $readback is incomplete" >&2
+    [ "${codes[0]}" -ne 0 ] || exit 1
+fi
+exit "${codes[0]}"

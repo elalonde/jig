@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""The part of jig start that runs in the worker account.
+
+usage: jig-start-worker <project> <role> <ID> <prompt> --expected <minutes> --model <model>
+           [--effort <level>] [--account <account>] [--branch <branch>] [--tag <tag>]...
+           [--approved-tag <tag>] [--head <commit>] [--stage all|check|launch]
+           [--add-dir <directory>]...
+
+The check stage refuses, in order: a lock, a live session of that name, a role
+account that differs, no fetch or the wrong branch, a dirty tree, a failed
+fast-forward, a HEAD other than origin, a tag missing on origin. A change to
+impl/orch/updates.log alone does not make the tree dirty, because jig orch appends
+idle lines there between the orchestrator's commits. The launch
+stage takes the lock, brings the clone to origin, sets the effort, places the
+prompt, refreshes the approved worktree and starts the session. The default runs
+both, so the script can run alone in the account. A refusal in the launch stage
+keeps the lock when jig start has pushed the unit's start line (it passes
+--head), or when the session is still there, so that jig close --dead finds
+the unit and writes its end line.
+
+jig start sends this file to python3 over ssh, because the tree it runs from may
+not be readable here. So it imports the standard library and nothing else, and
+gets the role's list of directories (lib/jig_dirs.py) from jig start, as --add-dir;
+alone in the account it passes only the ones it is given. It expands ~ here, and
+leaves out a directory that does not exist.
+Exits 1 on a refusal, naming what refused on stderr; 2 on a usage error.
+"""
+
+import argparse
+import datetime
+import getpass
+import grp
+import json
+import os
+import pathlib
+import pwd
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+# Copied from lib/jig_ids.py, which this script cannot import; a test holds them equal.
+UNIT_ID = re.compile(r"[a-z0-9]{1,6}")
+PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+# The one file of the clone that may hold a change when a unit starts.
+UPDATES_LOG = "impl/orch/updates.log"
+ROLE_KEYS = {"spec": "SPEC_ACCOUNT", "impl": "IMPL_ACCOUNT", "rev": "REV_ACCOUNT"}
+# The permission mode of every session jig starts, unless the clone already names one.
+PERMISSION_MODE = "auto"
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# An answer the folder-trust dialog offers. The session waits there with no output.
+TRUST_DIALOG = "Yes, I trust this folder"
+SETTLE_SECONDS = 30.0
+POLL_SECONDS = 0.2
+
+# The group that opens /run/jig and /srv/jig to a session. A pane has the groups of its
+# tmux server, which may have started before the account joined, so the session asks sg.
+SESSION_GROUP = "jig"
+
+
+class Refused(Exception):
+    """A precondition failed; the message names it."""
+
+
+def refuse(name, detail):
+    raise Refused(f"refused: {name}: {detail}")
+
+
+def git(clone, *args):
+    return subprocess.run(["git", "-C", str(clone), *args], capture_output=True, text=True,
+                          check=False)
+
+
+def git_out(clone, *args):
+    """Return the output of a git command, or an empty string when it fails."""
+    result = git(clone, *args)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def last_line(result):
+    lines = (result.stderr or result.stdout).strip().splitlines()
+    return lines[-1] if lines else f"exit {result.returncode}"
+
+
+def read_conf(project):
+    """Read the conf file as data: it is never run. Refuse without REPO and BRANCH."""
+    path = pathlib.Path(os.path.expanduser(f"~/.config/jig/{project}.conf"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        refuse("conf", f"cannot read {path}: {error.strerror}")
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("\"'")
+    for key in ("REPO", "BRANCH"):
+        if not values.get(key):
+            refuse("conf", f"{path} sets no {key}")
+    values["REPO"] = os.path.expanduser(values["REPO"])
+    return values
+
+
+def role_accounts(conf, role):
+    """Return the accounts of a role: a reviewer may run in more than one."""
+    return conf.get(ROLE_KEYS[role], "").split()
+
+
+def lock_path(project, account):
+    return pathlib.Path(os.environ.get("JIG_LOCK_DIR", "/run/jig/lock")) / f"{project}-{account}"
+
+
+def expected_path(lock):
+    return lock.with_name(lock.name + ".expected")
+
+
+def check_lock(project, account):
+    lock = lock_path(project, account)
+    if lock.exists():
+        refuse("lock", f"{lock} exists; if it is stale, remove it by hand")
+
+
+def check_account(conf, role, account):
+    accounts = role_accounts(conf, role)
+    if account not in accounts:
+        refuse("account", f"the conf file gives role {role} to {' '.join(accounts) or 'nobody'}, "
+                          f"not {account}")
+
+
+def session_alive(session):
+    return subprocess.run(["tmux", "has-session", "-t", f"={session}"], capture_output=True,
+                          check=False).returncode == 0
+
+
+def check_session(session):
+    if session_alive(session):
+        refuse("session", f"tmux session {session} exists")
+
+
+def check_clone(conf, tags):
+    clone, branch = conf["REPO"], conf["BRANCH"]
+    if not os.path.isdir(clone):
+        refuse("fetch", f"no clone at {clone}")
+    fetched = git(clone, "fetch", "-q", "origin")
+    if fetched.returncode != 0:
+        refuse("fetch", f"cannot fetch origin in {clone}: {last_line(fetched)}")
+    current = git_out(clone, "symbolic-ref", "-q", "--short", "HEAD")
+    if current != branch:
+        refuse("branch", f"{clone} has {current or 'a detached HEAD'} checked out, not {branch}")
+    origin_head = git_out(clone, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}")
+    if not origin_head:
+        refuse("branch", f"origin has no branch {branch}")
+    # jig orch, the supervisor of the orchestrator's session, appends idle lines to the
+    # update log between commits, so a change to that one file does not make the clone
+    # dirty. Every untracked file is listed alone, so that a new update log does not hide
+    # behind the name of its directory, and the raw output keeps the status columns of
+    # the first line, which git_out would strip.
+    status = git(clone, "status", "--porcelain", "--untracked-files=all")
+    dirty = [line for line in status.stdout.splitlines() if line[3:] != UPDATES_LOG] \
+        if status.returncode == 0 else []
+    if dirty:
+        refuse("clean", f"{clone} is not clean: {dirty[0]}")
+    merged = git(clone, "merge", "-q", "--ff-only", f"refs/remotes/origin/{branch}")
+    if merged.returncode != 0:
+        refuse("fast-forward", f"{branch} cannot fast-forward to origin: {last_line(merged)}")
+    head = git_out(clone, "rev-parse", "HEAD")
+    if head != origin_head:
+        refuse("head", f"HEAD {head} is not origin/{branch} {origin_head}")
+    for tag in tags:
+        if not git_out(clone, "ls-remote", "--tags", "origin", f"refs/tags/{tag}"):
+            refuse("tag", f"{tag} is not on origin")
+
+
+def bring_to_origin(conf, head):
+    """Bring the clone to the origin head, which holds the status commit when jig start ran."""
+    clone, branch = conf["REPO"], conf["BRANCH"]
+    fetched = git(clone, "fetch", "-q", "origin")
+    if fetched.returncode != 0:
+        refuse("fetch", f"cannot fetch origin in {clone}: {last_line(fetched)}")
+    merged = git(clone, "merge", "-q", "--ff-only", f"refs/remotes/origin/{branch}")
+    if merged.returncode != 0:
+        refuse("fast-forward", f"{branch} cannot fast-forward to origin: {last_line(merged)}")
+    if head and git(clone, "merge-base", "--is-ancestor", head, "HEAD").returncode != 0:
+        refuse("head", f"{clone} does not contain {head}")
+
+
+def set_effort(clone, model, effort):
+    """Merge the effort and the permission mode into the clone's local settings.
+
+    The mode decides the text under the input bar, which jig wait and the supervisor
+    read; a mode that is already set stays, and so does every other key.
+    """
+    path = pathlib.Path(clone) / ".claude" / "settings.local.json"
+    settings = {}
+    if path.exists():
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            refuse("settings", f"cannot read {path}: {error}")
+        if not isinstance(settings, dict):
+            refuse("settings", f"{path} does not hold an object")
+    settings["effortLevel"] = effort
+    per_model = settings.setdefault("modelSettings", {})
+    if not isinstance(per_model, dict) or not isinstance(per_model.setdefault(model, {}), dict):
+        refuse("settings", f"{path} has a modelSettings that is not an object")
+    per_model[model]["effortLevel"] = effort
+    permissions = settings.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        refuse("settings", f"{path} has a permissions that is not an object")
+    permissions.setdefault("defaultMode", PERMISSION_MODE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=path.name)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(settings, stream, indent=2)
+        stream.write("\n")
+    os.replace(name, path)
+
+
+def place_prompt(prompt, project, unit):
+    """Put the prompt and its inbox directory in the account's prompt tree; return the prompt."""
+    source = pathlib.Path(prompt).expanduser()
+    if not source.is_file():
+        refuse("prompt", f"no prompt at {source}")
+    target = pathlib.Path(os.path.expanduser(f"~/ws/prompts/{project}")) / f"{unit}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == target.resolve():
+        return target
+    shutil.copyfile(source, target)
+    inbox = source.parent / unit
+    if inbox.is_dir():
+        shutil.copytree(inbox, target.parent / unit, dirs_exist_ok=True)
+    return target
+
+
+def set_writable(tree, writable):
+    """Add or take away the write bits of a whole tree."""
+    def apply(path):
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        if writable:
+            os.chmod(path, mode | stat.S_IWUSR)
+        else:
+            os.chmod(path, mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+    # Going down, a directory opens before its entries; coming up, it closes after them.
+    for root, dirs, files in os.walk(tree, topdown=writable):
+        if writable:
+            apply(root)
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            if not os.path.islink(path) and (writable or name in files):
+                apply(path)
+        if not writable:
+            apply(root)
+
+
+def refresh_approved(clone, tag):
+    """Put the read-only worktree at a tag, and confirm that it is there."""
+    worktree = pathlib.Path(str(clone) + "-approved")
+    fetched = git(clone, "fetch", "-q", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
+    if fetched.returncode != 0:
+        refuse("worktree", f"cannot fetch {tag}, or it moved: {last_line(fetched)}")
+    if (worktree / ".git").exists():
+        set_writable(worktree, True)
+        moved = git(worktree, "checkout", "-q", "--detach", tag)
+    else:
+        git(clone, "worktree", "prune")
+        moved = git(clone, "worktree", "add", "-q", "--detach", str(worktree), tag)
+    if moved.returncode != 0:
+        refuse("worktree", f"cannot put {worktree} at {tag}: {last_line(moved)}")
+    at = git_out(worktree, "rev-parse", "HEAD")
+    wanted = git_out(clone, "rev-parse", f"refs/tags/{tag}^{{commit}}")
+    if not at or at != wanted:
+        refuse("worktree", f"{worktree} is at {at or 'nothing'}, not {tag} {wanted}")
+    dirty = git_out(worktree, "status", "--porcelain")
+    if dirty:
+        refuse("worktree", f"{worktree} is not clean: {dirty.splitlines()[0]}")
+    set_writable(worktree, False)
+
+
+def take_lock(project, account, session, expected):
+    lock = lock_path(project, account)
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+    except FileExistsError:
+        refuse("lock", f"{lock} exists; if it is stale, remove it by hand")
+    except OSError as error:
+        refuse("lock", f"cannot create {lock}: {error.strerror}")
+    started = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(f"session={session}\nstart={started}\n")
+    expected_path(lock).write_text(f"{expected}\n", encoding="utf-8")
+    return lock
+
+
+def drop_lock(lock):
+    lock.unlink(missing_ok=True)
+    expected_path(lock).unlink(missing_ok=True)
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
+
+
+def in_session_group():
+    """Say whether the group database lists this account, whatever this process holds."""
+    try:
+        wanted = grp.getgrnam(SESSION_GROUP).gr_gid
+        entry = pwd.getpwuid(os.getuid())
+    except KeyError:
+        return False
+    return wanted in os.getgrouplist(entry.pw_name, entry.pw_gid)
+
+
+def session_command(inner):
+    """Return the pane's command: the prompt stays in a file, so only the quoting nests."""
+    command = f"bash -lc {shlex.quote(inner)}"
+    if in_session_group():
+        return f"sg {SESSION_GROUP} -c {shlex.quote(command)}"
+    return command
+
+
+def existing_dirs(directories):
+    """Expand ~ in this account, and keep the directories that exist here."""
+    expanded = (os.path.expanduser(directory) for directory in directories)
+    return [directory for directory in expanded if os.path.isdir(directory)]
+
+
+def open_session(session, clone, model, directories, prompt, tee):
+    """Start Claude Code in tmux with the prompt as its first message, teeing the pane.
+
+    The pane holds a terminal, because Claude Code leaves its interactive mode when
+    its output is a pipe. So the tee hangs on the pane, not in the command, and the
+    command waits until the tee is on, or the first output would be lost.
+
+    --add-dir takes every word up to the next option, so it stands before --model
+    and the prompt can never be read as one more directory.
+    """
+    channel = f"jig-start-{session}"
+    add_dirs = "".join(f"--add-dir {shlex.quote(directory)} " for directory in directories)
+    inner = (
+        f"export PATH={shlex.quote(os.environ.get('PATH', ''))}:$PATH; "
+        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
+        f"tmux wait-for {shlex.quote(channel)}; "
+        f"exec claude {add_dirs}--model {shlex.quote(model)} --name {shlex.quote(session)} "
+        f'"$(cat {shlex.quote(str(prompt))})"'
+    )
+    created = tmux("new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", str(clone),
+                   session_command(inner))
+    if created.returncode != 0:
+        refuse("tmux", f"cannot start session {session}: {last_line(created)}")
+    piped = tmux("pipe-pane", "-o", "-t", f"={session}:", f"cat >> {shlex.quote(str(tee))}")
+    if piped.returncode != 0:
+        tmux("kill-session", "-t", f"={session}")
+        refuse("tmux", f"cannot tee session {session}: {last_line(piped)}")
+    tmux("wait-for", "-S", channel)
+
+
+def watch_pane(session):
+    """Read the pane while the session settles; a dialog or an early end stops the start."""
+    deadline = time.monotonic() + float(os.environ.get("JIG_START_SETTLE", SETTLE_SECONDS))
+    while True:
+        if not session_alive(session):
+            refuse("session", f"session {session} ended during the start; "
+                              "the tee has what it printed")
+        pane = tmux("capture-pane", "-p", "-t", f"={session}:").stdout
+        if TRUST_DIALOG in " ".join(pane.split()):
+            refuse("dialog", f"session {session} waits on the folder-trust dialog, with no "
+                             f"output until someone answers it; jig start does not. Answer it "
+                             f"with tmux attach -t {session}")
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(POLL_SECONDS)
+
+
+def check(args, conf, session):
+    check_lock(args.project, args.account)
+    check_session(session)
+    check_account(conf, args.role, args.account)
+    check_clone(conf, [*args.tag, *([args.approved_tag] if args.approved_tag else [])])
+    if args.role == "impl" and not args.approved_tag:
+        refuse("tag", "an implementer unit needs a spec tag for its approved worktree")
+
+
+def launch(args, conf, session):
+    clone = conf["REPO"]
+    # The lock comes first, so two starts cannot both reach tmux, and so a start that
+    # fails after its start line went to origin leaves a unit that jig close --dead finds.
+    lock = take_lock(args.project, args.account, session, args.expected)
+    try:
+        bring_to_origin(conf, args.head)
+        set_effort(clone, args.model, args.effort)
+        prompt = place_prompt(args.prompt, args.project, args.unit)
+        if args.approved_tag:
+            refresh_approved(clone, args.approved_tag)
+        tee = pathlib.Path(os.path.expanduser(
+            f"~/ws/reviews/{args.project}/out/{args.unit}.txt"))
+        tee.parent.mkdir(parents=True, exist_ok=True)
+        tee.touch()
+        # After the steps above, which create the prompt tree, the reviews and the worktree.
+        directories = existing_dirs(args.add_dir)
+        open_session(session, clone, args.model, directories, prompt, tee)
+        watch_pane(session)
+    except Refused as error:
+        if args.head is None and not session_alive(session):
+            drop_lock(lock)
+            raise
+        raise Refused(f"{error}. The lock {lock} stays: jig close --dead {args.project} "
+                      f"{args.unit} frees it and writes the end line") from None
+    print(f"jig start: started {session} (tmux attach -t {session}); lock {lock}; tee {tee}")
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="jig-start-worker")
+    parser.add_argument("project")
+    parser.add_argument("role", choices=sorted(ROLE_KEYS))
+    parser.add_argument("unit", metavar="ID")
+    parser.add_argument("prompt")
+    parser.add_argument("--expected", type=int)
+    parser.add_argument("--model")
+    parser.add_argument("--effort", default="high", choices=EFFORTS)
+    parser.add_argument("--account", default=getpass.getuser())
+    parser.add_argument("--branch")
+    parser.add_argument("--tag", action="append", default=[])
+    parser.add_argument("--approved-tag")
+    parser.add_argument("--head")
+    parser.add_argument("--stage", default="all", choices=("all", "check", "launch"))
+    parser.add_argument("--add-dir", action="append", default=[])
+    args = parser.parse_args(argv)
+    if not PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    if not UNIT_ID.fullmatch(args.unit):
+        parser.error(f"bad ID: {args.unit}")
+    if args.stage != "check" and not (args.model and args.expected and args.expected > 0):
+        parser.error("--model and a positive --expected are needed to start a session")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    session = f"{args.project}-{args.role}-{args.unit}"
+    try:
+        conf = read_conf(args.project)
+        if args.branch and args.branch != conf["BRANCH"]:
+            refuse("conf", f"this account's BRANCH is {conf['BRANCH']}, not {args.branch}")
+        if args.stage != "launch":
+            check(args, conf, session)
+        if args.stage != "check":
+            launch(args, conf, session)
+    except Refused as error:
+        print(f"jig start: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

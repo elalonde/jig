@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""jig new, account part: the directories, the conf file and the deploy keys of one account.
+
+usage: jig-new-account <project> <role> <account> <conf text> [<repo> ...]
+
+Sent over ssh by jig new and read from stdin, or run in the orchestrator's own
+account. It never changes a file that exists: each path is reported as "made" or
+"kept". The first line of output is "home=<HOME>". Exits 1 on a failure.
+"""
+
+import os
+import pathlib
+import subprocess
+import sys
+
+
+def say(word, path):
+    print(f"{word} {path}", flush=True)
+
+
+def directory(path, mode=None):
+    if path.is_dir():
+        say("kept", path)
+        return
+    path.mkdir(parents=True)
+    if mode is not None:
+        path.chmod(mode)
+    say("made", path)
+
+
+def new_file(path, text, mode=0o644):
+    """Write text to a file that does not exist yet; keep one that does."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    except FileExistsError:
+        say("kept", path)
+        return
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    say("made", path)
+
+
+def deploy_key(home, account, repo):
+    """Make the key this account uses for one repo, and its host alias in ~/.ssh/config."""
+    ssh = home / ".ssh"
+    directory(ssh, 0o700)
+    key = ssh / f"{repo.replace('-', '_')}_deploy"
+    if key.exists():
+        say("kept", key)
+    else:
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+                        f"{account} {repo}", "-f", str(key)],
+                       check=True, stdin=subprocess.DEVNULL)
+        say("made", key)
+    config = ssh / "config"
+    alias = f"github-{repo}"
+    text = config.read_text(encoding="utf-8") if config.exists() else ""
+    if any(line.split() == ["Host", alias] for line in text.splitlines()):
+        say("kept", f"{config} {alias}")
+        return
+    stanza = (f"Host {alias}\n  HostName github.com\n  User git\n"
+              f"  IdentityFile ~/.ssh/{key.name}\n  IdentitiesOnly yes\n"
+              "  StrictHostKeyChecking accept-new\n")
+    separator = "" if not text else "\n" if text.endswith("\n") else "\n\n"
+    descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+        stream.write(separator + stanza)
+    say("made", f"{config} {alias}")
+
+
+def main(argv):
+    if len(argv) < 4:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    project, role, account, conf = argv[:4]
+    repos = argv[4:]
+    home = pathlib.Path(os.path.expanduser("~"))
+    print(f"home={home}", flush=True)
+    try:
+        directory(home / "ws" / "src")
+        directory(home / "ws" / "prompts" / project)
+        directory(home / "ws" / "reviews" / project)
+        if role == "spec":
+            # The wall around the reference is this mode, not a rule.
+            directory(home / "ws" / "ref", 0o700)
+            directory(home / "ws" / "ref" / project, 0o700)
+        directory(home / ".config" / "jig")
+        new_file(home / ".config" / "jig" / f"{project}.conf", conf)
+        for repo in repos:
+            deploy_key(home, account, repo)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"jig new: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

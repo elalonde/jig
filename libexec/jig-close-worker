@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""The part of jig close that runs in the worker account.
+
+usage: jig-close-worker <project> <role> <ID> [--account <account>] [--dead]
+
+It ends the unit's tmux session, <project>-<role>-<ID>, and no other session.
+It frees the lock of the project and account, with the file of expected minutes
+beside it, only when the lock names that session: a lock that names another
+session belongs to a unit that still runs, so it stays and the close goes on.
+Then it copies the unit's Claude Code transcripts into
+~/ws/reviews/<project>/transcripts/<ID>/<run>/, where run 1 is the first close
+of the ID and each later close takes the next number. The tee of the session,
+out/<ID>.txt beside the transcripts, is left as it is.
+
+A unit's transcript is the file whose first message from the person is the
+unit's prompt, which begins with the line "# <ID>  paste into: <session> (". The
+session name holds the project, so two projects that run in one account and use
+the same ID never take each other's transcripts. A unit can run more than
+once under one ID, so a later close copies only the transcripts that no earlier
+run holds, and never changes an earlier run.
+
+jig close sends this file to python3 over ssh, as jig start does with its own
+worker part, so it imports the standard library and nothing else. --dead says
+that the unit ended without a report; the steps are the same.
+Exits 0 when the close is done, also when there is no session, lock or
+transcript to find; 1 when a step fails, naming it on stderr; 2 on a usage error.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+# Copied from jig-start-worker, which this script cannot import; a test holds them equal.
+UNIT_ID = re.compile(r"[a-z0-9]{1,6}")
+PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]*")
+ROLE_KEYS = {"spec": "SPEC_ACCOUNT", "impl": "IMPL_ACCOUNT", "rev": "REV_ACCOUNT"}
+
+# Claude Code may still write its last lines after tmux ends the pane, so the copy
+# waits this long for the pane's processes to exit.
+EXIT_WAIT_SECONDS = 10.0
+POLL_SECONDS = 0.1
+
+
+class Failed(Exception):
+    """A step of the close failed; the message names it."""
+
+
+def fail(name, detail):
+    raise Failed(f"failed: {name}: {detail}")
+
+
+def say(text):
+    print(f"jig close: {text}", flush=True)
+
+
+def lock_path(project, account):
+    return pathlib.Path(os.environ.get("JIG_LOCK_DIR", "/run/jig/lock")) / f"{project}-{account}"
+
+
+def expected_path(lock):
+    return lock.with_name(lock.name + ".expected")
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
+
+
+def session_alive(session):
+    # The = asks tmux for this exact name; without it, a prefix would match another session.
+    return tmux("has-session", "-t", f"={session}").returncode == 0
+
+
+def pid_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def end_session(session):
+    if not session_alive(session):
+        say(f"no tmux session {session}")
+        return
+    panes = tmux("list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}").stdout.split()
+    killed = tmux("kill-session", "-t", f"={session}")
+    if killed.returncode != 0 and session_alive(session):
+        fail("session", f"cannot end tmux session {session}: {killed.stderr.strip()}")
+    deadline = time.monotonic() + EXIT_WAIT_SECONDS
+    pids = [int(pid) for pid in panes if pid.isdigit()]
+    while any(pid_running(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(POLL_SECONDS)
+    say(f"ended tmux session {session}")
+
+
+def lock_session(text):
+    """Return the session that a lock's session= line names, or None."""
+    for line in text.splitlines():
+        if line.startswith("session="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def free_lock(project, account, session):
+    lock = lock_path(project, account)
+    try:
+        text = lock.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        say(f"no lock {lock}")
+        return
+    except OSError as error:
+        fail("lock", f"cannot read {lock}: {error.strerror}")
+    holder = lock_session(text)
+    if holder != session:
+        say(f"the lock {lock} names {holder or 'no session'}, not {session}; it stays")
+        return
+    try:
+        lock.unlink(missing_ok=True)
+        expected_path(lock).unlink(missing_ok=True)
+    except OSError as error:
+        fail("lock", f"cannot remove {lock}: {error.strerror}")
+    say(f"freed the lock {lock}")
+
+
+def message_text(entry):
+    """Return the text a person typed in a transcript entry: a string, or the first text part."""
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return str(part.get("text") or "")
+    return ""
+
+
+def first_message(path):
+    """Return the first message of a transcript that a person sent, or None.
+
+    A transcript holds one JSON object per line. Entries of type user also carry
+    tool results, and meta entries that Claude Code adds itself, and a tool result
+    can quote another unit's prompt; so only the first user entry that is not meta
+    tells whose session the file is.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "user" \
+                        and not entry.get("isMeta"):
+                    return message_text(entry)
+    except OSError:
+        return None
+    return None
+
+
+def is_unit_transcript(path, unit, session):
+    text = first_message(path)
+    if text is None:
+        return False
+    # The whole head of the first line is compared, up to the parenthesis after the
+    # session name: "# <ID>" alone would also match the same ID of another project.
+    return text.startswith(f"# {unit}  paste into: {session} (")
+
+
+def find_transcripts(unit, session):
+    """Return the unit's transcripts in every project directory of Claude Code."""
+    projects = pathlib.Path(os.path.expanduser("~/.claude/projects"))
+    if not projects.is_dir():
+        return []
+    return [path for path in sorted(projects.glob("*/*.jsonl"))
+            if path.is_file() and is_unit_transcript(path, unit, session)]
+
+
+def copy_transcripts(project, unit, session):
+    """Copy the transcripts that no earlier run holds into a new run directory.
+
+    The run directory is made even when there is nothing to copy, so that run
+    numbers count closes: a restarted unit's second close is always run 2.
+    """
+    base = pathlib.Path(os.path.expanduser(f"~/ws/reviews/{project}/transcripts/{unit}"))
+    earlier = [run for run in base.iterdir() if run.is_dir() and run.name.isdigit()] \
+        if base.is_dir() else []
+    held = {path.name for run in earlier for path in run.iterdir()}
+    target = base / str(max((int(run.name) for run in earlier), default=0) + 1)
+    try:
+        target.mkdir(parents=True)
+        found = find_transcripts(unit, session)
+        new = [path for path in found if path.name not in held]
+        for path in new:
+            shutil.copy2(path, target / path.name)
+    except OSError as error:
+        fail("transcript", f"cannot copy into {target}: {error}")
+    if not found:
+        say(f"no transcript of {unit} under ~/.claude/projects; {target} stays empty")
+    elif not new:
+        say(f"no transcript of {unit} that an earlier run does not hold; {target} stays empty")
+    else:
+        say(f"copied {len(new)} transcript(s) to {target}")
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="jig-close-worker")
+    parser.add_argument("project")
+    parser.add_argument("role", choices=sorted(ROLE_KEYS))
+    parser.add_argument("unit", metavar="ID")
+    parser.add_argument("--account", default=getpass.getuser())
+    parser.add_argument("--dead", action="store_true")
+    args = parser.parse_args(argv)
+    if not PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    if not UNIT_ID.fullmatch(args.unit):
+        parser.error(f"bad ID: {args.unit}")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    session = f"{args.project}-{args.role}-{args.unit}"
+    try:
+        end_session(session)
+        free_lock(args.project, args.account, session)
+        copy_transcripts(args.project, args.unit, session)
+    except Failed as error:
+        print(f"jig close: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Make a new project: directories, conf files, seed repos and the owner's block.
+
+usage: jig new <project>
+
+Run as the orchestrator account. In each role account it makes ~/ws/src,
+~/ws/prompts/<project>, ~/ws/reviews/<project>, the conf file and the deploy
+keys (the spec writer also gets ~/ws/ref/<project>, mode 700); the other
+accounts are reached by ssh, with the command in JIG_SSH, as jig start does.
+It makes blocks/, in/, out/ and checks/ for the project under JIG_SRV
+(default /srv/jig), and the seed repos in ~/ws/src/<project>-dev, with the
+product nested in it, from the templates in templates/new/; the product gets
+the CI workflow .github/workflows/ci.yml, which runs make check on every push.
+
+What needs the owner's login (the GitHub repos, deploy keys, the first push,
+the clones in the other accounts, the model policy rules, the status line,
+the session-log hooks, ~/.tmux.conf) goes into the block <srv>/blocks/
+<project>/new.sh, and the line that runs it is printed last.
+
+The owner's login, the host name and the GitHub owner come from
+<srv>/host.conf, so they never appear in this tree. A file that exists is never
+changed: a second run changes nothing and exits 0. A project that exists and
+that jig new did not make is refused, and so is a bad name. Exits 1 on a
+refusal, 2 on a usage error.
+"""
+
+import getpass
+import hashlib
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+TEMPLATES = ROOT / "templates" / "new"
+CONF_TEMPLATE = ROOT / "templates" / "project.conf"
+# Eric's standing preferences, kept at the top of every jig tree so that an installed
+# version carries them. Their text goes into the orchestrator's standing prompt.
+PREFS = ROOT / "prefs.md"
+ACCOUNT_SCRIPT = ROOT / "libexec" / "jig-new-account"
+SRV_ROOT = "/srv/jig"
+BLOCK_ID = "new"
+FIRST_BRANCH = "0.1"
+
+# Lower-case letters, digits and single hyphens. A name that ends in -dev would
+# be confused with a sidecar.
+NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+NAME_MAX = 24
+# A value that goes into a block or a path: no space, no quote, no shell word.
+VALUE = re.compile(r"[A-Za-z0-9._/~-]+")
+MARK = re.compile(r"@[A-Z_]+@")
+
+REQUIRED = ("OWNER", "HOST", "GITHUB_OWNER")
+MEANING = {
+    "OWNER": "the owner's login on this host",
+    "HOST": "this host's name",
+    "GITHUB_OWNER": "the GitHub account that holds the repos",
+}
+DEFAULTS = {
+    "ORCH_ACCOUNT": "orchestrator",
+    "SPEC_ACCOUNT": "specwriter",
+    "IMPL_ACCOUNT": "implementer",
+    "MODEL_POLICY": "/srv/claude/model-policy.toml",
+    "SESSION_LOG": "/opt/session-log",
+    "STATUSLINE": "/opt/statusline/statusline.py",
+}
+
+# Lint A and the hook of the product are jig's own, so a fix reaches every project.
+LINT_FILES = ("tools/lint-a.sh", "lib/lint_a.py", "lib/jig_ids.py", "hooks/commit-msg")
+CO_AUTHOR = "Co-Authored-By: Claude <noreply@anthropic.com>"
+
+
+class Refusal(Exception):
+    pass
+
+
+def say(text):
+    print(text, flush=True)
+
+
+def host_conf_keys():
+    """The note that names every key of host.conf, for a refusal about that file."""
+    lines = ["host.conf holds one KEY=value per line. Needed:"]
+    lines += [f"  {key}  {MEANING[key]}" for key in REQUIRED]
+    lines.append("Optional, with the value used when the key is missing:")
+    lines += [f"  {key}={value}" for key, value in DEFAULTS.items()]
+    return "\n".join(lines)
+
+
+def read_host_conf(srv):
+    path = srv / "host.conf"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise Refusal(f"cannot read {path}: {error.strerror}\n{host_conf_keys()}") from None
+    values = dict(DEFAULTS)
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    for key in REQUIRED:
+        if not values.get(key):
+            raise Refusal(f"{path} sets no {key}\n{host_conf_keys()}")
+    for key, value in values.items():
+        if not VALUE.fullmatch(value):
+            raise Refusal(f"{path}: {key}={value!r} is not a plain word or path")
+    return values
+
+
+def check_name(project):
+    if (len(project) > NAME_MAX or not NAME.fullmatch(project)
+            or project.endswith("-dev") or project.endswith("-dev-approved")):
+        raise Refusal(f"{project!r} is not a project name: lower-case letters, digits "
+                      f"and single hyphens, a letter first, at most {NAME_MAX}, "
+                      "not ending in -dev")
+
+
+def check_facts(host):
+    for key in ("MODEL_POLICY", "STATUSLINE"):
+        if not pathlib.Path(host[key]).is_file():
+            raise Refusal(f"{key}: {host[key]} is not a file")
+    for name in ("merge-hooks.py", "hooks.json"):
+        if not (pathlib.Path(host["SESSION_LOG"]) / name).is_file():
+            raise Refusal(f"SESSION_LOG: {host['SESSION_LOG']}/{name} is not a file")
+
+
+def project_paths(srv, project):
+    return [srv / part / project for part in ("blocks", "in", "out")]
+
+
+def check_not_foreign(srv, project, home):
+    """Refuse a project that exists and that jig new did not start."""
+    marker = srv / "blocks" / project / ".jig-new"
+    for path in project_paths(srv, project):
+        if path.exists() and not path.is_dir():
+            raise Refusal(f"{path} exists and is not a directory; not overwritten")
+    if marker.is_file():
+        return
+    found = [path for path in (*project_paths(srv, project),
+                               home / ".config" / "jig" / f"{project}.conf",
+                               home / "ws" / "src" / f"{project}-dev")
+             if path.exists() or path.is_symlink()]
+    if found:
+        raise Refusal(f"project {project} exists ({found[0]}) and jig new did not make "
+                      "it; nothing is overwritten")
+
+
+def srv_dirs(srv, project):
+    """blocks/, in/ and out/ of the project, writable by the group, which they inherit."""
+    for path in project_paths(srv, project):
+        if path.is_dir():
+            say(f"kept {path}")
+            continue
+        try:
+            path.mkdir()
+            path.chmod(0o2775)
+        except OSError as error:
+            raise Refusal(f"cannot make {path}: {error.strerror}") from None
+        say(f"made {path}")
+    marker = srv / "blocks" / project / ".jig-new"
+    if not marker.exists():
+        marker.write_text("made by jig new\n", encoding="utf-8")
+
+
+def checks_dirs(srv, project):
+    """Make checks/ and checks/<project>/ under the srv root, writable by the group.
+
+    A check that runs in an account other than the implementer's leaves a copy of its
+    exit file there, which the implementer's release step reads, so both accounts must
+    reach it through the group. The setgid bit hands the group of the srv root down to
+    the directories and to each copy written in them.
+    """
+    for path in (srv / "checks", srv / "checks" / project):
+        if path.is_dir():
+            say(f"kept {path}")
+            continue
+        try:
+            path.mkdir()
+            path.chmod(0o2775)
+        except OSError as error:
+            raise Refusal(f"cannot make {path}: {error.strerror}") from None
+        say(f"made {path}")
+
+
+def installed_version():
+    """The version of this tree when it is an installed one, else None."""
+    if ROOT.parent.joinpath("current").is_dir() and re.fullmatch(r"[0-9][0-9A-Za-z.+-]*",
+                                                                   ROOT.name):
+        return ROOT.name
+    return None
+
+
+def conf_text(project, host):
+    text = CONF_TEMPLATE.read_text(encoding="utf-8").replace("<project>", project)
+    version = installed_version()
+    if version:
+        text = re.sub(r"^JIG_VERSION=.*$", f"JIG_VERSION={version}", text, flags=re.MULTILINE)
+    else:
+        text = re.sub(r"^JIG_VERSION=.*\n", "", text, flags=re.MULTILINE)
+    changes = {
+        "BRANCH": FIRST_BRANCH,
+        "ORCH_ACCOUNT": host["ORCH_ACCOUNT"],
+        "SPEC_ACCOUNT": host["SPEC_ACCOUNT"],
+        "IMPL_ACCOUNT": host["IMPL_ACCOUNT"],
+        "REV_ACCOUNT": f"{host['SPEC_ACCOUNT']} {host['IMPL_ACCOUNT']}",
+    }
+    for key, value in changes.items():
+        text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.MULTILINE)
+    return text
+
+
+def account_command(account, host, words):
+    """The command that runs the account part in an account; local for the orchestrator."""
+    if account == host["ORCH_ACCOUNT"]:
+        return [sys.executable, "-I", "-", *words]
+    ssh = shlex.split(os.environ.get("JIG_SSH", "ssh -o BatchMode=yes"))
+    return [*ssh, f"{account}@localhost", shlex.join(["python3", "-I", "-", *words])]
+
+
+def setup_account(project, role, host, conf, repos):
+    """Run the account part; return the account's home."""
+    account = host[f"{role.upper()}_ACCOUNT"]
+    words = [project, role, account, conf, *repos]
+    with open(ACCOUNT_SCRIPT, "rb") as script:
+        result = subprocess.run(account_command(account, host, words), stdin=script,
+                                capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise Refusal(f"account {account}: {detail}")
+    lines = result.stdout.splitlines()
+    if not lines or not lines[0].startswith("home="):
+        raise Refusal(f"account {account}: no home in the output")
+    for line in lines[1:]:
+        say(f"{account}: {line}")
+    home = lines[0][len("home="):]
+    if not VALUE.fullmatch(home):
+        raise Refusal(f"account {account}: home {home!r} is not a plain path")
+    return home
+
+
+def prefs_text():
+    """Return the text of prefs.md without its title, to stand inside another file."""
+    text = PREFS.read_text(encoding="utf-8")
+    first, _, rest = text.partition("\n")
+    if first.startswith("# "):
+        text = rest.lstrip("\n")
+    return text.rstrip("\n")
+
+
+def render(text, values):
+    for key, value in values.items():
+        text = text.replace(f"@{key}@", value)
+    left = MARK.search(text)
+    if left:
+        raise Refusal(f"template name {left.group()} has no value")
+    return text
+
+
+def write_tree(source, target, values):
+    for path in sorted(source.rglob("*")):
+        if path.is_dir():
+            continue
+        relative = path.relative_to(source)
+        name = ".gitignore" if relative.name == "gitignore" else relative.name
+        out = target / relative.parent / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(render(path.read_text(encoding="utf-8"), values), encoding="utf-8")
+
+
+def git(env, *args):
+    result = subprocess.run(["git", *args], capture_output=True, text=True, env=env,
+                            stdin=subprocess.DEVNULL, check=False)
+    if result.returncode != 0:
+        raise Refusal(f"git {shlex.join(args)}: {result.stderr.strip()}")
+
+
+def first_commit(path, env, subject, origin):
+    git(env, "init", "-q", "-b", "master", str(path))
+    if (path / "hooks").is_dir():
+        git(env, "-C", str(path), "config", "--local", "core.hooksPath", "hooks")
+    git(env, "-C", str(path), "add", "-A")
+    git(env, "-C", str(path), "commit", "-q", "-m", f"{subject}\n\n{CO_AUTHOR}")
+    # The work happens on the first version line, which BRANCH names; master stays at
+    # the first commit until a line is merged into it.
+    git(env, "-C", str(path), "checkout", "-q", "-b", FIRST_BRANCH)
+    git(env, "-C", str(path), "remote", "add", "origin", origin)
+
+
+def seed_repos(project, host, values, home):
+    """Make the sidecar with the product nested in it, in a new directory moved in place last."""
+    target = home / "ws" / "src" / f"{project}-dev"
+    if target.exists():
+        say(f"kept {target}")
+        return
+    work = pathlib.Path(tempfile.mkdtemp(prefix=f".{project}-dev.", dir=target.parent))
+    try:
+        write_tree(TEMPLATES / "dev", work, values)
+        terms = sorted({host["OWNER"], host["HOST"], host["GITHUB_OWNER"]})
+        with open(work / "terms.txt", "a", encoding="utf-8") as stream:
+            stream.write("".join(f"{term}\n" for term in terms))
+        product = work / project
+        write_tree(TEMPLATES / "product", product, values)
+        for name in LINT_FILES:
+            (product / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, product / name)
+        env = dict(os.environ)
+        github = host["GITHUB_OWNER"]
+        first_commit(work, env, "Start the project records",
+                     f"github-{project}-dev:{github}/{project}-dev.git")
+        first_commit(product, env, "Start the project with its checks",
+                     f"github-{project}:{github}/{project}.git")
+        work.chmod(0o755)
+        work.rename(target)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    say(f"made {target}")
+    say(f"made {target / project}")
+
+
+def write_block(srv, project, values):
+    path = srv / "blocks" / project / f"{BLOCK_ID}.sh"
+    text = render((TEMPLATES / "block.sh.in").read_text(encoding="utf-8"), values)
+    long = [line for line in text.splitlines() if len(line) >= 75]
+    if long:
+        raise Refusal(f"a block line has 75 characters or more: {long[0]!r}")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
+    except FileExistsError:
+        say(f"kept {path}")
+    else:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        say(f"made {path}")
+    return path
+
+
+def new(project):
+    srv = pathlib.Path(os.environ.get("JIG_SRV") or SRV_ROOT)
+    check_name(project)
+    host = read_host_conf(srv)
+    if getpass.getuser() != host["ORCH_ACCOUNT"]:
+        raise Refusal(f"run as {host['ORCH_ACCOUNT']}, not {getpass.getuser()}")
+    home = pathlib.Path(os.path.expanduser("~"))
+    check_not_foreign(srv, project, home)
+    check_facts(host)
+    for part in ("blocks", "in", "out"):
+        if not (srv / part).is_dir():
+            raise Refusal(f"{srv / part} is not a directory")
+
+    srv_dirs(srv, project)
+    checks_dirs(srv, project)
+    conf = conf_text(project, host)
+    dev, product = f"{project}-dev", project
+    homes = {
+        "orch": setup_account(project, "orch", host, conf, [dev, product]),
+        "spec": setup_account(project, "spec", host, conf, [dev]),
+        "impl": setup_account(project, "impl", host, conf, [dev, product]),
+    }
+    values = {
+        "PROJECT": project, "OWNER": host["OWNER"], "HOST": host["HOST"],
+        "GITHUB_OWNER": host["GITHUB_OWNER"], "SRV": str(srv),
+        "ORCH": host["ORCH_ACCOUNT"], "SPEC": host["SPEC_ACCOUNT"],
+        "IMPL": host["IMPL_ACCOUNT"], "POLICY": host["MODEL_POLICY"],
+        "SESSION_LOG": host["SESSION_LOG"], "STATUSLINE": host["STATUSLINE"],
+        "ORCH_HOME": homes["orch"], "SPEC_HOME": homes["spec"],
+        "IMPL_HOME": homes["impl"],
+        # Last, so that no other name is filled inside the preferences' text.
+        "PREFS": prefs_text(),
+    }
+    seed_repos(project, host, values, home)
+    block = write_block(srv, project, values)
+    digest = hashlib.sha256(block.read_bytes()).hexdigest()[:8]
+    say("")
+    say(f"The block {BLOCK_ID} makes the GitHub repos and keys, pushes the seed repos,")
+    say("clones them in the other accounts, and sets the policy rules, the status")
+    say("line, the session-log hooks and ~/.tmux.conf. Its readback is in "
+        f"{srv / 'out' / project / (BLOCK_ID + '.txt')}.")
+    say(f"# as {host['OWNER']} on {host['HOST']}")
+    say(f"jig run {project} {BLOCK_ID} {digest}")
+
+
+def main(argv):
+    if len(argv) != 1:
+        print("usage: jig new <project>", file=sys.stderr)
+        return 2
+    try:
+        new(argv[0])
+    except Refusal as refusal:
+        print(f"jig new: {refusal}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

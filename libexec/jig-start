@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Start one unit in a worker account, from the orchestrator's account.
+
+usage: jig start <project> <role> <ID> <prompt> --expected <minutes>
+           [--model <model>] [--effort <level>]
+
+The preconditions, in order, each with its own refusal: the prompt passes jig
+validate prompt and matches the arguments; no lock; the role's account in the
+conf file equals the prompt's; then, in the worker account: origin fetched and
+the branch checked out, a clean tree, a fast-forward to origin, HEAD equal to
+it, every tag of the ROLE line on origin; last, the model the prompt names. A change
+to impl/orch/updates.log alone does not make the tree unclean: jig orch appends its
+idle lines there, and the orchestrator commits them with its next commit.
+
+Only then the status commit goes to origin, committed alone in this account's clone;
+a refused push gets one fetch and one rebase with --autostash, so an uncommitted
+change in that clone, such as those idle lines, stays in place. Then the prompt
+and its inbox directory go to the worker account, and the worker part starts the
+session. JIG_SSH holds the ssh command, and tests set it. Exits 1 on a refusal; 2 on
+a usage error.
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+WORKER_SCRIPT = ROOT / "libexec" / "jig-start-worker"
+VALIDATE = ROOT / "libexec" / "jig-validate"
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_dirs  # noqa: E402
+import jig_ids  # noqa: E402
+import jig_push  # noqa: E402
+
+# The worker script is the one place for what both parts need.
+sys.dont_write_bytecode = True
+_loader = importlib.machinery.SourceFileLoader("jig_start_worker", str(WORKER_SCRIPT))
+_spec = importlib.util.spec_from_loader("jig_start_worker", _loader)
+worker = importlib.util.module_from_spec(_spec)
+_loader.exec_module(worker)
+
+# What a prompt may name, and the model each name selects.
+MODELS = {
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "fable": "claude-fable-5-2",
+    "haiku": "claude-haiku-5-5",
+}
+
+FIRST_LINE = re.compile(r"# (\S+)  paste into: (\S+) \(([^,]+), ~/ws/src/(\S+)-dev\)")
+SECTION = re.compile(r"[A-Z][A-Z ]*:(?: |$)")
+ROLE_TAG = re.compile(r"(?<![\w-])(?:spec-p[0-9]+(?:r[0-9]+)?|(?:impl-p|kickoff-r)[0-9]+)(?![\w-])")
+SPEC_TAG = re.compile(r"Spec tag:\s*(spec-p[0-9]+(?:r[0-9]+)?)(?![\w-])")
+NAMED_MODEL = re.compile(r"^MODEL CHECK: this unit needs (\S+?)\.(?:\s|$)", re.MULTILINE)
+STATUS_LOG = "impl/log/status.log"
+# Every commit carries the trailer for Claude, the machine-written ones too.
+CO_AUTHOR = "Co-Authored-By: Claude <noreply@anthropic.com>"
+
+
+def refuse(name, detail):
+    worker.refuse(name, detail)
+
+
+def role_section(text):
+    """Return the ROLE section with its continuation lines."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("ROLE:"):
+            end = index + 1
+            while end < len(lines) and not SECTION.match(lines[end]):
+                end += 1
+            return "\n".join(lines[index:end])
+    return ""
+
+
+def read_prompt(args):
+    """Validate the prompt, and return the account its first line names and its text."""
+    if not jig_ids.is_unit_id(args.unit):
+        refuse("validate", f"{args.unit!r} is not a valid ID")
+    checked = subprocess.run([sys.executable, str(VALIDATE), "prompt", str(args.prompt)],
+                             capture_output=True, text=True, check=False)
+    if checked.returncode != 0:
+        refuse("validate", f"{args.prompt} fails jig validate prompt:\n{checked.stderr.strip()}")
+    text = args.prompt.read_text(encoding="utf-8")
+    match = FIRST_LINE.fullmatch(text.splitlines()[0])
+    if not match:
+        refuse("validate", f"{args.prompt}: cannot read the first line")
+    wanted = f"{args.project}-{args.role}-{args.unit}"
+    if match[1] != args.unit or match[2] != wanted or match[4] != args.project:
+        refuse("validate", f"{args.prompt} is for {match[2]}, not {wanted}")
+    return match[3], text
+
+
+def run_worker(account, args, stage, extra, tags, approved_tag):
+    """Run a stage of the worker part in the worker account; refuse when it fails."""
+    target = f"~/ws/prompts/{args.project}/{args.unit}.md"
+    words = ["python3", "-I", "-", args.project, args.role, args.unit, target,
+             "--stage", stage, "--account", account, "--effort", args.effort, *extra]
+    for tag in tags:
+        words += ["--tag", tag]
+    if approved_tag:
+        words += ["--approved-tag", approved_tag]
+    with open(WORKER_SCRIPT, "rb") as script:
+        result = subprocess.run(remote_command(account, words), stdin=script, check=False)
+    if result.returncode == 1:
+        sys.exit(1)
+    if result.returncode != 0:
+        refuse("ssh", f"the worker part exited {result.returncode} in {account}")
+
+
+def remote_command(account, words):
+    ssh = shlex.split(os.environ.get("JIG_SSH", "ssh -o BatchMode=yes"))
+    return [*ssh, f"{account}@localhost", shlex.join(words)]
+
+
+def select_model(text, given):
+    """Return the model to run, or refuse when it is not the one the prompt names."""
+    match = NAMED_MODEL.search(text)
+    if not match:
+        refuse("model", "the prompt's MODEL CHECK names no single model")
+    named = match[1]
+    family = named.lower()
+    if family not in MODELS:
+        pieces = named.split("-")
+        if len(pieces) < 3 or pieces[0] != "claude" or pieces[1] not in MODELS:
+            refuse("model", f"the prompt names {named}, which jig cannot select")
+        family = pieces[1]
+    selected = named if named.startswith("claude-") else MODELS[family]
+    if given is None:
+        return selected
+    given = MODELS.get(given.lower(), given)
+    wrong_family = not given.startswith(f"claude-{family}-")
+    if wrong_family or (named.startswith("claude-") and given != named):
+        refuse("model", f"the prompt names {named}, not {given}")
+    return given
+
+
+def push_status(clone, branch):
+    detail = jig_push.push_commit(clone, branch)
+    if detail:
+        refuse("status", f"{detail}; nothing was started")
+
+
+def write_status(conf, unit):
+    """Commit the start line alone in this account's clone and push it; return the new head."""
+    clone, branch = conf["REPO"], conf["BRANCH"]
+    fetched = worker.git(clone, "fetch", "-q", "origin")
+    if fetched.returncode != 0:
+        refuse("status", f"cannot fetch origin in {clone}: {worker.last_line(fetched)}")
+    current = worker.git_out(clone, "symbolic-ref", "-q", "--short", "HEAD")
+    if current != branch:
+        refuse("status", f"{clone} has {current or 'a detached HEAD'} checked out, not {branch}")
+    merged = worker.git(clone, "merge", "-q", "--ff-only", f"refs/remotes/origin/{branch}")
+    if merged.returncode != 0:
+        refuse("status", f"{clone} cannot fast-forward: {worker.last_line(merged)}")
+    head = worker.git_out(clone, "rev-parse", "HEAD")
+    if head != worker.git_out(clone, "rev-parse", f"refs/remotes/origin/{branch}"):
+        refuse("status", f"{clone} has commits that are not on origin/{branch}")
+
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    log = pathlib.Path(clone) / STATUS_LOG
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as stream:
+        stream.write(f"{now} {unit} start started {head}\n")
+    added = worker.git(clone, "add", "--", STATUS_LOG)
+    committed = worker.git(clone, "commit", "-q", "-m", f"status: {unit} start\n\n{CO_AUTHOR}",
+                           "--only", "--", STATUS_LOG)
+    if added.returncode != 0 or committed.returncode != 0:
+        refuse("status", f"cannot commit {STATUS_LOG}: {worker.last_line(committed)}")
+    push_status(clone, branch)
+    return worker.git_out(clone, "rev-parse", "HEAD")
+
+
+def copy_prompt(account, args):
+    """Send the prompt and its inbox directory to the worker account's prompt tree."""
+    script = 'mkdir -p "$HOME/ws/prompts/$1" && exec tar -xf - -C "$HOME/ws/prompts/$1"'
+    command = remote_command(account, ["sh", "-c", script, "sh", args.project])
+    inbox = args.prompt.parent / args.unit
+    with subprocess.Popen(command, stdin=subprocess.PIPE) as process:
+        try:
+            with tarfile.open(fileobj=process.stdin, mode="w|", dereference=True) as archive:
+                archive.add(args.prompt, arcname=f"{args.unit}.md")
+                if inbox.is_dir():
+                    archive.add(inbox, arcname=args.unit)
+        except OSError as error:
+            refuse("copy", f"cannot send the prompt to {account}: {error}")
+    if process.returncode != 0:
+        refuse("copy", f"cannot place the prompt in {account}: exit {process.returncode}")
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="jig start")
+    parser.add_argument("project")
+    parser.add_argument("role", choices=sorted(worker.ROLE_KEYS))
+    parser.add_argument("unit", metavar="ID")
+    parser.add_argument("prompt", type=pathlib.Path)
+    parser.add_argument("--expected", type=int, required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--effort", default="high", choices=worker.EFFORTS)
+    args = parser.parse_args(argv)
+    if args.expected <= 0:
+        parser.error("--expected must be a positive number of minutes")
+    if not worker.PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    return args
+
+
+def start(args):
+    account, text = read_prompt(args)
+    conf = worker.read_conf(args.project)
+    worker.check_lock(args.project, account)
+    worker.check_account(conf, args.role, account)
+
+    role_line = role_section(text)
+    tags = list(dict.fromkeys(ROLE_TAG.findall(role_line)))
+    spec_tag = SPEC_TAG.search(role_line)
+    # The approved worktree belongs to the implementer account, whatever the role in it.
+    in_implementer_account = account in worker.role_accounts(conf, "impl")
+    approved_tag = spec_tag[1] if spec_tag and in_implementer_account else None
+    # A spec review runs in the spec writer's account because it must read the reference,
+    # which only that account holds; any other review runs without it.
+    list_role = args.role
+    if args.role == "rev" and account in worker.role_accounts(conf, "spec"):
+        list_role = "spec"
+    add_dirs = [word for directory in jig_dirs.of_role(list_role, args.project)
+                for word in ("--add-dir", directory)]
+
+    branch = ["--branch", conf["BRANCH"]]
+    run_worker(account, args, "check", branch, tags, approved_tag)
+    model = select_model(text, args.model)
+
+    head = write_status(conf, args.unit)
+    copy_prompt(account, args)
+    run_worker(account, args, "launch",
+               [*branch, "--head", head, "--model", model, "--expected", str(args.expected),
+                *add_dirs],
+               [], approved_tag)
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        start(args)
+    except worker.Refused as error:
+        print(f"jig start: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

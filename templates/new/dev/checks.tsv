@@ -1,0 +1,3 @@
+name	command	account	cap_seconds
+make-check	make -C @PROJECT@ check	@IMPL@	300
+dev-check	make check	@IMPL@	60

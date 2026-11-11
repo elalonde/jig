@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Clear a project's hold, so that the next run of jig batch can start units again.
+
+usage: jig unhold <project>
+
+It removes the file that jig hold wrote; jig hold holds the details.
+Exits 0 when the hold is cleared or was not set, 1 on a refusal, 2 on a usage error.
+"""
+
+import importlib.machinery
+import importlib.util
+import pathlib
+import sys
+
+sys.dont_write_bytecode = True
+_path = pathlib.Path(__file__).resolve().parent / "jig-hold"
+_loader = importlib.machinery.SourceFileLoader("jig_hold", str(_path))
+_spec = importlib.util.spec_from_loader("jig_hold", _loader)
+hold = importlib.util.module_from_spec(_spec)
+_loader.exec_module(hold)
+
+if __name__ == "__main__":
+    sys.exit(hold.main(sys.argv[1:], clear=True))

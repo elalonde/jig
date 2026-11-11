@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""List a unit's exit files in its worker account, for jig report.
+
+usage: jig-report-worker <project> <ID>
+
+jig report sends this script over ssh and runs it in the unit's account, because the
+exit files that jig run-check wrote live in ~/ws/reviews/<project>/ of that account.
+It prints one JSON object: "files", a list with the name, modification time and the
+start of each regular file named <ID>-<name>.exit there. jig report decides which of
+them count. It uses only the standard library, as it runs from standard input.
+Exits 0, also when the directory does not exist; 2 on a usage error.
+"""
+
+import json
+import os
+import pathlib
+import re
+import sys
+
+UNIT_ID = re.compile(r"[a-z0-9]{1,6}")
+PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]*")
+# An exit file holds a code of at most three digits and a newline; more is not one.
+READ_BYTES = 64
+
+
+def exit_files(project, unit):
+    reviews = pathlib.Path(os.path.expanduser(f"~/ws/reviews/{project}"))
+    found = []
+    try:
+        entries = sorted(reviews.iterdir())
+    except OSError:
+        return found
+    for path in entries:
+        if not (path.name.startswith(f"{unit}-") and path.name.endswith(".exit")):
+            continue
+        try:
+            # A link could point at any file of the account; only a plain file counts.
+            info = path.lstat()
+            if not path.is_file() or path.is_symlink():
+                continue
+            with open(path, "rb") as stream:
+                head = stream.read(READ_BYTES).decode("utf-8", "replace")
+        except OSError:
+            continue
+        found.append({"name": path.name, "mtime": info.st_mtime, "text": head})
+    return found
+
+
+def main(argv):
+    if len(argv) != 2 or not PROJECT.fullmatch(argv[0]) or not UNIT_ID.fullmatch(argv[1]):
+        print("usage: jig-report-worker <project> <ID>", file=sys.stderr)
+        return 2
+    print(json.dumps({"files": exit_files(argv[0], argv[1])}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

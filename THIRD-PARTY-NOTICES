@@ -1,0 +1,19 @@
+Third-party notices for jig
+
+jig contains no code of others. Every file in this package or in its source
+archive was written for jig and is under the license in LICENSE.
+
+jig runs the following programs of others at run time. They are not part of
+jig and jig does not distribute them; each comes from the operating system or
+from its own vendor, under its own license:
+
+- bash, the GNU shell, under the GNU General Public License version 3 or later.
+- git, under the GNU General Public License version 2.
+- Python 3 and its standard library, under the Python Software Foundation
+  License.
+- tmux, under the ISC license.
+- OpenSSH (ssh and ssh-keygen), under a BSD-style license.
+- shellcheck, under the GNU General Public License version 3, used only by
+  make check.
+- Claude Code, under the terms of its vendor, Anthropic, which jig starts in
+  each session but does not contain.

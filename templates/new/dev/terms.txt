@@ -1,0 +1,4 @@
+# @PROJECT@ private terms. Never copy into the product.
+# One term per line. Match: whole word, case-insensitive. '#' starts a comment.
+# The orchestrator adds hosts, addresses, other project names and the
+# excluded sources of the kickoff record. jig new wrote the facts it knew:

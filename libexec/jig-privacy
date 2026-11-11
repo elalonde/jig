@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Scan a project's fixtures and captures for private values before a release.
+
+usage: jig privacy scan <project>
+
+The project's -dev clone is the clone that REPO names in ~/.config/jig/<project>.conf,
+and its product clone is <REPO>/<project>. The scan reads the path and the contents
+of these files:
+  every regular file under captures/ and vectors/ of the -dev clone, at any depth;
+  every regular file under the product's vector directory. That directory is the
+    last word of the command of the row recompute in checks.tsv on origin/<BRANCH>
+    of the -dev clone, the row that runs "jig recompute <project> <directory>". A
+    project without that row has no vector directory;
+  the product's test files: the files git lists in the product whose path from the
+    top of the product matches, as a whole, the files pattern of a language in the
+    product's tools/lint-a-patterns.txt, the file lint A reads. A product without
+    that file has no test file.
+A directory that does not exist holds nothing to scan.
+
+It looks for five kinds of private value:
+  a serial: a line of terms.txt of the -dev clone that is not blank and does not
+    start with "#", matched as jig terms check matches a term: as a fixed string,
+    in any letter case;
+  a host name: the name or the address of a host in the host list,
+    <JIG_SRV>/hosts.toml, with JIG_SRV /srv/jig unless set, matched the same way;
+  a UUID: hex digits in groups of 8, 4, 4, 4 and 12, joined by hyphens;
+  a MAC address: six pairs of hex digits, joined all by colons or all by hyphens;
+  an e-mail address.
+The values that documentation uses are not private and do not match: a host name or
+an e-mail address in a domain that RFC 2606 reserves (example, example.com,
+example.net, example.org, test, invalid, localhost, and every name under them), a MAC
+address in the documentation ranges of RFC 7042 (00:00:5E:00:53:00 to
+00:00:5E:00:53:FF and 01:00:5E:90:10:00 to 01:00:5E:90:10:FF), and the nil UUID.
+
+Each match prints one line on stdout, which names the place and the kind of value,
+and never the value:
+  <path>:<line>: <kind>
+  <path>: <kind> in the path
+where <kind> is "terms.txt line <n>" for a serial, "host name of host <k> in the
+host list" or "host address of host <k> in the host list", with hosts counted in
+the order of the file, "UUID", "MAC address" or "e-mail address". Paths read from
+the top of the -dev clone, so a product path starts with <project>/. A private value
+in a printed path is replaced by "***". A line that holds one kind twice prints one
+line for it.
+
+Exits 0 with no match; 1 with a match, or when the scan cannot be made: terms.txt
+missing, unreadable or holding no line, the host list missing or not valid, a
+pattern file that lint A refuses, a row recompute that names no directory, no
+product clone, a file that cannot be read (one line on stderr names it); 2 on a
+usage error. Changes no file.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_hosts  # noqa: E402
+import jig_units  # noqa: E402
+import lint_a  # noqa: E402
+
+
+def load(path, name):
+    """Load another jig tool of this tree as a module, so both read things one way."""
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+# A serial is found as jig terms check finds a term, so both tools share its reader
+# of terms.txt and its matching, and print paths and places the same way.
+terms = load(ROOT / "libexec" / "jig-terms", "jig_terms")
+Failed = terms.Failed
+
+USAGE = "usage: jig privacy scan <project>"
+FAILED = 1
+USAGE_ERROR = 2
+SRV_ROOT = "/srv/jig"
+HOSTS_NAME = "hosts.toml"
+DEV_DIRECTORIES = ("captures", "vectors")
+# The checks.tsv row whose command names the product's vector directory.
+RECOMPUTE_ROW = "recompute"
+
+# The domains RFC 2606 reserves for documentation and tests; a name under one of
+# them is reserved too.
+RESERVED_DOMAINS = ("example", "example.com", "example.net", "example.org", "test",
+                    "invalid", "localhost")
+# The first five octets of the MAC address ranges RFC 7042 sets aside for
+# documentation, in the colon form and capital letters.
+DOCUMENTATION_MACS = ("00:00:5E:00:53:", "01:00:5E:90:10:")
+
+# A hex digit or a letter next to a value would make it part of a longer word,
+# such as a longer hash, so the value is not taken alone.
+UUID = re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}"
+                  r"(?![0-9A-Za-z])")
+# A colon next to the six pairs means a longer run of pairs, such as an IPv6
+# address, and a hyphen next to them means a longer hyphenated word.
+MAC = re.compile(r"(?<![0-9A-Za-z:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z:])"
+                 r"|(?<![0-9A-Za-z-])(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z-])")
+EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+"
+                   r"(?:\.[A-Za-z0-9-]+)+")
+
+# The order of the kinds among the matches of one line; terms come first.
+HOST_RANK, UUID_RANK, MAC_RANK, EMAIL_RANK = 1, 2, 3, 4
+
+
+def reserved(name):
+    """Tell whether a host name or a mail domain is in a domain RFC 2606 reserves."""
+    name = name.lower().rstrip(".")
+    return any(name == domain or name.endswith("." + domain) for domain in RESERVED_DOMAINS)
+
+
+def nil_uuid(value):
+    return set(value) <= {"0", "-"}
+
+
+def documentation_mac(value):
+    return value.upper().replace("-", ":").startswith(DOCUMENTATION_MACS)
+
+
+def documentation_email(value):
+    return reserved(value.rpartition("@")[2])
+
+
+class Pattern:
+    """Finds the matches of a regex that are not documentation values, under one label."""
+
+    def __init__(self, rank, label, regex, documentation):
+        self.rank = rank
+        self.label = label
+        self.regex = regex
+        self.documentation = documentation
+
+    def matches(self, text):
+        return [found for found in self.regex.finditer(text)
+                if not self.documentation(found.group())]
+
+    def lines(self, text):
+        """Return {(line, rank, label)} for each line of text that holds a match."""
+        line_of = terms.line_finder(text)
+        return {(line_of(found.start()), self.rank, self.label)
+                for found in self.matches(text)}
+
+    def spans(self, text):
+        return [(found.start(), found.end(), self.rank, self.label)
+                for found in self.matches(text)]
+
+
+def host_finder(path):
+    """Return a finder of every name and address of the host list that is not reserved.
+
+    A host is named in the output by its place in the file, so that the line says
+    which entry to look up without printing it.
+    """
+    try:
+        hosts = jig_hosts.read_hosts(path)
+    except jig_hosts.HostError as error:
+        raise Failed(str(error)) from None
+    items = []
+    for number, (name, address) in enumerate(hosts.items(), 1):
+        for part, kind, value in ((0, "host name", name), (1, "host address", address)):
+            if not reserved(value):
+                items.append(((HOST_RANK, number, part),
+                              f"{kind} of host {number} in the host list", value))
+    return terms.Fixed(items)
+
+
+def finders(repo):
+    hosts = pathlib.Path(os.environ.get("JIG_SRV") or SRV_ROOT) / HOSTS_NAME
+    return [terms.term_finder(pathlib.Path(repo) / terms.TERMS_FILE),
+            host_finder(hosts),
+            Pattern((UUID_RANK,), "UUID", UUID, nil_uuid),
+            Pattern((MAC_RANK,), "MAC address", MAC, documentation_mac),
+            Pattern((EMAIL_RANK,), "e-mail address", EMAIL, documentation_email)]
+
+
+def vector_directory(repo, branch):
+    """Return the product's vector directory from checks.tsv on origin, or None.
+
+    The row recompute runs "jig recompute <project> <directory>", so the directory is
+    the last word of its command. No checks.tsv, or no such row, means no directory.
+    """
+    shown = subprocess.run(["git", "-C", str(repo), "show",
+                            f"refs/remotes/origin/{branch}:checks.tsv"],
+                           capture_output=True, text=True, check=False)
+    if shown.returncode != 0:
+        return None
+    for line in shown.stdout.splitlines()[1:]:
+        fields = line.split("\t")
+        if fields[0] != RECOMPUTE_ROW:
+            continue
+        words = fields[1].split() if len(fields) > 1 else []
+        path = pathlib.PurePosixPath(words[-1]) if words else None
+        if path is None or path.is_absolute() or ".." in path.parts or not path.parts:
+            raise Failed(f"the row {RECOMPUTE_ROW} of checks.tsv on origin/{branch} "
+                         f"names no product directory")
+        return str(path)
+    return None
+
+
+def test_files(product):
+    """Return the product's test files, as lint A finds them from its pattern file."""
+    try:
+        patterns = lint_a.read_patterns(product / lint_a.PATTERN_FILE)
+    except lint_a.PatternError as error:
+        raise Failed(str(error)) from None
+    if patterns is None:
+        return []
+    return [name for name in terms.listed_files(product)
+            if any(keys["files"].fullmatch(name) for keys in patterns.languages.values())]
+
+
+def scan(project):
+    conf = jig_units.read_conf(project)
+    repo = pathlib.Path(conf["REPO"])
+    found = finders(repo)
+    product = terms.product_clone(repo, project)
+    tests = test_files(product)
+    vectors = vector_directory(repo, conf["BRANCH"])
+
+    count = 0
+    for name in DEV_DIRECTORIES:
+        if (repo / name).is_dir():
+            count += terms.scan_directory(repo / name, name, found)
+    # A test file under the vector directory is read once.
+    names = set(tests)
+    if vectors is not None and (product / vectors).is_dir():
+        names.update(f"{vectors}/{name}" for name in terms.regular_files(product / vectors))
+    for name in sorted(names):
+        count += terms.scan_file(product / name, f"{project}/{name}", found)
+    return 1 if count else 0
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if len(argv) != 2 or argv[0] != "scan" or not jig_units.PROJECT.fullmatch(argv[1]):
+        print(USAGE, file=sys.stderr)
+        return USAGE_ERROR
+    try:
+        return scan(argv[1])
+    except (Failed, jig_units.Refused) as error:
+        print(f"jig privacy: {error}", file=sys.stderr)
+        return FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

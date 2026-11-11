@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""The part of jig send that runs in the worker account.
+
+usage: python3 -I - <session> <base64 text> [--pause <seconds>] [--check <seconds>]
+       with lib/jig_tmux.py and then this file on stdin
+
+jig send sends python3 the text of lib/jig_tmux.py followed by this file, over ssh, so
+this part reads nothing from jig's tree and uses deliver() from that library as its own
+function. It decodes the text from base64 and gives it to deliver(), which types it into
+the tmux session of exactly that name and submits it. --pause and --check pass on
+deliver's pause before Enter and its time for each check of the input box.
+
+It prints only deliver's reason on a refusal, never the screen or the input box.
+Exits 0 when the text was submitted; 1 on a refusal, with "refused: <reason>" as the
+last line on stderr; 2 on a usage error.
+"""
+
+import argparse
+import base64
+import binascii
+import sys
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """An argument parser whose error is a usage error of exit 2 and nothing else."""
+
+    def error(self, message):
+        print(f"jig send, worker part: {message}", file=sys.stderr)
+        sys.exit(2)
+
+
+def positive(value):
+    number = float(value)
+    if number <= 0:
+        raise ValueError(value)
+    return number
+
+
+def parse_args(argv):
+    parser = ArgumentParser(prog="jig-send-worker")
+    parser.add_argument("session")
+    parser.add_argument("text", help="the text, as base64 of its UTF-8")
+    parser.add_argument("--pause", type=positive)
+    parser.add_argument("--check", type=positive)
+    args = parser.parse_args(argv)
+    try:
+        args.text = base64.b64decode(args.text, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        parser.error("the text is not base64 of UTF-8")
+    return args
+
+
+def main(argv):
+    # Run alone, without the library ahead of it, this file has no deliver().
+    if "deliver" not in globals():
+        print("jig send, worker part: run it with lib/jig_tmux.py ahead of it on stdin",
+              file=sys.stderr)
+        return 2
+    args = parse_args(argv)
+    settings = {key: value for key, value in (("pause", args.pause), ("check", args.check))
+                if value is not None}
+    try:
+        failure = deliver(args.session, args.text, **settings)  # noqa: F821
+    except ValueError as error:
+        print(f"jig send, worker part: {error}", file=sys.stderr)
+        return 2
+    if failure:
+        print(f"refused: {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

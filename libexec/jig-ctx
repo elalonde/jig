@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Print how full a Claude Code session's context is, and say by the exit code whether
+the session may start new work.
+
+usage: jig ctx [<tmux session>]
+
+The status line of a session running in tmux writes the harness's own token count to
+<directory>/<tmux session>.json about once a minute (lib/jig_context.py reads it; the
+directory is /run/jig/ctx unless JIG_CTX_DIR names another). This prints the reading as
+tokens over window, for example 84213/200000. With no argument it reads the tmux session
+it runs in.
+
+It prints "none (...)" instead of a reading it cannot trust:
+  none (no file)               the status line has not written for this session
+  none (bad file)              the file does not hold one reading of this session
+  none (<n> s old)             the reading is older than 3 minutes
+  none (before session start)  the tmux session runs and the reading was written
+                               before that session was created
+
+The last case matters because a session that ends and is started again keeps its tmux
+name: without it, a fresh session would read the full context of the one before it and
+stop at once.
+
+Exit codes:
+  0  a reading below the soft limit
+  3  at or above the soft limit, 250000 tokens: start no new step, finish the one in
+     hand, save the state and exit
+  4  at or above the hard limit, 280000 tokens: exit after the current tool call
+  2  no reading (none), or a usage error
+JIG_CTX_SOFT and JIG_CTX_HARD set other limits, in tokens.
+"""
+
+import argparse
+import datetime
+import os
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_context  # noqa: E402
+
+SOFT_LIMIT = 250000
+HARD_LIMIT = 280000
+MAX_AGE = datetime.timedelta(minutes=3)
+TMUX_TIMEOUT = 10
+
+
+class UsageError(Exception):
+    pass
+
+
+def limit(name, default):
+    value = os.environ.get(name)
+    if not value:
+        return default
+    if not value.isdigit():
+        raise UsageError(f"{name} must be a whole number of tokens, not {value!r}")
+    return int(value)
+
+
+def tmux(*args):
+    """Return tmux's output, or None when tmux fails, is missing or does not answer."""
+    try:
+        result = subprocess.run(["tmux", *args], capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL, timeout=TMUX_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def own_session():
+    # TMUX is set only inside a tmux session; outside one, display-message would name
+    # whatever session the default server last used, which is not this process's.
+    if not os.environ.get("TMUX"):
+        raise UsageError("not inside tmux: name the tmux session")
+    name = tmux("display-message", "-p", "#S")
+    if not name:
+        raise UsageError("tmux did not name the session this runs in")
+    return name
+
+
+def session_created(session):
+    """Return the creation time of a running tmux session, or None when it does not run."""
+    # The "=" asks for this exact name, so a session whose name only starts with it
+    # is not taken instead.
+    value = tmux("display-message", "-p", "-t", f"={session}:", "#{session_created}")
+    if not value or not value.isdigit():
+        return None
+    return datetime.datetime.fromtimestamp(int(value)).astimezone()
+
+
+def reading(session, now):
+    """Return the text to print for a session: the readout, or none with its reason."""
+    if not (jig_context.context_dir() / f"{session}.json").exists():
+        return "none (no file)", None
+    context = jig_context.read_context(session, now=now)
+    if context is None:
+        return "none (bad file)", None
+    written = now - context.age
+    created = session_created(session)
+    if created is not None and written < created:
+        return "none (before session start)", None
+    if context.age > MAX_AGE:
+        return f"none ({int(context.age.total_seconds())} s old)", None
+    return context.readout(), context
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="jig ctx", description=__doc__.split("\n\n", 2)[2],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("session", nargs="?", help="the tmux session; default: this one")
+    args = parser.parse_args(argv)
+    try:
+        soft, hard = limit("JIG_CTX_SOFT", SOFT_LIMIT), limit("JIG_CTX_HARD", HARD_LIMIT)
+        session = args.session if args.session is not None else own_session()
+        # The name becomes a file name in the context directory, so it may not climb
+        # out of it.
+        if not session or "/" in session or session in (".", ".."):
+            raise UsageError(f"bad tmux session name: {session!r}")
+    except UsageError as error:
+        print(f"jig ctx: {error}", file=sys.stderr)
+        return 2
+    text, context = reading(session, datetime.datetime.now().astimezone())
+    print(text)
+    if context is None:
+        return 2
+    if context.tokens >= hard:
+        print(f"jig ctx: at or above the hard limit of {hard} tokens: exit after the "
+              "current tool call", file=sys.stderr)
+        return 4
+    if context.tokens >= soft:
+        print(f"jig ctx: at or above the soft limit of {soft} tokens: start no new step",
+              file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

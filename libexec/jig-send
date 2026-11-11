@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Type a correction into a running unit's tmux session and submit it.
+
+usage: jig send <project> <ID> <text>...
+
+The words after the ID, joined by single spaces, are the text: one line that is not
+blank and holds no control character. The unit's account and tmux session come from
+the first line of its prompt, ~/ws/prompts/<project>/<ID>.md, read as jig close reads
+it, and the text goes to that session and to no other.
+
+The worker part runs in the worker account: ssh starts python3 there, which reads
+lib/jig_tmux.py and then libexec/jig-send-worker from stdin. So the worker account
+reads nothing from this tree, which may lie in a home it cannot enter, and runs the
+same code as this tree even when an installed jig differs. The text travels as base64
+in one argument, so no shell on the way reads its quotes, $ signs or backslashes.
+
+Nothing is typed while the session shows no input bar, because an Enter would then
+answer a dialog. The text has to show in the input box before Enter goes, and to leave
+it after. A refusal names its reason and never prints the session's screen or input
+box: a project can keep its spec writer's work out of the orchestrator's sight, and
+the screen of a spec writer's session would show that work.
+
+JIG_SSH holds the ssh command, and tests set it. JIG_SEND_PAUSE and JIG_SEND_CHECK, in
+seconds, set the pause before Enter and the time allowed for each check of the box;
+they go to the worker part as arguments, because ssh carries no environment.
+"""
+
+import base64
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import subprocess
+import sys
+import unicodedata
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CLOSE_SCRIPT = ROOT / "libexec" / "jig-close"
+WORKER_SCRIPT = ROOT / "libexec" / "jig-send-worker"
+TMUX_LIBRARY = ROOT / "lib" / "jig_tmux.py"
+
+USAGE = """usage: jig send <project> <ID> <text>...
+Types the text, its words joined by single spaces, into the unit's tmux session and
+submits it. The text is one line, not blank, without control characters.
+Exits 0 when the text was submitted; 1 on a refusal (no prompt, a bad first line, no
+such session, no input bar, a text that did not arrive or did not leave the input box),
+with the reason on stderr; 2 on a usage error.
+"""
+
+DONE, REFUSED, USAGE_ERROR = 0, 1, 2
+# The worker part checks the box for up to three times its check time, after ssh has
+# connected; a worker that has not answered by then hangs, and is refused.
+WORKER_TIMEOUT_SECONDS = 120
+
+# jig close holds the reader of a prompt's first line, and through jig start the ssh
+# command and the conf reader, so that every tool finds a unit's session the same way.
+sys.dont_write_bytecode = True
+_loader = importlib.machinery.SourceFileLoader("jig_close", str(CLOSE_SCRIPT))
+_spec = importlib.util.spec_from_loader("jig_close", _loader)
+closing = importlib.util.module_from_spec(_spec)
+_loader.exec_module(closing)
+helpers = closing.helpers
+
+
+class UsageError(Exception):
+    """The command line is wrong; the message says how."""
+
+
+def one_line(words):
+    """Return the text of the words, or raise UsageError when it is not one line.
+
+    A newline or carriage return would submit part of the text early. Other control
+    characters are refused too: an Esc would stop the worker's turn, and a tab would
+    ask Claude Code to complete a word.
+    """
+    text = " ".join(words)
+    if not text.strip():
+        raise UsageError("the text is empty")
+    if any(unicodedata.category(char) == "Cc" for char in text):
+        raise UsageError("the text must be one line, without control characters")
+    return text
+
+
+def seconds(name):
+    """Return the setting as the worker part's argument, or None when it is not set."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    try:
+        if float(value) > 0:
+            return value
+    except ValueError:
+        pass
+    raise UsageError(f"{name} must be a number of seconds above 0, not {value!r}")
+
+
+def parse_args(argv):
+    if len(argv) < 2:
+        raise UsageError("a project, an ID and a text are needed")
+    project, unit, words = argv[0], argv[1], argv[2:]
+    if not helpers.PROJECT.fullmatch(project):
+        raise UsageError(f"bad project: {project}")
+    if not helpers.UNIT_ID.fullmatch(unit):
+        raise UsageError(f"bad ID: {unit}")
+    text = one_line(words)
+    settings = []
+    for option, name in (("--pause", "JIG_SEND_PAUSE"), ("--check", "JIG_SEND_CHECK")):
+        value = seconds(name)
+        if value is not None:
+            settings += [option, value]
+    return project, unit, text, settings
+
+
+def run_worker(account, session, text, settings):
+    """Run the worker part over ssh; return None when the text was submitted, or else the
+    name and detail of the refusal."""
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    words = ["python3", "-I", "-", session, encoded, *settings]
+    # The worker script uses the library's functions as its own, so the library comes first.
+    script = TMUX_LIBRARY.read_bytes() + b"\n" + WORKER_SCRIPT.read_bytes()
+    try:
+        result = subprocess.run(closing.start.remote_command(account, words), input=script,
+                                capture_output=True, timeout=WORKER_TIMEOUT_SECONDS,
+                                check=False)
+    except subprocess.TimeoutExpired:
+        return "worker", f"no answer from {account} in {WORKER_TIMEOUT_SECONDS} s"
+    if result.returncode == DONE:
+        return None
+    # Only the worker's own refusal line is passed on. Anything else, such as a
+    # traceback, could hold text from the session, so it is reduced to its exit code.
+    lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
+    if result.returncode == REFUSED and lines and lines[-1].startswith("refused: "):
+        return "session", lines[-1][len("refused: "):]
+    return "worker", f"the worker part exited {result.returncode} in {account}"
+
+
+def send(project, unit, text, settings):
+    conf = helpers.read_conf(project)
+    account, role, session = closing.read_prompt(project, unit)
+    if account not in helpers.role_accounts(conf, role):
+        helpers.refuse("account", f"the conf file does not give role {role} to {account}")
+    failure = run_worker(account, session, text, settings)
+    if failure:
+        helpers.refuse(*failure)
+    print(f"jig send: submitted to {session} in {account}")
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(USAGE, end="")
+        return DONE
+    try:
+        project, unit, text, settings = parse_args(argv)
+    except UsageError as error:
+        print(f"{USAGE}jig send: error: {error}", file=sys.stderr)
+        return USAGE_ERROR
+    try:
+        send(project, unit, text, settings)
+    except helpers.Refused as error:
+        print(f"jig send: {error}", file=sys.stderr)
+        return REFUSED
+    return DONE
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

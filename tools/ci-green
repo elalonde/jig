@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Exit 0 only when every CI job of a commit finished with conclusion success.
+
+usage: ci-green [--wait <seconds>] <clone> <token-file> [<commit>]
+
+The repository comes from the clone's origin, and the commit defaults to its
+HEAD. This talks to the API directly with the token file, because the account's
+gh login may belong to another project. Exit 1 means not green, 2 means the
+answer could not be read.
+
+Without --wait the answer is read once, so a job that still runs is not green.
+With --wait, a release that has just pushed its commit can wait for CI: the jobs
+are read again every JIG_CI_POLL seconds (15 unless set) until every job of the
+commit has completed and every workflow run of the commit has the status
+completed, and then judged as without it. The runs count too, because a job that
+waits for another one may not be listed until it is queued, so a run whose listed
+jobs are all green can still be going. A job that completed with
+any conclusion but success ends the wait at once, since nothing can make the
+commit green any more. When the seconds run out first, the last line says "CI
+not finished" and the exit is 1.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = os.environ.get("JIG_GITHUB_API", "https://api.github.com")
+PAGE_SIZE = 100
+DEFAULT_POLL_SECONDS = 15.0
+
+
+class Unreadable(Exception):
+    """The API or the clone did not give an answer."""
+
+
+def fetch(path, token):
+    request = urllib.request.Request(API + path, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise Unreadable(f"{path}: HTTP {error.code}") from None
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise Unreadable(f"{path}: {error}") from None
+
+
+def fetch_all(path, key, token):
+    """Follow the API's pages; a job on a later page counts like any other."""
+    items = []
+    page = 1
+    separator = "&" if "?" in path else "?"
+    while True:
+        batch = fetch(f"{path}{separator}per_page={PAGE_SIZE}&page={page}", token).get(key, [])
+        items.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return items
+        page += 1
+
+
+def git(clone, *args):
+    try:
+        return subprocess.run(["git", "-C", clone, *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError) as error:
+        raise Unreadable(f"git {' '.join(args)}: {error}") from None
+
+
+def read_runs(base, sha, token):
+    """Return the workflow runs of the commit and the jobs of all of them."""
+    runs = fetch_all(f"{base}?head_sha={sha}", "workflow_runs", token)
+    jobs = []
+    for run in runs:
+        jobs.extend(fetch_all(f"{base}/{run['id']}/jobs", "jobs", token))
+    return runs, jobs
+
+
+def finished(runs, jobs):
+    """Tell whether the wait can end: one job is red, or every job and run has completed.
+
+    The API gives a job its conclusion only when the job has completed.
+    """
+    if any(job.get("conclusion") not in (None, "success") for job in jobs):
+        return True
+    return bool(jobs) and all(job.get("conclusion") is not None for job in jobs) \
+        and all(run.get("status") == "completed" for run in runs)
+
+
+def poll_seconds():
+    try:
+        return max(float(os.environ.get("JIG_CI_POLL") or DEFAULT_POLL_SECONDS), 0.05)
+    except ValueError:
+        return DEFAULT_POLL_SECONDS
+
+
+def parse(argv):
+    """Return (wait seconds or None, positional words), or None for a usage error."""
+    wait = None
+    if argv[:1] == ["--wait"]:
+        if len(argv) < 2 or not argv[1].isdigit():
+            return None
+        wait, argv = int(argv[1]), argv[2:]
+    if len(argv) not in (2, 3) or any(word.startswith("--") for word in argv):
+        return None
+    return wait, argv
+
+
+def main(argv):
+    parsed = parse(argv)
+    if parsed is None:
+        print(__doc__, file=sys.stderr)
+        return 2
+    wait, words = parsed
+    clone, token_file = words[:2]
+    commit = words[2] if len(words) == 3 else "HEAD"
+
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+        if not token:
+            raise Unreadable(f"{token_file} is empty")
+        origin = git(clone, "remote", "get-url", "origin")
+        slug = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\.git)?$", origin)
+        if not slug:
+            raise Unreadable(f"cannot read owner/repo from origin: {origin}")
+        sha = git(clone, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        base = f"/repos/{slug.group(1)}/actions/runs"
+        runs, jobs = read_runs(base, sha, token)
+        if wait is not None:
+            deadline = time.monotonic() + wait
+            while not finished(runs, jobs):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    for job in jobs:
+                        print(f"ci-green: {job.get('name')}: {job.get('conclusion')}")
+                    print(f"ci-green: CI not finished for {sha} after {wait} s")
+                    return 1
+                time.sleep(min(poll_seconds(), left))
+                runs, jobs = read_runs(base, sha, token)
+    except (Unreadable, OSError, KeyError) as error:
+        print(f"ci-green: {error}", file=sys.stderr)
+        return 2
+
+    for job in jobs:
+        print(f"ci-green: {job.get('name')}: {job.get('conclusion')}")
+    if not jobs:
+        print(f"ci-green: no jobs for {sha}")
+        return 1
+    if all(job.get("conclusion") == "success" for job in jobs):
+        print(f"ci-green: {sha} is green, {len(jobs)} job(s)")
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Close one unit in its worker account, from the orchestrator's account.
+
+usage: jig close <project> <ID> [--dead]
+
+The unit's account and tmux session come from the first line of its prompt,
+~/ws/prompts/<project>/<ID>.md, the file jig start was given. A unit can run
+more than once under one ID: every jig start commits "status: <ID> start", and
+the newest such commit on origin begins the current run.
+
+In order: when the last line for the ID in impl/log/status.log on origin is an
+end line, the unit is closed already, and jig close says so and does nothing
+else. Without --dead, the current run needs its report: a "log: <ID>" commit on
+origin after the newest start commit. Its status word is the text before the
+colon in line 1 of impl/log/<ID>-report.md at that commit. --dead is for a
+worker that ended without a report, or a session that a refused jig start left
+at a dialog; its status word is "dead". The orchestrator's clone must
+fast-forward to origin, and its status.log must have no uncommitted change.
+
+Then the worker part ends the session, frees the lock when it names that
+session, and copies the transcripts. Last, the end line goes into status.log,
+committed alone and pushed. A refused push gets one fetch and one rebase with
+--autostash, so an uncommitted change in the clone, such as the idle lines that
+jig orch appends to impl/orch/updates.log, stays in place and uncommitted. The caller chooses when to close; jig close acts at
+once. JIG_SSH holds the ssh command, and tests set it.
+Exits 0 when the unit is closed, or was already; 1 on a refusal; 2 on a usage error.
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+START_SCRIPT = ROOT / "libexec" / "jig-start"
+WORKER_SCRIPT = ROOT / "libexec" / "jig-close-worker"
+
+# jig start holds the prompt's first-line pattern, the ssh command and the git
+# helpers, so both tools read a prompt and a clone the same way.
+sys.dont_write_bytecode = True
+_loader = importlib.machinery.SourceFileLoader("jig_start", str(START_SCRIPT))
+_spec = importlib.util.spec_from_loader("jig_start", _loader)
+start = importlib.util.module_from_spec(_spec)
+_loader.exec_module(start)
+helpers = start.worker
+
+STATUS_LOG = start.STATUS_LOG
+DEAD = "dead"
+
+
+def refuse(name, detail):
+    helpers.refuse(name, detail)
+
+
+def read_prompt(project, unit):
+    """Return the account, role and tmux session that the prompt's first line names."""
+    path = pathlib.Path(os.path.expanduser(f"~/ws/prompts/{project}/{unit}.md"))
+    try:
+        with open(path, encoding="utf-8") as stream:
+            first = stream.readline().rstrip("\n")
+    except OSError as error:
+        refuse("prompt", f"cannot read {path}: {error.strerror}")
+    match = start.FIRST_LINE.fullmatch(first)
+    if not match:
+        refuse("prompt", f"{path}: cannot read the first line")
+    session, account = match[2], match[3]
+    prefix, suffix = f"{project}-", f"-{unit}"
+    role = session[len(prefix):-len(suffix)] \
+        if session.startswith(prefix) and session.endswith(suffix) else ""
+    if match[1] != unit or match[4] != project or role not in helpers.ROLE_KEYS:
+        refuse("prompt", f"{path} is for {session}, which is not a session of {project} {unit}")
+    return account, role, session
+
+
+def unit_lines(clone, branch, unit):
+    """Return the lines of status.log on origin that belong to the unit."""
+    shown = helpers.git(clone, "show", f"refs/remotes/origin/{branch}:{STATUS_LOG}")
+    if shown.returncode != 0:
+        return []
+    return [line for line in shown.stdout.splitlines()
+            if len(line.split()) >= 4 and line.split()[1] == unit
+            and line.split()[2] in ("start", "end")]
+
+
+def newest_commit(clone, revisions, subject):
+    """Return the newest commit in revisions whose subject is exactly subject, or None."""
+    listed = helpers.git(clone, "log", "--fixed-strings", f"--grep={subject}",
+                         "--format=%H %s", revisions)
+    for line in listed.stdout.splitlines():
+        commit, _, text = line.partition(" ")
+        if text == subject:
+            return commit
+    return None
+
+
+def fetch(clone):
+    fetched = helpers.git(clone, "fetch", "-q", "origin")
+    if fetched.returncode != 0:
+        refuse("status", f"cannot fetch origin in {clone}: {helpers.last_line(fetched)}")
+
+
+def sync_clone(clone, branch):
+    """Bring the clone to origin, as jig start does before its status line; return the head."""
+    current = helpers.git_out(clone, "symbolic-ref", "-q", "--short", "HEAD")
+    if current != branch:
+        refuse("status", f"{clone} has {current or 'a detached HEAD'} checked out, not {branch}")
+    merged = helpers.git(clone, "merge", "-q", "--ff-only", f"refs/remotes/origin/{branch}")
+    if merged.returncode != 0:
+        refuse("status", f"{clone} cannot fast-forward: {helpers.last_line(merged)}")
+    head = helpers.git_out(clone, "rev-parse", "HEAD")
+    if head != helpers.git_out(clone, "rev-parse", f"refs/remotes/origin/{branch}"):
+        refuse("status", f"{clone} has commits that are not on origin/{branch}")
+    # The end line is committed alone, so a change of the orchestrator's own to the
+    # log would either be lost or go out under the unit's end commit.
+    if helpers.git_out(clone, "status", "--porcelain", "--", STATUS_LOG):
+        refuse("status", f"{STATUS_LOG} has uncommitted changes in {clone}")
+    return head
+
+
+def report_status(clone, commit, unit):
+    """Return the status of the unit's report as the commit holds it, or "" without one.
+
+    The status is the text before the first colon of line 1, or the whole line when it
+    has no colon. jig orch reads it here too, so that the line it sends and the end line
+    of jig close never disagree.
+    """
+    report = helpers.git(clone, "show", f"{commit}:impl/log/{unit}-report.md")
+    lines = report.stdout.splitlines() if report.returncode == 0 else []
+    return lines[0].split(":", 1)[0].strip() if lines else ""
+
+
+def run_status(clone, branch, unit, dead):
+    """Return the status word and commit of the end line, or refuse."""
+    origin = f"refs/remotes/origin/{branch}"
+    started = newest_commit(clone, origin, f"status: {unit} start")
+    if started is None:
+        refuse("start", f"origin/{branch} has no 'status: {unit} start' commit")
+    # A log commit of an earlier run comes before the newest start, so it does not count.
+    logged = newest_commit(clone, f"{started}..{origin}", f"log: {unit}")
+    if dead:
+        if logged:
+            refuse("report", f"the current run has its report in {logged[:12]}; close it "
+                             f"without --dead")
+        return DEAD, helpers.git_out(clone, "rev-parse", origin)
+    if logged is None:
+        refuse("report", f"no 'log: {unit}' commit on origin/{branch} after the newest "
+                         f"start {started[:12]}; use --dead for a worker that ended without one")
+    word = report_status(clone, logged, unit)
+    if not word:
+        refuse("report", f"{logged[:12]} has no status in line 1 of impl/log/{unit}-report.md")
+    return word, logged
+
+
+def run_worker(account, project, role, unit, dead):
+    words = ["python3", "-I", "-", project, role, unit, "--account", account]
+    if dead:
+        words.append("--dead")
+    with open(WORKER_SCRIPT, "rb") as script:
+        result = subprocess.run(start.remote_command(account, words), stdin=script, check=False)
+    if result.returncode != 0:
+        refuse("worker", f"the worker part exited {result.returncode} in {account}; "
+                         f"no end line was written")
+
+
+def push_end(clone, branch):
+    detail = start.jig_push.push_commit(clone, branch)
+    if detail:
+        refuse("status", f"{detail}; the worker part is done, and jig close again writes "
+                         f"the end line")
+
+
+def write_end(clone, branch, unit, status, commit):
+    fetch(clone)
+    head = sync_clone(clone, branch)
+    if status == DEAD:
+        commit = head
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    log = pathlib.Path(clone) / STATUS_LOG
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as stream:
+        stream.write(f"{now} {unit} end {status} {commit}\n")
+    added = helpers.git(clone, "add", "--", STATUS_LOG)
+    committed = helpers.git(clone, "commit", "-q", "-m", f"status: {unit} end\n\n{start.CO_AUTHOR}",
+                            "--only", "--", STATUS_LOG)
+    if added.returncode != 0 or committed.returncode != 0:
+        helpers.git(clone, "checkout", "-q", "HEAD", "--", STATUS_LOG)
+        refuse("status", f"cannot commit {STATUS_LOG}: {helpers.last_line(committed)}")
+    push_end(clone, branch)
+    return commit
+
+
+def close(args):
+    conf = helpers.read_conf(args.project)
+    clone, branch = conf["REPO"], conf["BRANCH"]
+    fetch(clone)
+    lines = unit_lines(clone, branch, args.unit)
+    if lines and lines[-1].split()[2] == "end":
+        print(f"jig close: {args.unit} is closed already: {lines[-1]}")
+        return
+
+    account, role, session = read_prompt(args.project, args.unit)
+    if account not in helpers.role_accounts(conf, role):
+        refuse("account", f"the conf file does not give role {role} to {account}")
+    sync_clone(clone, branch)
+    status, commit = run_status(clone, branch, args.unit, args.dead)
+
+    run_worker(account, args.project, role, args.unit, args.dead)
+    commit = write_end(clone, branch, args.unit, status, commit)
+    print(f"jig close: closed {session}: end {status} {commit}")
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="jig close")
+    parser.add_argument("project")
+    parser.add_argument("unit", metavar="ID")
+    parser.add_argument("--dead", action="store_true",
+                        help="the worker ended without a report, or a refused start left it")
+    args = parser.parse_args(argv)
+    if not helpers.PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    if not helpers.UNIT_ID.fullmatch(args.unit):
+        parser.error(f"bad ID: {args.unit}")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        close(args)
+    except helpers.Refused as error:
+        print(f"jig close: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

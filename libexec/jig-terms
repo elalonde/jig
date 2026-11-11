@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Check that no private term of a project appears in what its release publishes.
+
+usage: jig terms check <project> [<directory>]
+
+The terms are the lines of terms.txt at the top of the project's -dev clone, the
+clone that REPO names in ~/.config/jig/<project>.conf. A line that is blank, or whose
+first text is "#", holds no term; every other line is one term, without the spaces
+around it. A term matches wherever its characters appear in a row, in any letter
+case, also inside a longer word: a private name joined to another word is still
+published.
+
+Three places are read:
+  the product clone nested in the -dev clone, <REPO>/<project>: every file that git
+    lists, tracked or new and not ignored, by its path and by its contents;
+  the messages of the product commits since the last release on the line that
+    BRANCH names: the commits reachable from the clone's HEAD and not from the
+    newest tag v<BRANCH>.<n> reachable from it, or every commit reachable from HEAD
+    when there is no such tag;
+  with <directory>, every regular file under it, at any depth, by its path below
+    <directory> and by its bytes. The place of <directory> itself is not searched:
+    it is where the caller keeps the files, which is not published. An archive in
+    it is read as it is: the caller unpacks what it wants read.
+
+Each match prints one line on stdout. The line names the place and the line of
+terms.txt that holds the term, and never the term itself:
+  <path>:<line>: terms.txt line <n>
+  <path>: terms.txt line <n> in the path
+  commit <hash>: terms.txt line <n>
+Paths in the product start with <project>/, so that they read from the top of the
+-dev clone, and paths under <directory> start with <directory>. A printed path
+has each term in it replaced by "***", also in the part of <directory>, where a
+term is not a match. A line or a message that holds one term twice prints one line
+for it.
+
+Exits 0 with no match; 1 with a match, or when the check cannot be made: no
+terms.txt, one that cannot be read or holds no term, no product clone, a directory
+that does not exist, a file that cannot be read (one line on stderr names it); 2 on
+a usage error. Changes no file.
+"""
+
+import bisect
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_units  # noqa: E402
+import lint_a  # noqa: E402
+
+USAGE = "usage: jig terms check <project> [<directory>]"
+TERMS_FILE = "terms.txt"
+# What a private value in a printed path is replaced with.
+MASK = "***"
+FAILED = 1
+# Terms come first among the kinds of match on a line, in the order of terms.txt.
+TERM_RANK = 0
+USAGE_ERROR = 2
+
+
+class Failed(Exception):
+    """The check cannot be made, so an empty result would not mean a clean tree."""
+
+
+def decode(data):
+    """Return bytes as text in which every byte keeps its place.
+
+    Bytes that are not UTF-8, as in a binary file, become stand-in characters that
+    match nothing, so that UTF-8 text inside a binary file is still found.
+    """
+    return data.decode("utf-8", "surrogateescape")
+
+
+def line_finder(text):
+    """Return a function that gives the line number of an offset in text."""
+    breaks = [found.start() for found in re.finditer("\n", text)]
+    return lambda offset: bisect.bisect_left(breaks, offset) + 1
+
+
+def folded_with_owners(text):
+    """Return text in folded letter case, and for each folded character its index in text.
+
+    Folding can make one character into two, so a match in the folded text is
+    mapped back through the owners to mask the right characters of the original.
+    """
+    folded, owners = [], []
+    for index, character in enumerate(text):
+        piece = character.casefold()
+        folded.append(piece)
+        owners.extend([index] * len(piece))
+    return "".join(folded), owners
+
+
+class Fixed:
+    """Finds fixed strings in any letter case; each string has its own label.
+
+    Each item is (rank, label, value). The rank, a tuple, orders the labels of one
+    line in the output; the value is never printed.
+    """
+
+    def __init__(self, items):
+        self.items = [(rank, label, value.casefold()) for rank, label, value in items
+                      if value]
+
+    def lines(self, text):
+        """Return {(line, rank, label)} for each line of text that holds an item."""
+        folded = text.casefold()
+        line_of = line_finder(folded)
+        found = set()
+        for rank, label, value in self.items:
+            start = folded.find(value)
+            while start != -1:
+                found.add((line_of(start), rank, label))
+                # The rest of this line cannot add anything for this item.
+                end = folded.find("\n", start + len(value))
+                if end == -1:
+                    break
+                start = folded.find(value, end + 1)
+        return found
+
+    def spans(self, text):
+        """Return [(start, end, rank, label)] in text, for masking a short text."""
+        folded, owners = folded_with_owners(text)
+        spans = []
+        for rank, label, value in self.items:
+            start = folded.find(value)
+            while start != -1:
+                end = start + len(value)
+                spans.append((owners[start], owners[end - 1] + 1, rank, label))
+                start = folded.find(value, start + 1)
+        return spans
+
+
+def read_terms(path):
+    """Return [(line number, term)] of terms.txt, or raise Failed naming the file.
+
+    A missing, unreadable or empty file fails, because the check would otherwise
+    pass with nothing to look for.
+    """
+    try:
+        data = pathlib.Path(path).read_bytes()
+    except FileNotFoundError:
+        raise Failed(f"terms file {path} does not exist") from None
+    except OSError as error:
+        raise Failed(f"cannot read terms file {path}: {error.strerror}") from None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Failed(f"terms file {path} is not UTF-8 text") from None
+    terms = []
+    for number, line in enumerate(text.splitlines(), 1):
+        term = line.strip()
+        if term and not term.startswith("#"):
+            terms.append((number, term))
+    if not terms:
+        raise Failed(f"terms file {path} holds no term")
+    return terms
+
+
+def term_finder(path):
+    """Return a Fixed finder for the terms of terms.txt, labelled by their line."""
+    return Fixed([((TERM_RANK, number), f"{TERMS_FILE} line {number}", term)
+                  for number, term in read_terms(path)])
+
+
+def masked(text, finders):
+    """Return text with every match of every finder replaced by MASK."""
+    covered = [False] * len(text)
+    for finder in finders:
+        for start, end, _, _ in finder.spans(text):
+            for index in range(start, end):
+                covered[index] = True
+    pieces = []
+    for index, character in enumerate(text):
+        if not covered[index]:
+            pieces.append(character)
+        elif index == 0 or not covered[index - 1]:
+            pieces.append(MASK)
+    return "".join(pieces)
+
+
+def path_matches(shown, path, finders):
+    """Return the output lines for the private values in a path itself."""
+    labels = set()
+    for finder in finders:
+        labels.update((rank, label) for _, _, rank, label in finder.spans(path))
+    return [f"{shown}: {label} in the path" for _, label in sorted(labels)]
+
+
+def text_matches(shown, text, finders):
+    """Return the output lines for each line of text that holds a private value."""
+    found = set()
+    for finder in finders:
+        found.update(finder.lines(text))
+    return [f"{shown}:{line}: {label}" for line, _, label in sorted(found)]
+
+
+def read_bytes(path, shown):
+    try:
+        return pathlib.Path(path).read_bytes()
+    except OSError as error:
+        raise Failed(f"cannot read {shown}: {error.strerror}") from None
+
+
+def scan_file(path, name, finders, shown_root=None):
+    """Print and return the matches of one file, searched by name and by its bytes.
+
+    The printed path is name, or shown_root/name with shown_root given; shown_root is
+    not searched, but a term in it is masked all the same.
+    """
+    shown = masked(name if shown_root is None else f"{shown_root}/{name}", finders)
+    lines = path_matches(shown, name, finders)
+    lines += text_matches(shown, decode(read_bytes(path, shown)), finders)
+    for line in lines:
+        print(line, flush=True)
+    return len(lines)
+
+
+def regular_files(directory):
+    """Return the paths under directory of every regular file, at any depth, sorted.
+
+    A symbolic link is not followed: it is not a file of the tree it stands in.
+    """
+    def stop(error):
+        raise Failed(f"cannot read {error.filename}: {error.strerror}")
+
+    directory = pathlib.Path(directory)
+    names = []
+    for root, subdirs, files in os.walk(directory, onerror=stop):
+        subdirs.sort()
+        for name in files:
+            path = pathlib.Path(root) / name
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError as error:
+                raise Failed(f"cannot read {path}: {error.strerror}") from None
+            if stat.S_ISREG(mode):
+                names.append(path.relative_to(directory).as_posix())
+    return sorted(names)
+
+
+def scan_directory(directory, shown_root, finders):
+    """Scan every regular file under directory; paths print under shown_root."""
+    count = 0
+    for name in regular_files(directory):
+        count += scan_file(pathlib.Path(directory) / name, name, finders, shown_root)
+    return count
+
+
+def product_clone(repo, project):
+    product = pathlib.Path(repo) / project
+    if not (product / ".git").exists():
+        raise Failed(f"no product clone at {product}")
+    return product
+
+
+def git(clone, *args):
+    return subprocess.run(["git", "-C", str(clone), *args], capture_output=True, check=False)
+
+
+def git_lines(clone, *args):
+    result = git(clone, *args)
+    if result.returncode != 0:
+        detail = decode(result.stderr).strip().splitlines()
+        raise Failed(f"git {args[0]} failed in {clone}: {detail[-1] if detail else ''}")
+    return decode(result.stdout).splitlines()
+
+
+def listed_files(product):
+    """Return the files git lists in the product, tracked or new and not ignored."""
+    try:
+        return lint_a.listed_files(product)
+    except subprocess.CalledProcessError:
+        raise Failed(f"git cannot list the files of {product}") from None
+
+
+def scan_product(product, project, finders):
+    count = 0
+    for name in listed_files(product):
+        count += scan_file(product / name, f"{project}/{name}", finders)
+    return count
+
+
+def last_release(product, line):
+    """Return the newest tag v<line>.<n> by n among those reachable from HEAD, or None."""
+    form = re.compile(rf"v{re.escape(line)}\.([0-9]+)")
+    best = None
+    for tag in git_lines(product, "tag", "--merged", "HEAD", "--list", f"v{line}.*"):
+        found = form.fullmatch(tag)
+        if found and (best is None or int(found.group(1)) > best[0]):
+            best = (int(found.group(1)), tag)
+    return None if best is None else best[1]
+
+
+def commit_messages(product, line):
+    """Return [(hash, message)] of the commits since the last release on the line."""
+    if git(product, "rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+        return []
+    tag = last_release(product, line)
+    span = "HEAD" if tag is None else f"refs/tags/{tag}..HEAD"
+    result = git(product, "log", "-z", "--format=%H%n%B", span)
+    if result.returncode != 0:
+        raise Failed(f"git log failed in {product}")
+    messages = []
+    for entry in decode(result.stdout).split("\0"):
+        commit, _, message = entry.partition("\n")
+        if commit:
+            messages.append((commit.strip(), message))
+    return messages
+
+
+def scan_messages(product, line, finders):
+    count = 0
+    for commit, message in commit_messages(product, line):
+        labels = set()
+        for finder in finders:
+            labels.update((rank, label) for _, rank, label in finder.lines(message))
+        for _, label in sorted(labels):
+            print(f"commit {commit}: {label}", flush=True)
+            count += 1
+    return count
+
+
+def check(project, directory=None):
+    conf = jig_units.read_conf(project)
+    repo = pathlib.Path(conf["REPO"])
+    finders = [term_finder(repo / TERMS_FILE)]
+    product = product_clone(repo, project)
+    if directory is not None and not pathlib.Path(directory).is_dir():
+        raise Failed(f"{directory} is not a directory")
+    count = scan_product(product, project, finders)
+    count += scan_messages(product, conf["BRANCH"], finders)
+    if directory is not None:
+        count += scan_directory(directory, str(directory).rstrip("/") or "/", finders)
+    return 1 if count else 0
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if len(argv) not in (2, 3) or argv[0] != "check" \
+            or not jig_units.PROJECT.fullmatch(argv[1]):
+        print(USAGE, file=sys.stderr)
+        return USAGE_ERROR
+    try:
+        return check(*argv[1:])
+    except (Failed, jig_units.Refused) as error:
+        print(f"jig terms: {error}", file=sys.stderr)
+        return FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

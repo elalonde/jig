@@ -1,0 +1,7 @@
+# Git attributes that jig trace form passes to git show, so that the header of
+# each hunk names the Python or bash function it falls in. Without them git
+# names the nearest line that starts with a letter, which is often a class or
+# an import, not the function that changed.
+*.py diff=python
+*.sh diff=bash
+*.bash diff=bash

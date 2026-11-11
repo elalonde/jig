@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Check, write and outline a project's trace records, and check their coverage.
+
+usage: jig trace check | coverage | gen <product path> ... | form <commit>
+
+Run in the -dev clone, on the product clone nested in it (the -dev directory's
+name without -dev). The product's own comments and test names carry no record
+IDs; the trace in the -dev clone ties them to the code instead.
+
+The spec documents are the files under specs/ at any depth, except the kickoff
+record, the status file, specs/ids.tsv and specs/id-map.tsv. An ID occurs in a
+text only as a whole, never as the start of a longer ID.
+
+check makes sure that tie still holds:
+
+- every entry of trace/<product path>.json finds its code line by text and
+  occurrence, or is file-level (line 0);
+- every ID an entry holds belongs to a class of specs/ids.tsv and occurs in a
+  spec document, and every ID that a class regex finds in the spec documents,
+  searched with the same guards as the general ID form, has that form as a whole;
+- every trace file still has its product file;
+- every product commit after the import has its note in
+  trace/ledger/<full hash>.md, with no cell still holding <fill>. The commit map
+  trace/commit-map.tsv lists, for each commit that a history rewrite replaced,
+  the commit that took its place, and the import is the newest of those; a
+  commit that the rewrite dropped has no new hash and takes no part in finding
+  the import;
+- the ID map specs/id-map.tsv, when present, has its form, and while
+  trace/pre-import names the commit from before the product's IDs moved into the
+  trace, every ID of that commit's tree is carried. Only the files that are still
+  product files are searched: first for the old IDs of the map, the longest first,
+  then for the IDs of each class, where a match inside an earlier one does not
+  count. Each ID found reads through the map, to its new IDs, to nothing for a
+  dropped ID, or to itself, and each result must be in an entry of the trace of
+  its file. A broken ID map gives its one line and nothing else.
+
+A missing commit map, ID map or trace/pre-import means there was no rewrite or
+move, and that part passes.
+
+coverage reads the records only: specs/ids.tsv, the files that each class names
+as defining its IDs, the spec documents and the trace files. It needs no product
+clone, and with no specs/ids.tsv it has nothing to check. Each class names its
+check:
+
+- requirement: each ID, defined by a heading, has one Owner line under it, which
+  names a spec document that writes the ID, and the ID is in a cell after the
+  first of a control row;
+- control: each control row, a table row that defines a control, has a cell in
+  the column whose header starts with Mutation that holds more than spaces, and
+  its ID is in an entry of the trace, which is how its test is known;
+- fixture: each ID of the class that a spec document or a trace entry uses has a
+  table row that defines it;
+- reference: each defined ID is used on a spec line other than its definition,
+  or by a trace entry;
+- none: only that no ID is defined twice, which every class checks.
+
+Each failure of coverage is the one line <path>:<line>: <ID>: <problem>. A
+broken specs/ids.tsv gives its one line and nothing else.
+
+gen reads the comments of the named product files, with the comment signs lint A
+uses, and adds one entry to trace/<product path>.json for each comment that cites
+IDs of the general form. A block of full-line comments is one comment and is tied
+to the next code line; a comment at the end of a code line is tied to that line;
+a comment with no code line before or after it is file-level. An entry with the
+same text, occurrence and comment lines as one already in the file replaces it in
+place, so running gen again adds nothing. gen never writes to the product.
+
+form prints the outline of the ledger note of one product commit: the commit, a
+unit to fill in, and one row for each function that git names in the commit's
+hunk headers, or one row for a file whose hunks name none, with every rules cell
+holding <fill>. It writes nothing.
+
+Prints one line on stderr for each failure; the lines of coverage have no prefix.
+Exit 0 when nothing fails, 1 when something does, and 2 on a usage error.
+"""
+
+import argparse
+import io
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tokenize
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+
+import jig_ids  # noqa: E402
+import jig_trace  # noqa: E402
+import lint_a  # noqa: E402
+from jig_trace import FormError  # noqa: E402
+
+FILL = "<fill>"
+# The attributes that make git name Python and bash functions in hunk headers.
+DIFF_ATTRIBUTES = pathlib.Path(ROOT) / "share" / "trace-diff.gitattributes"
+USAGE = "jig trace check | coverage | gen <product path> ... | form <commit>"
+# The kinds of object that git cat-file --batch can find; only a blob is a file.
+OBJECT_TYPES = (b"blob", b"tree", b"commit", b"tag")
+
+
+def check_ids_file(dev):
+    """Return the ID classes, None when there is no specs/ids.tsv, and the failures.
+
+    A file in another form gives one failure and no classes to check against, so
+    that a broken header does not turn into one line for every ID.
+    """
+    path = dev / "specs" / "ids.tsv"
+    if not path.exists():
+        return None, []
+    try:
+        return jig_trace.read_id_classes(path), []
+    except FormError as error:
+        return False, [f"specs/ids.tsv: {error}"]
+
+
+def check_trace_files(dev, product, classes, documents):
+    """Check the anchors and IDs of every trace file, and that its product file exists."""
+    failures = []
+    known = set()
+    for text in documents.values():
+        known |= jig_trace.ids_in(text)
+    for product_path, path in jig_trace.trace_files(dev).items():
+        name = f"trace/{product_path}.json"
+        target = product / product_path
+        # With its product file gone, the entries of a trace file mean nothing, so
+        # that one line says all there is to say about it.
+        if not target.is_file():
+            failures.append(f"{name}: the product has no file {product_path}")
+            continue
+        try:
+            entries = jig_trace.read_trace_file(path)
+        except FormError as error:
+            failures.append(f"{name}: {error}")
+            continue
+        lines = jig_trace.stripped_lines(target)
+        for number, entry in enumerate(entries, 1):
+            where = f"{name}: entry {number} (line {entry['line']})"
+            if not jig_trace.anchor_resolves(lines, entry):
+                failures.append(f"{where}: {product_path} has fewer than {entry['nth']} "
+                                f"lines with the text {entry['text']!r}")
+            if classes is False:
+                continue
+            for record in entry["ids"]:
+                if classes is None:
+                    failures.append(f"{where}: ID {record!r} matches no class: there is no "
+                                    "specs/ids.tsv")
+                elif jig_trace.class_of(classes, record) is None:
+                    failures.append(f"{where}: ID {record!r} matches no class of "
+                                    "specs/ids.tsv")
+                if record not in known:
+                    failures.append(f"{where}: ID {record!r} does not occur in the spec "
+                                    "documents")
+    return failures
+
+
+def check_class_matches(classes, documents):
+    """Every ID a class regex finds in the spec documents must have the general form.
+
+    A class regex wider than that form would let records in that no other jig tool
+    can find again, so a match is held to the form as a whole.
+    """
+    failures = []
+    if not classes:
+        return failures
+    for item in classes:
+        for document, text in documents.items():
+            seen = set()
+            # The search has the guards of the general form, so a match inside a
+            # longer word is not an ID of the class and is not held to the form.
+            for match in item.search.finditer(text):
+                found = match.group(0)
+                if not found or found in seen:
+                    continue
+                seen.add(found)
+                if jig_ids.GENERAL_ID.fullmatch(found) is None:
+                    failures.append(f"specs/ids.tsv: class {item.name} matches {found!r} in "
+                                    f"{document}, which is outside the general ID form")
+    return failures
+
+
+def check_ledger(dev, product):
+    """Every product commit after the import needs a filled ledger note."""
+    path = dev / "trace" / "commit-map.tsv"
+    if not path.exists():
+        return []
+    try:
+        start = jig_trace.CommitMap.read(path).import_commit(product)
+    except FormError as error:
+        return [f"trace/commit-map.tsv: {error}"]
+    listed = jig_trace.git(product, "rev-list", f"{start}..HEAD")
+    if listed.returncode != 0:
+        return [f"trace/commit-map.tsv: git cannot list the commits after {start}: "
+                f"{listed.stderr.strip()}"]
+    failures = []
+    for commit in listed.stdout.split():
+        note = dev / "trace" / "ledger" / f"{commit}.md"
+        if not note.is_file():
+            failures.append(f"trace/ledger/{commit}.md: no ledger entry for the product "
+                            f"commit {commit}")
+        elif FILL in note.read_text(encoding="utf-8", errors="replace"):
+            failures.append(f"trace/ledger/{commit}.md: a rules cell still holds {FILL}")
+    return failures
+
+
+def read_id_map(dev):
+    """Return the ID map, None when there is no specs/id-map.tsv, and the failures.
+
+    The map is read whenever it exists, also when nothing else would use it, so
+    that a broken map never stays in the tree unnoticed.
+    """
+    path = dev / "specs" / "id-map.tsv"
+    if not path.exists():
+        return None, []
+    try:
+        return jig_trace.IdMap.read(path), []
+    except FormError as error:
+        return False, [f"specs/id-map.tsv: {error}"]
+
+
+def pre_import_commit(dev, product):
+    """Return the commit that trace/pre-import names, or None, and the failures."""
+    path = dev / "trace" / "pre-import"
+    if path.is_dir():
+        return None, ["trace/pre-import: is a directory, not a file that holds one line"]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    if len(lines) != 1 or not jig_trace.FULL_HASH.fullmatch(lines[0]):
+        return None, ["trace/pre-import: does not hold one line with the full hash of a "
+                      "product commit"]
+    if jig_trace.in_product(product, lines[0]) != lines[0]:
+        return None, [f"trace/pre-import: {lines[0]} is not a commit of the product"]
+    return lines[0], []
+
+
+def tree_files(product, commit):
+    """The paths of the files in the tree of a product commit."""
+    listed = jig_trace.git(product, "ls-tree", "-r", "-z", "--name-only", commit)
+    return [name for name in listed.stdout.split("\0") if name]
+
+
+def tree_texts(product, commit, paths):
+    """Map each path to its text in the tree of commit, read in one git call."""
+    paths = [path for path in paths if "\n" not in path]
+    shown = subprocess.run(["git", "-C", str(product), "cat-file", "--batch"],
+                           input="".join(f"{commit}:{path}\n" for path in paths).encode(),
+                           capture_output=True, check=False)
+    data, texts, at = shown.stdout, {}, 0
+    for path in paths:
+        end = data.index(b"\n", at)
+        # A found object answers "<hash> <type> <size>" and its content follows.
+        # An object the clone does not hold, such as the commit of a submodule,
+        # answers with the name asked for and "missing", and that name may hold
+        # spaces, so the type is read from the end of the line before the size.
+        header = data[at:end].rsplit(b" ", 2)
+        at = end + 1
+        if len(header) != 3 or header[1] not in OBJECT_TYPES or not header[2].isdigit():
+            continue
+        size = int(header[2])
+        if header[1] == b"blob":
+            texts[path] = data[at:at + size].decode("utf-8", errors="replace")
+        at += size + 1
+    return texts
+
+
+def id_searches(olds, classes):
+    """The searches for IDs in the pre-import tree, in the order they must run.
+
+    The old IDs of the map come first, the longest first, then the matches of each
+    class.
+    """
+    searches = [jig_ids.fixed_bounded(old) for old in sorted(olds, key=len, reverse=True)]
+    return searches + [item.search for item in classes]
+
+
+def found_ids(text, searches):
+    """Return (line, ID) for each ID that the searches find in text, in their order.
+
+    A match inside one found before it is part of that ID and does not count, so an
+    old ID that holds a shorter old ID, or a class match, is read only once.
+    """
+    spans, found = [], []
+    for search in searches:
+        for match in search.finditer(text):
+            start, end = match.span()
+            if start == end or any(first <= start and end <= last for first, last in spans):
+                continue
+            spans.append((start, end))
+            found.append((text.count("\n", 0, start) + 1, match.group(0)))
+    return found
+
+
+def check_completeness(dev, product, classes, id_map):
+    """Every ID that the pre-import tree holds must have come into the trace.
+
+    Before the move, the IDs stood in the product's comments; trace/pre-import names
+    a commit from that time. Each ID found in a file of that tree that is still a
+    product file now, read through the ID map, must be in the IDs of an entry of
+    that file's trace. A file whose trace cannot be read gets its one line from the
+    anchor check and none here.
+    """
+    if not (dev / "trace" / "pre-import").exists():
+        return []
+    commit, failures = pre_import_commit(dev, product)
+    if commit is None:
+        return failures
+    now = set(tree_files(product, "HEAD"))
+    paths = sorted(path for path in tree_files(product, commit) if path in now)
+    texts = tree_texts(product, commit, paths)
+    searches = id_searches(list(id_map.rows) if id_map else [], classes or [])
+    traces = jig_trace.trace_files(dev)
+    for path in paths:
+        carried = set()
+        if path in traces:
+            try:
+                carried = {record for entry in jig_trace.read_trace_file(traces[path])
+                           for record in entry["ids"]}
+            except FormError:
+                continue
+        reported = set()
+        for line, found in found_ids(texts.get(path, ""), searches):
+            for record in id_map.read_through(found) if id_map else [found]:
+                if record in carried or record in reported:
+                    continue
+                reported.add(record)
+                failures.append(f"{path}:{line}: {record} of the tree of trace/pre-import "
+                                f"is in no entry of trace/{path}.json")
+    return failures
+
+
+def check(start):
+    dev = jig_trace.dev_root(start)
+    if dev is None:
+        return [f"{start} is not inside a -dev clone"]
+    product = jig_trace.product_dir(dev)
+    failures = []
+    classes, found = check_ids_file(dev)
+    failures += found
+    documents = jig_trace.spec_documents(dev)
+    if (product / ".git").exists():
+        failures += check_trace_files(dev, product, classes, documents)
+    else:
+        # Anchors, product files and commits all live in the product; without it
+        # they cannot be read, and one line says why.
+        failures.append(f"{dev.name}: no product clone at {product}")
+    failures += check_class_matches(classes, documents)
+    if (product / ".git").exists():
+        failures += check_ledger(dev, product)
+    id_map, found = read_id_map(dev)
+    failures += found
+    # A broken ID map would make every ID it should have renamed look missing, so
+    # its one line stands alone.
+    if id_map is not False and (product / ".git").exists():
+        failures += check_completeness(dev, product, classes, id_map)
+    return failures
+
+
+# The forms of definition each coverage check reads: requirements are headings,
+# controls and fixtures are table rows, and the rest may use any of the three.
+DEFINING_KINDS = {"requirement": ("heading",), "control": ("row",), "fixture": ("row",)}
+
+
+def problem(path, line, record, words):
+    return f"{path}:{line}: {record}: {words}"
+
+
+def coverage_trace(dev):
+    """Return (trace path, entry) for every entry of every trace file, and the failures."""
+    entries, failures = [], []
+    for product_path, path in jig_trace.trace_files(dev).items():
+        name = f"trace/{product_path}.json"
+        try:
+            entries += [(name, item) for item in jig_trace.read_trace_file(path)]
+        except FormError as error:
+            failures.append(f"{name}: {error}")
+    return entries, failures
+
+
+def first_definitions(found):
+    """Map each ID to its first definition, and list each definition after the first."""
+    first, again = {}, []
+    for definition in found:
+        if definition.record in first:
+            again.append(definition)
+        else:
+            first[definition.record] = definition
+    return first, again
+
+
+def control_cells(dev, classes):
+    """The cells after the first of every control row, for the requirement check."""
+    cells = []
+    for item in classes:
+        if item.coverage == "control":
+            for definition in jig_trace.definitions(dev, item, DEFINING_KINDS["control"]):
+                cells += jig_trace.table_cells(definition.lines[definition.line - 1])[1:]
+    return cells
+
+
+def check_requirement(definition, documents, cells):
+    record, where = definition.record, (definition.path, definition.line, definition.record)
+    failures = []
+    owners = jig_trace.owner_lines(definition.lines, definition.line)
+    if not owners:
+        failures.append(problem(*where, "no owner"))
+    elif len(owners) > 1:
+        failures.append(problem(*where, "two owners"))
+    elif f"specs/{owners[0]}" not in documents:
+        failures.append(problem(*where, "owner not a spec document"))
+    elif not jig_trace.occurrences(documents[f"specs/{owners[0]}"], record):
+        failures.append(problem(*where, "not in its owner"))
+    if not any(jig_trace.occurrences(cell, record) for cell in cells):
+        failures.append(problem(*where, "no control row"))
+    return failures
+
+
+def check_control(definition, traced):
+    where = (definition.path, definition.line, definition.record)
+    failures = []
+    header = jig_trace.table_header(definition.lines, definition.line)
+    row = jig_trace.table_cells(definition.lines[definition.line - 1])
+    columns = [number for number, cell in enumerate(header) if cell.startswith("Mutation")]
+    if not columns or len(row) <= columns[0] or not row[columns[0]].strip():
+        failures.append(problem(*where, "no mutation cell"))
+    # A test is known by the trace entry that holds its control IDs, never by its name.
+    if definition.record not in traced:
+        failures.append(problem(*where, "no test"))
+    return failures
+
+
+def check_fixture(item, first, documents, entries):
+    """Each ID of a fixture class that the specs or the trace use must have its row."""
+    failures = []
+    for document, text in documents.items():
+        for number, line in enumerate(text.split("\n"), 1):
+            seen = set()
+            for match in jig_ids.GENERAL_ID.finditer(line):
+                record = match.group(0)
+                if (item.regex.fullmatch(record) and record not in first
+                        and record not in seen):
+                    seen.add(record)
+                    failures.append(problem(document, number, record, "not defined"))
+    for name, entry in entries:
+        for record in entry["ids"]:
+            if item.regex.fullmatch(record) and record not in first:
+                failures.append(problem(name, entry["line"], record, "not defined"))
+    return failures
+
+
+def referenced(record, places, documents, traced):
+    """Say whether a spec line other than a definition of the ID, or the trace, names it."""
+    if record in traced:
+        return True
+    return any((document, number) not in places
+               for document, text in documents.items()
+               for number in jig_trace.occurrences(text, record))
+
+
+def coverage(start):
+    """Run the coverage checks of every class of specs/ids.tsv; return the failure lines."""
+    dev = jig_trace.dev_root(start)
+    if dev is None:
+        return [f"{start} is not inside a -dev clone"]
+    path = dev / "specs" / "ids.tsv"
+    if not path.exists():
+        return []
+    try:
+        classes = jig_trace.read_id_classes(path)
+    except FormError as error:
+        return [f"specs/ids.tsv: {error}"]
+    documents = jig_trace.spec_documents(dev)
+    entries, failures = coverage_trace(dev)
+    traced = {record for _name, entry in entries for record in entry["ids"]}
+    cells = None
+    for item in classes:
+        found = jig_trace.definitions(dev, item, DEFINING_KINDS.get(item.coverage,
+                                                                    ("heading", "item", "row")))
+        first, again = first_definitions(found)
+        failures += [problem(definition.path, definition.line,
+                             definition.record, "defined twice") for definition in again]
+        if item.coverage == "requirement":
+            if cells is None:
+                cells = control_cells(dev, classes)
+            for definition in first.values():
+                failures += check_requirement(definition, documents, cells)
+        elif item.coverage == "control":
+            for definition in first.values():
+                failures += check_control(definition, traced)
+        elif item.coverage == "fixture":
+            failures += check_fixture(item, first, documents, entries)
+        elif item.coverage == "reference":
+            for record, definition in first.items():
+                places = {(place.path, place.line) for place in found if place.record == record}
+                if not referenced(record, places, documents, traced):
+                    failures.append(problem(definition.path, definition.line, record,
+                                            "not referenced"))
+    return failures
+
+
+class Comments:
+    """What gen reads in one product file.
+
+    Its lines, the full-line comments by line number, and the comments at the end
+    of code lines. A shebang on the first line is neither a comment nor code, so
+    that a header comment right below it counts as coming before any code.
+    """
+
+    def __init__(self, lines):
+        self.lines = lines
+        self.full = {}
+        self.trailing = {}
+        self.shebang = bool(lines) and lines[0].startswith("#!")
+
+    def is_code(self, number):
+        if number == 1 and self.shebang:
+            return False
+        return bool(self.lines[number - 1].strip()) and number not in self.full
+
+
+def python_comments(text):
+    """Read the comments of Python source with its tokenizer.
+
+    The tokenizer knows strings, so a hash sign inside a string or a docstring
+    is not a comment. Raise SyntaxError when the source cannot be tokenized.
+    """
+    found = Comments(text.split("\n"))
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            number, column = token.start
+            if number == 1 and found.shebang:
+                continue
+            # The line of the source, not token.line, which after a string over
+            # several lines holds all of them.
+            if found.lines[number - 1][:column].strip():
+                found.trailing[number] = token.string
+            else:
+                found.full[number] = token.string
+    except tokenize.TokenError as error:
+        raise SyntaxError(error.args[0]) from None
+    return found
+
+
+def shell_comments(text):
+    """Read the comments of a shell script line by line, as lint A does."""
+    found = Comments(text.split("\n"))
+    for number, line in enumerate(found.lines, 1):
+        if number == 1 and found.shebang:
+            continue
+        comment = lint_a.hash_comment(line)
+        if comment is None:
+            continue
+        if line.lstrip().startswith("#"):
+            found.full[number] = comment
+        else:
+            found.trailing[number] = comment
+    return found
+
+
+def comment_words(comment):
+    """The words of one comment line, without its hash signs and outer white space."""
+    return lint_a.comment_start(comment).strip()
+
+
+def cited_ids(words):
+    """The IDs of the general form in the lines of a comment, each once, in order."""
+    ids = []
+    for line in words:
+        for match in jig_ids.GENERAL_ID.finditer(line):
+            if match.group(0) not in ids:
+                ids.append(match.group(0))
+    return ids
+
+
+def anchor(stripped, number):
+    """The line, text and occurrence that tie an entry to code line number."""
+    text = stripped[number - 1]
+    nth = sum(1 for line in stripped[:number] if line == text)
+    return number, text, nth
+
+
+def entries_of(found):
+    """Return the trace entries for the comments that cite IDs, in file order."""
+    stripped = [line.strip() for line in found.lines]
+    code = [number for number in range(1, len(found.lines) + 1) if found.is_code(number)]
+    comments = [(number, [found.trailing[number]], anchor(stripped, number))
+                for number in found.trailing]
+    block = []
+    for number in sorted(found.full):
+        block.append(number)
+        if number + 1 in found.full:
+            continue
+        start, end = block[0], block[-1]
+        after = [line for line in code if line > end]
+        if any(line < start for line in code) and after:
+            place = anchor(stripped, after[0])
+        else:
+            place = (0, "", 1)
+        comments.append((start, [found.full[line] for line in block], place))
+        block = []
+    entries = []
+    for _start, lines, (line, text, nth) in sorted(comments, key=lambda item: item[0]):
+        words = [comment_words(comment) for comment in lines]
+        ids = cited_ids(words)
+        if ids:
+            entries.append({"line": line, "text": text, "nth": nth, "ids": ids,
+                            "comments": words})
+    return entries
+
+
+def same_entry(one, other):
+    return (one["text"], one["nth"], one["comments"]) == (
+        other["text"], other["nth"], other["comments"])
+
+
+def merge(existing, new):
+    """Fold new entries into existing ones.
+
+    An entry that is already there keeps its place and takes the new line and
+    IDs; the rest go at the end. No entry is ever dropped, because a comment that
+    moved away may still be what a reviewer wants to see.
+    """
+    merged = [dict(item) for item in existing]
+    for item in new:
+        matches = [old for old in merged if same_entry(old, item)]
+        for old in matches:
+            old["line"], old["ids"] = item["line"], item["ids"]
+        if not matches:
+            merged.append(item)
+    return merged
+
+
+def product_relative(product, name):
+    """The path of name inside the product, in its plain form, or None outside it."""
+    relative = os.path.normpath(name)
+    if os.path.isabs(relative) or relative == "." or relative.split(os.sep)[0] == "..":
+        return None
+    try:
+        (product / relative).resolve().relative_to(product.resolve())
+    except ValueError:
+        return None
+    return pathlib.PurePosixPath(*pathlib.PurePath(relative).parts).as_posix()
+
+
+def gen_one(dev, product, name):
+    """Write the trace entries of one product file; return its failures."""
+    relative = product_relative(product, name)
+    if relative is None:
+        return [f"{name}: is outside the product {product}"]
+    path = product / relative
+    if not path.is_file():
+        return [f"{name}: the product has no file {relative}"]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        if lint_a.is_python(path, text):
+            found = python_comments(text)
+        elif lint_a.is_shell(path, text):
+            found = shell_comments(text)
+        else:
+            return [f"{relative}: is neither Python nor shell, so it has no comment signs "
+                    "to read"]
+    except SyntaxError as error:
+        return [f"{relative}: cannot be read as Python ({error})"]
+    trace = dev / "trace" / f"{relative}.json"
+    existing = []
+    if trace.exists():
+        try:
+            existing = jig_trace.read_trace_file(trace)
+        except FormError as error:
+            return [f"trace/{relative}.json: {error}"]
+    merged = merge(existing, entries_of(found))
+    # Writing only on a change keeps a second run from touching the file at all,
+    # whatever layout the file had before.
+    if merged != existing:
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        trace.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+                         encoding="utf-8")
+        print(f"jig trace gen: trace/{relative}.json: {len(merged)} entries")
+    return []
+
+
+def product_of(start):
+    """Return (dev, product, failures) for the -dev clone around start."""
+    dev = jig_trace.dev_root(start)
+    if dev is None:
+        return None, None, [f"{start} is not inside a -dev clone"]
+    product = jig_trace.product_dir(dev)
+    if not (product / ".git").exists():
+        return dev, None, [f"{dev.name}: no product clone at {product}"]
+    return dev, product, []
+
+
+def gen(start, names):
+    dev, product, failures = product_of(start)
+    if failures:
+        return failures
+    for name in names:
+        failures += gen_one(dev, product, name)
+    return failures
+
+
+HUNK = re.compile(r"@@ -[0-9,]+ \+[0-9,]+ @@(.*)")
+
+
+def diff_rows(diff):
+    """Return (file, function) rows from the text of git show, in its order.
+
+    A file whose hunks name no function, or that has no hunk at all, such as a
+    binary file or a change of mode only, gets one row with the function "-", so
+    that the note still accounts for it.
+    """
+    files = []
+    header = False
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            # With renames turned off, both sides name the same path. The lines
+            # that follow give the name again, except for a file with no text
+            # change.
+            rest = line[len("diff --git "):]
+            files.append([rest[2:(len(rest) - 1) // 2], []])
+            header = True
+        elif header and line.startswith(("--- a/", "+++ b/")):
+            # A deleted file has no new side, so then the old side names it.
+            files[-1][0] = header_path(line[len("--- a/"):])
+        elif line.startswith("@@ ") and files:
+            # Lines of a hunk start with a space, a plus or a minus sign, so a
+            # line that starts with these signs is always a hunk header.
+            header = False
+            match = HUNK.match(line)
+            function = match.group(1).strip() if match else ""
+            if function and function not in files[-1][1]:
+                files[-1][1].append(function)
+    return [(path, function) for path, functions in files for function in functions or ["-"]]
+
+
+def header_path(name):
+    # Git ends a name with a space in it by a tab on these lines, for patch.
+    return name[:-1] if " " in name and name.endswith("\t") else name
+
+
+def cell(text):
+    # A bar would end the table cell early.
+    return text.replace("|", "\\|")
+
+
+def form(start, commit):
+    dev, product, failures = product_of(start)
+    if failures:
+        return failures
+    full = jig_trace.in_product(product, commit)
+    if full is None:
+        return [f"{commit}: is not a commit of the product"]
+    shown = jig_trace.git(
+        product, "-c", f"core.attributesFile={DIFF_ATTRIBUTES}", "-c", "core.quotePath=false",
+        "-c", "log.showRoot=true", "show", "--format=", "--no-color", "--no-ext-diff", "--no-renames",
+        "--diff-merges=first-parent", "--src-prefix=a/", "--dst-prefix=b/", full)
+    if shown.returncode != 0:
+        return [f"{full}: git show failed: {shown.stderr.strip()}"]
+    lines = [f"commit: {full}", f"unit: {FILL}", "", "| file | function | rules |",
+             "| --- | --- | --- |"]
+    lines += [f"| {cell(path)} | {cell(function)} | {FILL} |"
+              for path, function in diff_rows(shown.stdout)]
+    print("\n".join(lines))
+    return []
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="jig trace", description=__doc__.split("\n", 1)[0],
+                                     usage=USAGE)
+    parser.add_argument("command", choices=("check", "coverage", "gen", "form"))
+    args, extra = parser.parse_known_args(argv)
+    if args.command == "check":
+        if extra:
+            parser.error("check takes no arguments")
+        failures = check(os.getcwd())
+    elif args.command == "coverage":
+        if extra:
+            parser.error("coverage takes no arguments")
+        failures = coverage(os.getcwd())
+        # Each line is the whole of a failure, starting with its path, so that a
+        # search for the lines of one file finds them with nothing in front.
+        for failure in failures:
+            print(failure, file=sys.stderr)
+        return 1 if failures else 0
+    elif args.command == "gen":
+        if not extra:
+            parser.error("gen takes one or more product paths")
+        failures = gen(os.getcwd(), extra)
+    else:
+        if len(extra) != 1:
+            parser.error("form takes one commit")
+        failures = form(os.getcwd(), extra[0])
+    for failure in failures:
+        print(f"jig trace {args.command}: {failure}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

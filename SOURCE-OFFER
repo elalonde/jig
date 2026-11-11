@@ -1,0 +1,21 @@
+Source offer for jig
+
+jig is written in bash and Python, so the package of each release is its own
+source: the files you install are the files that run.
+
+Each release of jig is published with two archives on the same release page
+of the jig repository:
+
+- jig-<version>.tar.gz, the package, which holds the tree of the release
+  commit;
+- jig-<version>-src.tar.gz, the source archive, which holds the same files
+  under the directory jig-<version>/ and builds and tests with make, with no
+  network access.
+
+The tag v<version> in the jig repository names the commit of each release, and
+the repository holds the history of the source from its first published commit
+on. Both archives stay on the release page for as long as the release is
+published.
+
+jig contains no code of others; the programs it runs at run time are listed
+in THIRD-PARTY-NOTICES, and their source comes from their own vendors.

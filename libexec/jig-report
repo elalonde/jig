@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Check a unit's committed report and fill in what only a machine may write.
+
+usage: jig report <project> <ID>
+
+A unit writes "checks: none" and "context: none" in its report, because a model's
+own account of its check results or its context size is not evidence. This replaces
+them with the exit codes that jig run-check recorded in the unit's account and with
+the context readout that the unit's status line wrote, and commits the report again.
+
+The unit's account and tmux session come from the first line of its prompt,
+~/ws/prompts/<project>/<ID>.md, as for jig close. A unit can run more than once under
+one ID: the newest "status: <ID> start" commit on origin begins the current run, and
+that run needs its "log: <ID>" commit. The report, impl/log/<ID>-report.md on origin,
+must pass jig validate report, and every hash of its commits: line must name a commit
+reachable from origin in the -dev clone or in the product clone nested in it. When the
+prompt names the implementer account, no such product commit may add, change or remove
+a file in the product's vector directory: the last word of the command of the row
+recompute in checks.tsv on origin. A project without that row has no such directory.
+Nor may any other product commit on origin touch that directory when the report does
+not name it and it was made during the unit: committed after the unit's first start
+line in impl/log/status.log on origin and not after its "log: <ID>" commit. An exit file counts when its name is <ID>-<row>.exit for a row of checks.tsv and it
+was written during the current run. A checks: or context: value other than none is
+the unit's and stays as written.
+
+The filled report is committed alone as "report: <ID>" in the orchestrator's clone and
+pushed. A refused push gets one fetch and one rebase with --autostash, so an uncommitted
+change in the clone, such as the idle lines that jig orch appends to
+impl/orch/updates.log, stays in place and uncommitted. When a "report: <ID>" commit already follows the newest "log: <ID>", this says
+so and does nothing. JIG_SSH holds the ssh command, and tests set it.
+Exits 0 when the report is filled, or was already; 1 on a refusal; 2 on a usage error.
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CLOSE_SCRIPT = ROOT / "libexec" / "jig-close"
+VALIDATE_SCRIPT = ROOT / "libexec" / "jig-validate"
+WORKER_SCRIPT = ROOT / "libexec" / "jig-report-worker"
+
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_context  # noqa: E402
+
+
+def load(path, name):
+    """Load another jig tool of this tree as a module, so both read things one way."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+# jig close reads the prompt and finds the current run; jig validate holds the report form.
+close = load(CLOSE_SCRIPT, "jig_close")
+validate = load(VALIDATE_SCRIPT, "jig_validate")
+start = close.start
+helpers = close.helpers
+
+PLACEHOLDER = "none"
+CHECKS_LINE = 6
+TIMES_LINE = 8
+CONTEXT_SUFFIX = "  context: none"
+EXIT_TEXT = re.compile(r"([0-9]{1,3})\n?")
+# The checks.tsv row whose command names the product's vector directory.
+RECOMPUTE_ROW = "recompute"
+# jig start appends a line "<time> <ID> start ..." here for each run of a unit.
+STATUS_LOG = "impl/log/status.log"
+
+
+def refuse(name, detail):
+    helpers.refuse(name, detail)
+
+
+def report_path(unit):
+    return f"impl/log/{unit}-report.md"
+
+
+def fetch_product(product):
+    if not (pathlib.Path(product) / ".git").exists():
+        refuse("product", f"no product clone at {product}")
+    fetched = helpers.git(product, "fetch", "-q", "origin")
+    if fetched.returncode != 0:
+        refuse("product", f"cannot fetch origin in {product}: {helpers.last_line(fetched)}")
+
+
+def current_run(clone, branch, unit):
+    """Return the start commit and the log commit of the current run, or refuse."""
+    origin = f"refs/remotes/origin/{branch}"
+    started = close.newest_commit(clone, origin, f"status: {unit} start")
+    if started is None:
+        refuse("start", f"origin/{branch} has no 'status: {unit} start' commit")
+    logged = close.newest_commit(clone, f"{started}..{origin}", f"log: {unit}")
+    if logged is None:
+        refuse("report", f"no 'log: {unit}' commit on origin/{branch} after the newest "
+                         f"start {started[:12]}")
+    return started, logged
+
+
+def sync_clone(clone, branch, unit):
+    """Bring the clone to origin, as jig close does before its end line."""
+    current = helpers.git_out(clone, "symbolic-ref", "-q", "--short", "HEAD")
+    if current != branch:
+        refuse("clone", f"{clone} has {current or 'a detached HEAD'} checked out, not {branch}")
+    merged = helpers.git(clone, "merge", "-q", "--ff-only", f"refs/remotes/origin/{branch}")
+    if merged.returncode != 0:
+        refuse("clone", f"{clone} cannot fast-forward: {helpers.last_line(merged)}")
+    if helpers.git_out(clone, "rev-parse", "HEAD") != \
+            helpers.git_out(clone, "rev-parse", f"refs/remotes/origin/{branch}"):
+        refuse("clone", f"{clone} has commits that are not on origin/{branch}")
+    # The filled report replaces the file; an edit of the orchestrator's own to it would
+    # be lost, or would go out under this commit.
+    if helpers.git_out(clone, "status", "--porcelain", "--", report_path(unit)):
+        refuse("clone", f"{report_path(unit)} has uncommitted changes in {clone}")
+
+
+def read_report(clone, branch, unit):
+    """Return the report's lines on origin, or refuse with each failure of its form."""
+    shown = helpers.git(clone, "show", f"refs/remotes/origin/{branch}:{report_path(unit)}")
+    if shown.returncode != 0:
+        refuse("report", f"origin/{branch} has no {report_path(unit)}")
+    failures = validate.text_failures("report", shown.stdout)
+    if failures:
+        for failure in failures:
+            print(f"jig report: {report_path(unit)} on origin/{branch}: {failure}",
+                  file=sys.stderr)
+        refuse("report", f"{report_path(unit)} fails jig validate report")
+    lines = shown.stdout.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    # A report copied from another unit has a valid form and would otherwise
+    # be filled and committed under this unit's name.
+    if lines[2] != f"id: {unit}":
+        print(f"jig report: {report_path(unit)} on origin/{branch}: line 3: "
+              f"{lines[2]!r} is not 'id: {unit}'", file=sys.stderr)
+        refuse("report", f"{report_path(unit)} fails jig validate report")
+    return lines
+
+
+def is_known(repo, branch, value):
+    """Say whether a hash names one commit that origin's branch of the repo holds."""
+    full = helpers.git_out(repo, "rev-parse", "--verify", "-q", f"{value}^{{commit}}")
+    if not full:
+        return False
+    return helpers.git(repo, "merge-base", "--is-ancestor", full,
+                       f"refs/remotes/origin/{branch}").returncode == 0
+
+
+def check_commits(lines, clone, product, branch):
+    value = lines[4][len("commits: "):]
+    if value == PLACEHOLDER:
+        return
+    unknown = [entry for entry in value.split(" ")
+               if not (is_known(clone, branch, entry) or is_known(product, branch, entry))]
+    if unknown:
+        refuse("commits", f"not on origin/{branch} of the -dev or the product clone: "
+                          f"{' '.join(unknown)}")
+
+
+def check_table(clone, branch):
+    """Return the rows of checks.tsv on origin as lists of fields, without the header."""
+    shown = helpers.git(clone, "show", f"refs/remotes/origin/{branch}:checks.tsv")
+    if shown.returncode != 0:
+        return []
+    return [line.split("\t") for line in shown.stdout.splitlines()[1:] if line.strip()]
+
+
+def check_rows(clone, branch):
+    """Return the row names of checks.tsv on origin, in their order."""
+    return [fields[0] for fields in check_table(clone, branch)]
+
+
+def vector_directory(clone, branch):
+    """Return the product's vector directory, or None for a project without vectors.
+
+    The row recompute of checks.tsv runs "jig recompute <project> <directory>", so the
+    directory is the last word of its command.
+    """
+    for fields in check_table(clone, branch):
+        if fields[0] != RECOMPUTE_ROW:
+            continue
+        words = fields[1].split() if len(fields) > 1 else []
+        path = pathlib.PurePosixPath(words[-1]) if words else None
+        if path is None or path.is_absolute() or ".." in path.parts or not path.parts:
+            refuse("vectors", f"the row {RECOMPUTE_ROW} of checks.tsv on origin/{branch} "
+                              f"names no product directory")
+        return str(path)
+    return None
+
+
+def check_vectors(lines, conf, account, clone, product, branch):
+    """Refuse an implementer's report whose product commits touch the vector directory.
+
+    Only the spec writer copies vectors into the product, so that the implementer's
+    tests check the product against the reference and not against its own edits.
+    """
+    value = lines[4][len("commits: "):]
+    if value == PLACEHOLDER or account not in helpers.role_accounts(conf, "impl"):
+        return
+    directory = vector_directory(clone, branch)
+    if directory is None:
+        return
+    for entry in value.split(" "):
+        if not is_known(product, branch, entry):
+            continue
+        paths = vector_paths(product, entry, directory)
+        if paths:
+            refuse("vectors", f"the product commit {entry} changes {paths[0]} in {directory}, "
+                              f"the product's vector directory, which only the spec writer "
+                              f"writes")
+
+
+def first_start_time(clone, branch, unit):
+    """Return the time of the unit's first start line in status.log on origin, in seconds.
+
+    A restarted unit has a start line for each run; the first one is when the unit
+    began, so a product commit of an earlier run still counts as the unit's.
+    """
+    shown = helpers.git(clone, "show", f"refs/remotes/origin/{branch}:{STATUS_LOG}")
+    for line in shown.stdout.splitlines() if shown.returncode == 0 else []:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == unit and fields[2] == "start":
+            try:
+                return datetime.datetime.fromisoformat(fields[0]).timestamp()
+            except ValueError:
+                refuse("vectors", f"the first start line of {unit} in {STATUS_LOG} on "
+                                  f"origin/{branch} has no time: {fields[0]!r}")
+    refuse("vectors", f"{STATUS_LOG} on origin/{branch} has no start line of {unit}")
+
+
+def check_unnamed_vectors(lines, conf, account, clone, product, branch, unit, logged):
+    """Refuse an implementer's report when the unit touched the vector directory unnamed.
+
+    A unit could push a product commit that changes the vectors and leave it out of its
+    commits: line, which the check of the listed commits would then never see. A product
+    commit counts as the unit's when its committer time is after the unit's first start
+    line and not after the unit's log commit in -dev.
+    """
+    if account not in helpers.role_accounts(conf, "impl"):
+        return
+    directory = vector_directory(clone, branch)
+    if directory is None:
+        return
+    begun = first_start_time(clone, branch, unit)
+    ended = int(helpers.git_out(clone, "log", "-1", "--format=%ct", logged))
+    value = lines[4][len("commits: "):]
+    named = set() if value == PLACEHOLDER else {
+        helpers.git_out(product, "rev-parse", "--verify", "-q", f"{entry}^{{commit}}")
+        for entry in value.split(" ")}
+    listed = helpers.git(product, "log", "--format=%H %ct", f"refs/remotes/origin/{branch}")
+    if listed.returncode != 0:
+        refuse("vectors", f"cannot list origin/{branch} in {product}: "
+                          f"{helpers.last_line(listed)}")
+    for line in listed.stdout.splitlines():
+        commit, committed = line.split(" ")
+        if not begun < int(committed) <= ended or commit in named:
+            continue
+        paths = vector_paths(product, commit, directory)
+        if paths:
+            refuse("vectors", f"the product commit {commit[:12]} changes {paths[0]} in "
+                              f"{directory}, the product's vector directory, during the unit "
+                              f"and is not named in commits:")
+
+
+def vector_paths(product, commit, directory):
+    """Return the files under the vector directory that a product commit changes."""
+    # A merge counts only for the files it leaves different from every parent, the
+    # files that the merge itself changed (-c); --root covers a first commit.
+    touched = helpers.git(product, "diff-tree", "-r", "-c", "--root", "--no-commit-id",
+                          "--name-only", "-z", commit, "--", f":(literal){directory}")
+    if touched.returncode != 0:
+        refuse("vectors", f"cannot list the files of {commit} in {product}: "
+                          f"{helpers.last_line(touched)}")
+    return [path for path in touched.stdout.split("\0") if path]
+
+
+def exit_files(account, project, unit):
+    """Return the unit's exit files as the worker part lists them in its account."""
+    words = ["python3", "-I", "-", project, unit]
+    with open(WORKER_SCRIPT, "rb") as script:
+        result = subprocess.run(start.remote_command(account, words), stdin=script,
+                                capture_output=True, check=False)
+    if result.returncode != 0:
+        refuse("worker", f"the worker part exited {result.returncode} in {account}")
+    try:
+        return json.loads(result.stdout.decode("utf-8"))["files"]
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+        refuse("worker", f"the worker part in {account} gave no list of exit files")
+    return []
+
+
+def checks_value(rows, files, unit, since):
+    """Return the <row>=<code> pairs of this run's exit files, or None when there is none."""
+    by_name = {entry.get("name"): entry for entry in files if isinstance(entry, dict)}
+    pairs = []
+    for row in rows:
+        entry = by_name.get(f"{unit}-{row}.exit")
+        # A commit time has whole seconds, and the start commit comes before the session,
+        # so a file of this run is never older than it.
+        if entry is None or not isinstance(entry.get("mtime"), (int, float)) \
+                or entry["mtime"] < since:
+            continue
+        match = EXIT_TEXT.fullmatch(str(entry.get("text")))
+        if not match or int(match[1]) > 255:
+            refuse("checks", f"{entry['name']} does not hold one exit code")
+        pairs.append(f"{row}={int(match[1])}")
+    return " ".join(pairs) or None
+
+
+def fill(lines, checks, readout):
+    """Return the report's lines with each placeholder replaced where a value exists."""
+    filled = list(lines)
+    if checks and filled[CHECKS_LINE - 1] == f"checks: {PLACEHOLDER}":
+        filled[CHECKS_LINE - 1] = f"checks: {checks}"
+    times = filled[TIMES_LINE - 1]
+    if readout and times.endswith(CONTEXT_SUFFIX):
+        filled[TIMES_LINE - 1] = times[:-len(PLACEHOLDER)] + readout
+    return filled
+
+
+def push(clone, branch):
+    detail = start.jig_push.push_commit(clone, branch)
+    if detail:
+        refuse("push", f"{detail}; nothing was committed, and jig report can run again")
+
+
+def commit_report(clone, branch, unit, lines):
+    path = pathlib.Path(clone) / report_path(unit)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    message = f"report: {unit}\n\n{start.CO_AUTHOR}"
+    # With nothing to fill the commit is empty, and it still marks the report as checked.
+    added = helpers.git(clone, "add", "--", report_path(unit))
+    committed = helpers.git(clone, "commit", "-q", "--allow-empty", "-m", message,
+                            "--only", "--", report_path(unit))
+    if added.returncode != 0 or committed.returncode != 0:
+        helpers.git(clone, "checkout", "-q", "HEAD", "--", report_path(unit))
+        refuse("commit", f"cannot commit {report_path(unit)}: {helpers.last_line(committed)}")
+    push(clone, branch)
+    return helpers.git_out(clone, "rev-parse", "HEAD")
+
+
+def report(project, unit):
+    conf = helpers.read_conf(project)
+    clone, branch = conf["REPO"], conf["BRANCH"]
+    product = str(pathlib.Path(clone) / project)
+    close.fetch(clone)
+    fetch_product(product)
+    started, logged = current_run(clone, branch, unit)
+    filled_by = close.newest_commit(clone, f"{logged}..refs/remotes/origin/{branch}",
+                                    f"report: {unit}")
+    if filled_by:
+        print(f"jig report: {unit} is filled already in {filled_by[:12]}")
+        return
+
+    account, role, session = close.read_prompt(project, unit)
+    if account not in helpers.role_accounts(conf, role):
+        refuse("account", f"the conf file does not give role {role} to {account}")
+    sync_clone(clone, branch, unit)
+    lines = read_report(clone, branch, unit)
+    check_commits(lines, clone, product, branch)
+    check_vectors(lines, conf, account, clone, product, branch)
+    check_unnamed_vectors(lines, conf, account, clone, product, branch, unit, logged)
+
+    since = int(helpers.git_out(clone, "log", "-1", "--format=%ct", started))
+    checks = checks_value(check_rows(clone, branch), exit_files(account, project, unit),
+                          unit, since)
+    context = jig_context.read_context(session)
+    filled = fill(lines, checks, context.readout() if context else None)
+    # The filled values come from files, not from the unit; check the form once more.
+    if validate.report_failures(filled):
+        refuse("report", "the filled report would fail jig validate report")
+    commit = commit_report(clone, branch, unit, filled)
+    print(f"jig report: {unit}: {filled[CHECKS_LINE - 1]}; "
+          f"context: {filled[TIMES_LINE - 1].rsplit('context: ', 1)[1]}; "
+          f"committed {commit[:12]}")
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="jig report")
+    parser.add_argument("project")
+    parser.add_argument("unit", metavar="ID")
+    args = parser.parse_args(argv)
+    if not helpers.PROJECT.fullmatch(args.project):
+        parser.error(f"bad project: {args.project}")
+    if not helpers.UNIT_ID.fullmatch(args.unit):
+        parser.error(f"bad ID: {args.unit}")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        report(args.project, args.unit)
+    except helpers.Refused as error:
+        print(f"jig report: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
