@@ -51,7 +51,7 @@ the implementer account gets the project's token file and the push URL that
 
 Requested by: Eric.
 
-Units: 6 minor, 2 patch, 19 none
+Units: 6 minor, 2 patch, 26 none
 
 ## 0.3.0
 
