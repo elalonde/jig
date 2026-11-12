@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+# jig pre-commit hook
+# jig start and jig new find their own file by the exact line above.
+"""Refuse a commit to the product while the project's term check does not pass.
+
+The term check looks for the project's private terms, the lines of terms.txt, in
+the product. A product clone sits inside the -dev clone of its project, and the
+check is the row "terms" of checks.tsv at the root of that -dev clone: name,
+command, account and time cap in seconds, separated by tabs. This hook runs the
+row's command with sh -c from that root and refuses the commit when the command
+does not exit 0, when it runs past its cap, or when there is no such row. The
+check names the place of each match and never the term, so its output is safe
+to show here.
+
+jig start and jig new replace or remove a hook only when its second line is the
+marker line, so a project's own pre-commit hook is never lost.
+
+The hook is a single file with no import from jig's tree, because jig start
+copies it into clones of accounts that cannot read that tree.
+"""
+
+import os
+import signal
+import subprocess
+import sys
+
+ROW = "terms"
+
+
+def git(*args, env=None):
+    return subprocess.run(["git", *args], capture_output=True, text=True, env=env,
+                          stdin=subprocess.DEVNULL, check=False)
+
+
+def refuse(reason):
+    print(f"jig pre-commit hook: {reason}; the commit is refused", file=sys.stderr)
+    return 1
+
+
+def environment_without_git():
+    """Return this environment without the variables that git sets for its hooks.
+
+    Left in place, they would point every git command of the check at the product's
+    repository and index, also a command that means to read the -dev clone.
+    """
+    listed = set(git("rev-parse", "--local-env-vars").stdout.split())
+    return {key: value for key, value in os.environ.items() if key not in listed}
+
+
+def read_row(dev):
+    """Return the command and the cap of the row, or None and the reason it is unusable."""
+    path = os.path.join(dev, "checks.tsv")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        return None, f"cannot read {path}: {getattr(error, 'strerror', None) or error}"
+    # The first line names the columns.
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if fields[0] != ROW:
+            continue
+        if len(fields) != 4 or not fields[3].isdigit() or int(fields[3]) == 0:
+            return None, f"the row {ROW} of {path} is not name, command, account, cap in seconds"
+        return (fields[1], int(fields[3])), None
+    return None, f"{path} has no row {ROW}, so the term check cannot run"
+
+
+def run_check(command, dev, env, cap):
+    """Run the command in its own process group, so that a stop at the cap ends all of it."""
+    process = subprocess.Popen(["sh", "-c", command], cwd=dev, env=env,
+                               stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        return process.wait(timeout=cap)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        return None
+
+
+def main():
+    shown = git("rev-parse", "--show-toplevel")
+    if shown.returncode != 0 or not shown.stdout.strip():
+        return refuse("cannot find the root of this clone")
+    product = shown.stdout.strip()
+    env = environment_without_git()
+    outer = git("-C", os.path.dirname(product), "rev-parse", "--show-toplevel", env=env)
+    if outer.returncode != 0 or not outer.stdout.strip():
+        return refuse(f"no -dev clone holds {product}, so there is no checks.tsv to read")
+    dev = outer.stdout.strip()
+    row, problem = read_row(dev)
+    if problem:
+        return refuse(problem)
+    command, cap = row
+    code = run_check(command, dev, env, cap)
+    if code is None:
+        return refuse(f"the term check ran past its cap of {cap} s")
+    if code != 0:
+        return refuse(f"the term check exited {code}; the lines above name each place")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

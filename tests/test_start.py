@@ -19,6 +19,7 @@ import jig_ids  # noqa: E402
 
 JIG = ROOT / "bin" / "jig"
 WORKER = ROOT / "libexec" / "jig-start-worker"
+HOOK = ROOT / "hooks" / "pre-commit"
 GOOD_PROMPT = ROOT / "tests" / "fixtures" / "validate" / "good-prompt.md"
 TEMPLATE = ROOT / "templates" / "project.conf"
 
@@ -900,6 +901,125 @@ class StartConfTest(StartCase):
         self.assertNotIn("JIG_VERSION=", conf)
         result = run([JIG, "which", "jig"], env=self.base_env())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class StartHookTest(StartCase):
+    """The worker's -dev clone holds a product clone, and origin may hold the row terms."""
+
+    def setUp(self):
+        super().setUp()
+        # The -dev clone ignores its nested product clone, as a real one does.
+        (self.seed / ".gitignore").write_text(".claude/settings.local.json\n/jig/\n",
+                                              encoding="utf-8")
+        self.set_terms_row(True)
+        self.ok(["git", "-C", self.worker_clone, "pull", "-q", "--ff-only", "origin", "master"])
+        self.product = self.git_init(self.worker_clone / "jig")
+        (self.product / "README").write_text("the product\n", encoding="utf-8")
+        self.git_commit_all(self.product)
+
+    def set_terms_row(self, present):
+        """Push a checks.tsv with or without the row terms to origin."""
+        rows = ["name\tcommand\taccount\tcap_seconds", "make-check\tmake check\timplementer\t60"]
+        if present:
+            rows.append("terms\tjig terms check jig\timplementer\t60")
+        (self.seed / "checks.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        self.git_commit_all(self.seed)
+        self.ok(["git", "-C", self.seed, "push", "-q", "origin", "master"])
+
+    def use_hooks_path(self):
+        self.ok(["git", "-C", self.product, "config", "--local", "core.hooksPath", "hooks"])
+        return self.product / "hooks" / "pre-commit"
+
+    def default_hook(self):
+        return self.product / ".git" / "hooks" / "pre-commit"
+
+    def exclude_lines(self):
+        exclude = self.product / ".git" / "info" / "exclude"
+        return exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+
+    def assert_jigs_hook(self, path):
+        self.assertEqual(path.read_bytes(), HOOK.read_bytes())
+        self.assertTrue(os.access(path, os.X_OK))
+
+    def test_start_installs_the_hook_where_git_looks_for_it(self):
+        # No hook yet, no hooks path, and the row on origin: jig start writes jig's hook
+        # into the git directory, so it needs no exclude line.
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_jigs_hook(self.default_hook())
+        self.assertNotIn("/hooks/pre-commit", self.exclude_lines())
+
+    def test_start_installs_the_hook_at_the_hooks_path_and_excludes_it(self):
+        # With core.hooksPath, git looks in the work tree: the hook goes there, its path
+        # goes into the exclude file once, and the product clone stays clean.
+        hook = self.use_hooks_path()
+        self.assertEqual(self.start().returncode, 0)
+        self.assert_jigs_hook(hook)
+        self.assertFalse(self.default_hook().exists())
+        self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 1)
+        self.assertEqual(self.ok(["git", "-C", self.product, "status", "--porcelain"]), "")
+
+    def test_start_replaces_an_older_hook_with_the_marker(self):
+        hook = self.use_hooks_path()
+        hook.parent.mkdir()
+        hook.write_text("#!/bin/sh\n# jig pre-commit hook\nexit 0\n", encoding="utf-8")
+        self.assertEqual(self.start().returncode, 0)
+        self.assert_jigs_hook(hook)
+
+    def test_start_refuses_another_hook_and_changes_nothing(self):
+        # A hook without the marker is the project's own: the check stage names it and
+        # stops, before the start line, the lock and the session.
+        hook = self.default_hook()
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        result = self.start()
+        self.assert_refused(result, "hook")
+        self.assertIn(str(hook), result.stderr)
+        self.assertFalse(self.lock().exists())
+        self.assertEqual(hook.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+
+    def test_start_refuses_another_hook_also_without_the_row(self):
+        self.set_terms_row(False)
+        hook = self.use_hooks_path()
+        hook.parent.mkdir()
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        result = self.start()
+        self.assert_refused(result, "hook")
+        self.assertIn(str(hook), result.stderr)
+        self.assertFalse(self.lock().exists())
+        self.assertTrue(hook.exists())
+
+    def test_start_leaves_a_hook_path_that_the_product_tracks(self):
+        # The product keeps its own pre-commit hook in its tree: jig start neither
+        # refuses it nor writes over it, and adds no exclude line for it.
+        hook = self.use_hooks_path()
+        hook.parent.mkdir()
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self.git_commit_all(self.product)
+        self.assertEqual(self.start().returncode, 0)
+        self.assertEqual(hook.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+        self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 0)
+
+    def test_start_removes_its_hook_without_the_row_and_keeps_the_exclude_line(self):
+        # A line of the -dev repo without the term check: jig's hook goes, so that the
+        # unit can commit, and the exclude line from an earlier install stays.
+        self.set_terms_row(False)
+        hook = self.use_hooks_path()
+        hook.parent.mkdir()
+        shutil.copy2(HOOK, hook)
+        exclude = self.product / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text("/hooks/pre-commit\n", encoding="utf-8")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(hook.exists())
+        self.assertEqual(self.exclude_lines(), ["/hooks/pre-commit"])
+
+    def test_start_worker_alone_installs_the_hook_beside_it(self):
+        # Run alone from a jig tree, the worker takes the hook of that tree.
+        result = self.worker_alone("--approved-tag", "spec-p0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_jigs_hook(self.default_hook())
 
 
 if __name__ == "__main__":

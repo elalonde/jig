@@ -11,6 +11,8 @@ It makes blocks/, in/, out/ and checks/ for the project under JIG_SRV
 (default /srv/jig), and the seed repos in ~/ws/src/<project>-dev, with the
 product nested in it, from the templates in templates/new/; the product gets
 the CI workflow .github/workflows/ci.yml, which runs make check on every push.
+After the product's first commit, jig's pre-commit hook goes into the seed product
+clone, at the path git names for it, with that path in .git/info/exclude.
 
 What needs the owner's login (the GitHub repos, deploy keys, the first push,
 the clones in the other accounts, the model policy rules, the status line,
@@ -36,12 +38,18 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_units  # noqa: E402
+
 TEMPLATES = ROOT / "templates" / "new"
 CONF_TEMPLATE = ROOT / "templates" / "project.conf"
 # Eric's standing preferences, kept at the top of every jig tree so that an installed
 # version carries them. Their text goes into the orchestrator's standing prompt.
 PREFS = ROOT / "prefs.md"
 ACCOUNT_SCRIPT = ROOT / "libexec" / "jig-new-account"
+# jig's pre-commit hook, which runs the term check before each commit to the product.
+PRE_COMMIT = ROOT / "hooks" / "pre-commit"
 SRV_ROOT = "/srv/jig"
 BLOCK_ID = "new"
 FIRST_BRANCH = "0.1"
@@ -291,6 +299,19 @@ def first_commit(path, env, subject, origin):
     git(env, "-C", str(path), "remote", "add", "origin", origin)
 
 
+def install_pre_commit(product):
+    """Put jig's pre-commit hook in the seed product clone, kept out of the product.
+
+    It comes after the first commit, so that commit holds no pre-commit file. jig start
+    installs the same file in the clones of the other accounts. The code is the one jig
+    start runs, so both write the file and its exclude line the same way.
+    """
+    try:
+        jig_units.worker.install_hook(product, PRE_COMMIT.read_text(encoding="utf-8"))
+    except jig_units.Refused as error:
+        raise Refusal(str(error)) from None
+
+
 def seed_repos(project, host, values, home):
     """Make the sidecar with the product nested in it, in a new directory moved in place last."""
     target = home / "ws" / "src" / f"{project}-dev"
@@ -314,6 +335,7 @@ def seed_repos(project, host, values, home):
                      f"github-{project}-dev:{github}/{project}-dev.git")
         first_commit(product, env, "Start the project with its checks",
                      f"github-{project}:{github}/{project}.git")
+        install_pre_commit(product)
         work.chmod(0o755)
         work.rename(target)
     finally:

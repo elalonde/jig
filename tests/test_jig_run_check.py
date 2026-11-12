@@ -259,3 +259,46 @@ class RunCheckCopyTest(RunCheckCase):
         self.assertEqual(self.recorded("passes"), "0\n")
         self.assertIn("cannot read the head commit", result[2])
         self.assertEqual(list(self.checks.iterdir()), [])
+
+
+class RunCheckTermsTest(RunCheckCase):
+    """The row terms names an implementer account that is not the account of the tests."""
+
+    def setUp(self):
+        super().setUp()
+        rows = [*ROWS, ("terms", "echo terms ran", "the-implementer", "60"),
+                ("other", "echo should not run > ran.txt", "the-implementer", "60")]
+        lines = ["name\tcommand\taccount\tcap_seconds"] + ["\t".join(row) for row in rows]
+        (self.dev / "checks.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.checks = self.srv / "checks" / "jig"
+        self.checks.mkdir(parents=True)
+
+    def write_accounts(self, spec, implementer):
+        self.conf.write_text(f"REPO={self.dev}\nBRANCH=master\nIMPL_ACCOUNT={implementer}\n"
+                             f"SPEC_ACCOUNT={spec}\n", encoding="utf-8")
+
+    def test_terms_runs_in_the_spec_writer_account_and_writes_no_copy(self):
+        # The conf names the account of the tests as the spec writer. The row terms runs
+        # there, records 0, and leaves no copy, since its own account is the implementer.
+        self.write_accounts(ACCOUNT, "the-implementer")
+        result = self.in_session("jig-spec-demo", "jig", "terms")
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.recorded("terms"), "0\n")
+        self.assertIn("terms ran", self.output("terms"))
+        self.assertEqual(list(self.checks.iterdir()), [])
+
+    def test_another_row_of_the_implementer_stays_in_its_own_account(self):
+        # Only the row terms moves: a run of another implementer row in the spec writer's
+        # account is refused and runs nothing.
+        self.write_accounts(ACCOUNT, "the-implementer")
+        result = self.in_session("jig-spec-demo", "jig", "other")
+        self.assert_refused(result)
+        self.assertFalse((self.dev / "ran.txt").exists())
+
+    def test_terms_is_refused_in_an_account_of_neither_role(self):
+        # The account names come from the conf file: when it names other accounts for
+        # both roles, the account of the tests may not run the row.
+        self.write_accounts("the-spec-writer", "the-implementer")
+        result = self.in_session("jig-spec-demo", "jig", "terms")
+        self.assert_refused(result)
+        self.assertIn("the-implementer", result[2])

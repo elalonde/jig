@@ -10,8 +10,14 @@ appended, so that a unit can narrow a check to the parts it touched.
 
 A unit is a tmux session named <project>-<role>-<ID>, and the ID comes from that name,
 so this runs only inside such a session of the same project, and only a row of the
-account that runs it. The output goes to ~/ws/reviews/<project>/<ID>-<name>.txt, with
-the wall time of the run as its last line, and the exit code alone to
+account that runs it. The row terms is the one exception: the term check, which looks
+for the project's private terms in the product, guards every commit to the product,
+and a spec writer who copies vectors commits to the product too. So that row runs in
+the account that runs it when that account is IMPL_ACCOUNT or SPEC_ACCOUNT of the
+conf file, whatever account the row names.
+
+The output goes to ~/ws/reviews/<project>/<ID>-<name>.txt, with the wall time of
+the run as its last line, and the exit code alone to
 ~/ws/reviews/<project>/<ID>-<name>.exit, which jig report reads. A run that passes its
 cap is killed with its process group and records 124. This exits with the recorded
 code; a refusal writes no exit file and exits 1, or 2 for a usage error.
@@ -57,6 +63,7 @@ SRV_ROOT = "/srv/jig"
 # The account the conf template names; a conf file that names none means it.
 DEFAULT_IMPL_ACCOUNT = "implementer"
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+TERMS_ROW = "terms"
 
 
 def unit_id(project):
@@ -183,7 +190,11 @@ def run_check(project, name, words):
     repo = conf["REPO"]
     command, account, cap = read_row(repo, name)
     current = pwd.getpwuid(os.getuid()).pw_name
-    if account != current:
+    allowed = {account}
+    if name == TERMS_ROW:
+        allowed.update(conf.get("IMPL_ACCOUNT", "").split())
+        allowed.update(conf.get("SPEC_ACCOUNT", "").split())
+    if current not in allowed:
         jig_units.refuse("account", f"the row {name} runs in the account {account}, "
                                     f"not in {current}")
     if words:

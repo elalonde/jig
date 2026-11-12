@@ -113,9 +113,11 @@ class CommitMsgTest(TempTestCase):
 
     def test_commit_msg_make_hook_installs_it_in_the_clone(self):
         clone = self.git_init(self.tmp / "clone")
+        # Without the pre-commit hook, which needs a -dev clone around the clone and is
+        # tested on its own: here only the commit message decides.
         for name in ("hooks", "lib"):
             shutil.copytree(ROOT / name, clone / name,
-                            ignore=shutil.ignore_patterns("__pycache__"))
+                            ignore=shutil.ignore_patterns("__pycache__", "pre-commit"))
         shutil.copy(ROOT / "Makefile", clone)
         env = self.env(LINT_TERMS=str(self.terms))
         result = run(["make", "-C", clone, "hook"], env=env)

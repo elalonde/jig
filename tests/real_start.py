@@ -4,8 +4,9 @@ Run by make real-start, not by make check: it needs this account's conf file,
 its -dev clone with a clean tree, and its Claude Code login. The start test
 starts one small session, starts it again, and removes only that session and
 that lock. The close test leaves a session at the folder-trust dialog and
-closes it as a dead unit. Both tests use their own test IDs, which no real unit
-uses.
+closes it as a dead unit. The hook test starts a fixture project twice, with and
+without the term check on origin, and reads jig's pre-commit hook in its product
+clone. The tests use their own test IDs, which no real unit uses.
 """
 
 import getpass
@@ -45,6 +46,14 @@ CLOSE_TRANSCRIPTS = HOME / "ws" / "reviews" / PROJECT / "transcripts" / CLOSE_UN
 LOCK_NAME = f"{PROJECT}-{getpass.getuser()}"
 REAL_LOCK = pathlib.Path("/run/jig/lock") / LOCK_NAME
 DIALOG_WAIT_SECONDS = 60
+# A fixture project of the hook test, whose files all go when the test ends.
+HOOK_PROJECT = "hookfx"
+HOOK_UNIT = "x9hok"
+HOOK_SESSION = f"{HOOK_PROJECT}-impl-{HOOK_UNIT}"
+HOOK_TAG = "spec-p0"
+HOOK_CONF = HOME / ".config" / "jig" / f"{HOOK_PROJECT}.conf"
+HOOK_PROMPTS = HOME / "ws" / "prompts" / HOOK_PROJECT
+HOOK_REVIEWS = HOME / "ws" / "reviews" / HOOK_PROJECT
 
 
 def load_start_worker():
@@ -206,6 +215,131 @@ class RealCloseTest(unittest.TestCase):
         self.assertFalse(beside.exists())
         copied = sorted(path.name for path in (CLOSE_TRANSCRIPTS / "1").iterdir())
         print(f"transcript after a close at the trust dialog: {', '.join(copied) or 'none'}")
+
+
+class RealHookTest(unittest.TestCase):
+    """jig's pre-commit hook in a fixture project of this account, with real tmux and claude.
+
+    The project's -dev clone, its product clone and both bare origins live in a new
+    directory under /tmp. The worker reads the project's conf file from this account's
+    ~/.config/jig, and puts the prompt and the tee under ~/ws; the test removes all of
+    them. The session waits at the folder-trust dialog in the new folder, so the worker
+    stops there after the install, and the test ends that session and frees its lock.
+    """
+
+    def setUp(self):
+        for path in (HOOK_CONF, HOOK_PROMPTS, HOOK_REVIEWS):
+            self.assertFalse(path.exists(), f"{path} is not this test's")
+        self.assertFalse(session_alive(HOOK_SESSION), f"{HOOK_SESSION} is running")
+        self.base = pathlib.Path(tempfile.mkdtemp(prefix="jig-test."))
+        self.addCleanup(self.remove_base)
+        self.addCleanup(shutil.rmtree, HOOK_PROMPTS, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, HOOK_REVIEWS, ignore_errors=True)
+        self.addCleanup(HOOK_CONF.unlink, missing_ok=True)
+        self.addCleanup(self.stop_session)
+        self.lock_dir = self.base / "lock"
+        self.lock_dir.mkdir()
+        # The settle time only matters when no dialog shows; the dialog stops it sooner.
+        self.env = {**os.environ, "JIG_LOCK_DIR": str(self.lock_dir),
+                    "JIG_START_SETTLE": "15"}
+
+        dev_origin = self.base / f"{HOOK_PROJECT}-dev.git"
+        product_origin = self.base / f"{HOOK_PROJECT}.git"
+        self.seed = self.base / "seed"
+        self.dev = self.base / f"{HOOK_PROJECT}-dev"
+        self.product = self.dev / HOOK_PROJECT
+        for origin in (dev_origin, product_origin):
+            self.git("init", "-q", "--bare", "-b", "master", str(origin))
+        self.git("init", "-q", "-b", "master", str(self.seed))
+        self.git("-C", str(self.seed), "remote", "add", "origin", str(dev_origin))
+        # The -dev clone ignores the local settings that the start writes, and the product.
+        (self.seed / ".gitignore").write_text(f".claude/settings.local.json\n/{HOOK_PROJECT}/\n",
+                                              encoding="utf-8")
+        self.push_checks(terms=True)
+        self.git("-C", str(self.seed), "tag", HOOK_TAG)
+        self.git("-C", str(self.seed), "push", "-q", "origin", HOOK_TAG)
+        self.git("clone", "-q", "-b", "master", str(dev_origin), str(self.dev))
+
+        self.git("init", "-q", "-b", "master", str(self.product))
+        (self.product / "README").write_text("the fixture product\n", encoding="utf-8")
+        self.git("-C", str(self.product), "add", "-A")
+        self.git("-C", str(self.product), "commit", "-q", "--no-verify", "-m", "fixture")
+        self.git("-C", str(self.product), "remote", "add", "origin", str(product_origin))
+        self.git("-C", str(self.product), "push", "-q", "origin", "master")
+        # As make check of a product sets it: the hook path then lies in the work tree.
+        self.git("-C", str(self.product), "config", "--local", "core.hooksPath", "hooks")
+
+        HOOK_CONF.parent.mkdir(parents=True, exist_ok=True)
+        HOOK_CONF.write_text(f"REPO={self.dev}\nBRANCH=master\n"
+                             f"IMPL_ACCOUNT={getpass.getuser()}\n", encoding="utf-8")
+        self.prompt = self.base / "prompt.md"
+        self.prompt.write_text("Say OK, then stop.\n", encoding="utf-8")
+
+    def git(self, *args):
+        result = capture("git", *args)
+        self.assertEqual(result.returncode, 0, f"git {' '.join(args)}: {result.stderr}")
+        return result.stdout.strip()
+
+    def push_checks(self, terms):
+        rows = ["name\tcommand\taccount\tcap_seconds", "make-check\ttrue\timplementer\t60"]
+        if terms:
+            rows.append(f"terms\tjig terms check {HOOK_PROJECT}\timplementer\t60")
+        (self.seed / "checks.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        self.git("-C", str(self.seed), "add", "-A")
+        self.git("-C", str(self.seed), "commit", "-q", "--no-verify", "-m", "fixture checks")
+        self.git("-C", str(self.seed), "push", "-q", "origin", "master")
+
+    def remove_base(self):
+        # The approved worktree is read-only, so the tree opens before it goes.
+        capture("chmod", "-R", "u+w", str(self.base))
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def stop_session(self):
+        capture("tmux", "kill-session", "-t", f"={HOOK_SESSION}")
+        lock = self.lock_dir / f"{HOOK_PROJECT}-{getpass.getuser()}"
+        lock.unlink(missing_ok=True)
+        lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
+
+    def run_worker(self):
+        """Run the worker part alone; accept its stop at the folder-trust dialog."""
+        result = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
+                         "--expected", EXPECTED, "--model", MODEL, "--approved-tag", HOOK_TAG,
+                         "--tag", HOOK_TAG, env=self.env)
+        stopped = result.returncode == 1 and "refused: dialog:" in result.stderr
+        self.assertTrue(result.returncode == 0 or stopped, result.stderr)
+        print(f"worker: {'stopped at the folder-trust dialog' if stopped else 'started'}")
+        self.stop_session()
+        self.assertFalse(session_alive(HOOK_SESSION))
+
+    def hook_path(self):
+        named = self.git("-C", str(self.product), "rev-parse", "--git-path", "hooks/pre-commit")
+        print(f"git rev-parse --git-path hooks/pre-commit: {named}")
+        return self.product / named
+
+    def excluded(self):
+        exclude = self.product / ".git" / "info" / "exclude"
+        return exclude.read_text(encoding="utf-8").splitlines()
+
+    def test_real_start_installs_and_removes_the_pre_commit_hook(self):
+        # With the row terms on origin, the start installs jig's hook at the hooks path
+        # and excludes that path; the product clone stays clean.
+        self.run_worker()
+        hook = self.hook_path()
+        self.assertEqual(hook.read_bytes(), (ROOT / "hooks" / "pre-commit").read_bytes())
+        self.assertTrue(os.access(hook, os.X_OK))
+        line_2 = hook.read_text(encoding="utf-8").splitlines()[1]
+        print(f"line 2 of the hook: {line_2}")
+        self.assertEqual(line_2, "# jig pre-commit hook")
+        self.assertIn("/hooks/pre-commit", self.excluded())
+        self.assertEqual(self.git("-C", str(self.product), "status", "--porcelain"), "")
+
+        # Without the row on origin, the next start removes the hook and keeps the line.
+        self.push_checks(terms=False)
+        self.run_worker()
+        hook = self.hook_path()
+        print(f"hook after the start without the row: {'present' if hook.exists() else 'absent'}")
+        self.assertFalse(hook.exists())
+        self.assertIn("/hooks/pre-commit", self.excluded())
 
 
 if __name__ == "__main__":

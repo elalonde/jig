@@ -4,15 +4,17 @@
 usage: jig-start-worker <project> <role> <ID> <prompt> --expected <minutes> --model <model>
            [--effort <level>] [--account <account>] [--branch <branch>] [--tag <tag>]...
            [--approved-tag <tag>] [--head <commit>] [--stage all|check|launch]
-           [--add-dir <directory>]...
+           [--add-dir <directory>]... [--hook <base64 text>]
 
 The check stage refuses, in order: a lock, a live session of that name, a role
 account that differs, no fetch or the wrong branch, a dirty tree, a failed
-fast-forward, a HEAD other than origin, a tag missing on origin. A change to
+fast-forward, a HEAD other than origin, a tag missing on origin, and another
+pre-commit hook than jig's in the product clone. A change to
 impl/orch/updates.log alone does not make the tree dirty, because jig orch appends
 idle lines there between the orchestrator's commits. The launch
-stage takes the lock, brings the clone to origin, sets the effort, places the
-prompt, refreshes the approved worktree and starts the session. The default runs
+stage takes the lock, brings the clone to origin, installs or removes jig's
+pre-commit hook in the product clone, sets the effort, places the prompt,
+refreshes the approved worktree and starts the session. The default runs
 both, so the script can run alone in the account. A refusal in the launch stage
 keeps the lock when jig start has pushed the unit's start line (it passes
 --head), or when the session is still there, so that jig close --dead finds
@@ -22,11 +24,27 @@ jig start sends this file to python3 over ssh, because the tree it runs from may
 not be readable here. So it imports the standard library and nothing else, and
 gets the role's list of directories (lib/jig_dirs.py) from jig start, as --add-dir;
 alone in the account it passes only the ones it is given. It expands ~ here, and
-leaves out a directory that does not exist.
+leaves out a directory that does not exist. For the same reason jig start passes the
+text of jig's pre-commit hook, hooks/pre-commit of its own tree, as --hook; run
+alone from a jig tree, the script reads that file beside it.
+
+The product clone is the clone of the product nested in the -dev clone, at
+REPO/<project>. jig's pre-commit hook is the file that git rev-parse --git-path
+hooks/pre-commit names there, so a clone with core.hooksPath gets it at the right
+place too. Its second line is a marker, and only a file with that marker is jig's:
+another hook at the path stops the start before anything changes, so a project's
+own hook is never replaced. When checks.tsv at origin/<BRANCH> of the -dev clone
+holds the row terms, the launch writes the hook, and adds its path to
+.git/info/exclude of the product clone when the path lies in the work tree, so that
+the hook never becomes a product file. Without that row, the launch removes jig's
+hook, so that a unit on a line without the term check can still commit, and leaves
+the exclude line. A hook path that git tracks in the product clone belongs to the
+product, and is left as it is.
 Exits 1 on a refusal, naming what refused on stderr; 2 on a usage error.
 """
 
 import argparse
+import base64
 import datetime
 import getpass
 import grp
@@ -62,6 +80,13 @@ POLL_SECONDS = 0.2
 # The group that opens /run/jig and /srv/jig to a session. A pane has the groups of its
 # tmux server, which may have started before the account joined, so the session asks sg.
 SESSION_GROUP = "jig"
+
+# The second line of jig's pre-commit hook, by which a file at the hook's path is
+# known to be jig's own.
+HOOK_MARKER = "# jig pre-commit hook"
+# The row of checks.tsv that the hook runs: the term check, which looks for the
+# project's private terms in the product.
+TERMS_ROW = "terms"
 
 
 class Refused(Exception):
@@ -284,6 +309,150 @@ def refresh_approved(clone, tag):
     set_writable(worktree, False)
 
 
+def product_clone(conf, project):
+    return pathlib.Path(conf["REPO"]) / project
+
+
+def is_clone(path):
+    # A worktree or a submodule has a .git file instead of a directory.
+    return (pathlib.Path(path) / ".git").exists()
+
+
+def hook_place(product):
+    """Return the path of the clone's pre-commit hook, and that path relative to the work
+    tree when it lies there, or None when it lies in the git directory or outside."""
+    named = git_out(product, "rev-parse", "--git-path", "hooks/pre-commit")
+    git_dir = git_out(product, "rev-parse", "--absolute-git-dir")
+    if not named or not git_dir:
+        refuse("hook", f"git cannot name the pre-commit hook of {product}")
+    path = pathlib.Path(os.path.realpath(pathlib.Path(product) / named))
+    top = pathlib.Path(os.path.realpath(product))
+    if path.is_relative_to(os.path.realpath(git_dir)) or not path.is_relative_to(top):
+        return path, None
+    return path, path.relative_to(top).as_posix()
+
+
+def is_tracked(product, relative):
+    return bool(git_out(product, "ls-files", "--", f":(literal){relative}"))
+
+
+def is_jigs_hook(path):
+    """Say whether the file at the path is jig's pre-commit hook, by its second line."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            stream.readline()
+            return stream.readline().rstrip("\r\n") == HOOK_MARKER
+    except OSError:
+        return False
+
+
+def foreign_hook(product):
+    """Return the hook's path and its place in the work tree, after refusing a hook that
+    is not jig's; return None when git tracks the path, since the product owns it then."""
+    path, relative = hook_place(product)
+    if relative is not None and is_tracked(product, relative):
+        return None
+    if os.path.lexists(path) and not is_jigs_hook(path):
+        refuse("hook", f"{path} is a pre-commit hook that is not jig's; jig start never "
+                       "replaces it. Move it away, then start again")
+    return path, relative
+
+
+def check_hook(product):
+    if is_clone(product):
+        foreign_hook(product)
+
+
+def has_terms_row(clone, branch):
+    """Say whether checks.tsv at origin/<branch> of the -dev clone has the row terms."""
+    shown = git(clone, "show", f"refs/remotes/origin/{branch}:checks.tsv")
+    if shown.returncode != 0:
+        return False
+    return any(line.split("\t")[0] == TERMS_ROW for line in shown.stdout.splitlines()[1:])
+
+
+def exclude_from_product(product, relative):
+    """Add the path to .git/info/exclude of the clone, once, as a pattern of that one file."""
+    named = git_out(product, "rev-parse", "--git-path", "info/exclude")
+    if not named:
+        refuse("hook", f"git cannot name the exclude file of {product}")
+    exclude = pathlib.Path(product) / named
+    # A backslash keeps a wildcard character in the name from matching other files.
+    line = "/" + re.sub(r"([*?\[\\])", r"\\\1", relative)
+    try:
+        text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if line in text.splitlines():
+            return
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with open(exclude, "a", encoding="utf-8") as stream:
+            stream.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
+    except OSError as error:
+        refuse("hook", f"cannot add {line} to {exclude}: {error.strerror}")
+
+
+def install_hook(product, text):
+    """Write jig's pre-commit hook into the product clone, unless the product tracks the
+    path; another hook at the path is refused and stays as it is."""
+    found = foreign_hook(product)
+    if found is None:
+        return
+    path, relative = found
+    if text is None or text.splitlines()[1:2] != [HOOK_MARKER]:
+        refuse("hook", "no text of jig's pre-commit hook was given")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=".pre-commit.")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.chmod(name, 0o755)
+        os.replace(name, path)
+    except OSError as error:
+        refuse("hook", f"cannot write {path}: {error.strerror}")
+    if relative is not None:
+        exclude_from_product(product, relative)
+
+
+def remove_hook(product):
+    """Remove jig's pre-commit hook from the product clone; leave every other file."""
+    found = foreign_hook(product)
+    if found is not None and os.path.lexists(found[0]):
+        try:
+            found[0].unlink()
+        except OSError as error:
+            refuse("hook", f"cannot remove {found[0]}: {error.strerror}")
+
+
+def place_hook(conf, project, text):
+    """Install or remove the hook by the row terms at the origin head the clone is now at."""
+    product = product_clone(conf, project)
+    if not is_clone(product):
+        return
+    if has_terms_row(conf["REPO"], conf["BRANCH"]):
+        install_hook(product, text)
+    else:
+        remove_hook(product)
+
+
+def decode_hook(value):
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        raise argparse.ArgumentTypeError("not the base64 text of a hook") from None
+
+
+def hook_beside_script():
+    """Return the hook of the jig tree this script runs from, or None when it came on stdin."""
+    if sys.argv[0] in ("", "-"):
+        return None
+    path = pathlib.Path(sys.argv[0]).resolve().parent.parent / "hooks" / "pre-commit"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def take_lock(project, account, session, expected):
     lock = lock_path(project, account)
     try:
@@ -384,6 +553,7 @@ def check(args, conf, session):
     check_session(session)
     check_account(conf, args.role, args.account)
     check_clone(conf, [*args.tag, *([args.approved_tag] if args.approved_tag else [])])
+    check_hook(product_clone(conf, args.project))
     if args.role == "impl" and not args.approved_tag:
         refuse("tag", "an implementer unit needs a spec tag for its approved worktree")
 
@@ -395,6 +565,7 @@ def launch(args, conf, session):
     lock = take_lock(args.project, args.account, session, args.expected)
     try:
         bring_to_origin(conf, args.head)
+        place_hook(conf, args.project, args.hook)
         set_effort(clone, args.model, args.effort)
         prompt = place_prompt(args.prompt, args.project, args.unit)
         if args.approved_tag:
@@ -432,6 +603,7 @@ def parse_args(argv):
     parser.add_argument("--head")
     parser.add_argument("--stage", default="all", choices=("all", "check", "launch"))
     parser.add_argument("--add-dir", action="append", default=[])
+    parser.add_argument("--hook", type=decode_hook, default=None)
     args = parser.parse_args(argv)
     if not PROJECT.fullmatch(args.project):
         parser.error(f"bad project: {args.project}")
@@ -439,6 +611,8 @@ def parse_args(argv):
         parser.error(f"bad ID: {args.unit}")
     if args.stage != "check" and not (args.model and args.expected and args.expected > 0):
         parser.error("--model and a positive --expected are needed to start a session")
+    if args.hook is None:
+        args.hook = hook_beside_script()
     return args
 
 

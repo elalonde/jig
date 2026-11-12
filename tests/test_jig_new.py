@@ -454,10 +454,41 @@ class JigNewTest(TempTestCase):
                 self.assertIn("lint-a: clean", result.stdout)
         hooks = run(["git", "-C", dev / "demo", "config", "core.hooksPath"], env=self.env())
         self.assertEqual(hooks.stdout.strip(), "hooks")
-        # The hook is live: a message with a private term is refused.
+        # The hooks are live. The term check of the pre-commit hook finds nothing in the
+        # new product, and the commit-msg hook then refuses a message with a private term.
         bad = run(["git", "-C", dev / "demo", "commit", "--allow-empty", "-q", "-m",
-                   f"Talk about {HOST}"], env=self.env())
+                   f"Talk about {HOST}"], env=env)
         self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("jig pre-commit hook", bad.stderr)
+        self.assertIn(HOST, bad.stderr)
+
+    def test_new_installs_the_pre_commit_hook_after_the_first_commit(self):
+        # The seed product clone gets jig's pre-commit hook at the hooks path in its work
+        # tree. The first commit does not hold it, the exclude file keeps it out of the
+        # product, and the clone stays clean.
+        self.made()
+        product = self.home / "ws/src/demo-dev/demo"
+        hook = product / "hooks/pre-commit"
+        self.assertEqual(hook.read_bytes(), (ROOT / "hooks" / "pre-commit").read_bytes())
+        self.assertTrue(os.access(hook, os.X_OK))
+        named = run(["git", "-C", product, "rev-parse", "--git-path", "hooks/pre-commit"],
+                    env=self.env())
+        self.assertEqual(named.stdout.strip(), "hooks/pre-commit")
+        first = run(["git", "-C", product, "show", "--name-only", "--format=", "HEAD"],
+                    env=self.env()).stdout.split()
+        self.assertIn("hooks/commit-msg", first)
+        self.assertNotIn("hooks/pre-commit", first)
+        exclude = (product / ".git/info/exclude").read_text(encoding="utf-8").splitlines()
+        self.assertIn("/hooks/pre-commit", exclude)
+        status = run(["git", "-C", product, "status", "--porcelain"], env=self.env())
+        self.assertEqual(status.stdout, "")
+
+    def test_checks_template_gives_the_new_project_the_row_terms(self):
+        # The row runs the term check of the new project in the implementer account.
+        self.made()
+        text = (self.home / "ws/src/demo-dev/checks.tsv").read_text(encoding="utf-8")
+        rows = [line.split("\t") for line in text.splitlines()]
+        self.assertIn(["terms", "jig terms check demo", "implementer", "60"], rows)
 
     def test_pattern_template_holds_the_process_ids_of_the_module(self):
         # The template that jig new copies holds exactly the process ID patterns of the

@@ -8,7 +8,8 @@ The preconditions, in order, each with its own refusal: the prompt passes jig
 validate prompt and matches the arguments; no lock; the role's account in the
 conf file equals the prompt's; then, in the worker account: origin fetched and
 the branch checked out, a clean tree, a fast-forward to origin, HEAD equal to
-it, every tag of the ROLE line on origin; last, the model the prompt names. A change
+it, every tag of the ROLE line on origin, no pre-commit hook other than jig's in the
+worker's product clone; last, the model the prompt names. A change
 to impl/orch/updates.log alone does not make the tree unclean: jig orch appends its
 idle lines there, and the orchestrator commits them with its next commit.
 
@@ -16,11 +17,13 @@ Only then the status commit goes to origin, committed alone in this account's cl
 a refused push gets one fetch and one rebase with --autostash, so an uncommitted
 change in that clone, such as those idle lines, stays in place. Then the prompt
 and its inbox directory go to the worker account, and the worker part starts the
-session. JIG_SSH holds the ssh command, and tests set it. Exits 1 on a refusal; 2 on
-a usage error.
+session, with the text of jig's pre-commit hook from this tree, which the worker
+installs in its product clone or removes from it. JIG_SSH holds the ssh command, and
+tests set it. Exits 1 on a refusal; 2 on a usage error.
 """
 
 import argparse
+import base64
 import datetime
 import importlib.machinery
 import importlib.util
@@ -35,6 +38,8 @@ import tarfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKER_SCRIPT = ROOT / "libexec" / "jig-start-worker"
 VALIDATE = ROOT / "libexec" / "jig-validate"
+# The worker account cannot read this tree, so the hook's text travels with the command.
+HOOK = ROOT / "hooks" / "pre-commit"
 sys.path.insert(0, str(ROOT / "lib"))
 
 import jig_dirs  # noqa: E402
@@ -238,11 +243,12 @@ def start(args):
     run_worker(account, args, "check", branch, tags, approved_tag)
     model = select_model(text, args.model)
 
+    hook = base64.b64encode(HOOK.read_bytes()).decode("ascii")
     head = write_status(conf, args.unit)
     copy_prompt(account, args)
     run_worker(account, args, "launch",
                [*branch, "--head", head, "--model", model, "--expected", str(args.expected),
-                *add_dirs],
+                "--hook", hook, *add_dirs],
                [], approved_tag)
 
 
