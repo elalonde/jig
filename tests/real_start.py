@@ -6,7 +6,9 @@ starts one small session, starts it again, and removes only that session and
 that lock. The close test leaves a session at the folder-trust dialog and
 closes it as a dead unit. The hook test starts a fixture project twice, with and
 without the term check on origin, and reads jig's pre-commit hook in its product
-clone. The tests use their own test IDs, which no real unit uses.
+clone. The version line test reads a spec tag of a version line from a fixture
+prompt with jig start's own readers, and starts the fixture project with it. The
+tests use their own test IDs, which no real unit uses.
 """
 
 import getpass
@@ -26,6 +28,7 @@ import unittest
 
 from tests.support import ROOT
 
+START = ROOT / "libexec" / "jig-start"
 WORKER = ROOT / "libexec" / "jig-start-worker"
 CLOSE_WORKER = ROOT / "libexec" / "jig-close-worker"
 PROJECT = "jig"
@@ -51,17 +54,24 @@ HOOK_PROJECT = "hookfx"
 HOOK_UNIT = "x9hok"
 HOOK_SESSION = f"{HOOK_PROJECT}-impl-{HOOK_UNIT}"
 HOOK_TAG = "spec-p0"
+# The approval tag of the specs of the version line 1.2.
+LINE_TAG = "spec-1.2"
 HOOK_CONF = HOME / ".config" / "jig" / f"{HOOK_PROJECT}.conf"
 HOOK_PROMPTS = HOME / "ws" / "prompts" / HOOK_PROJECT
 HOOK_REVIEWS = HOME / "ws" / "reviews" / HOOK_PROJECT
 
 
-def load_start_worker():
+def load_script(name, path):
+    """Load a script of libexec, which has no .py name, as a module."""
     sys.dont_write_bytecode = True
-    loader = importlib.machinery.SourceFileLoader("jig_start_worker", str(WORKER))
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     loader.exec_module(module)
     return module
+
+
+def load_start_worker():
+    return load_script("jig_start_worker", WORKER)
 
 
 def lock_holder(lock):
@@ -217,8 +227,8 @@ class RealCloseTest(unittest.TestCase):
         print(f"transcript after a close at the trust dialog: {', '.join(copied) or 'none'}")
 
 
-class RealHookTest(unittest.TestCase):
-    """jig's pre-commit hook in a fixture project of this account, with real tmux and claude.
+class FixtureProjectCase(unittest.TestCase):
+    """A fixture project of this account, which the worker part starts with real tmux and claude.
 
     The project's -dev clone, its product clone and both bare origins live in a new
     directory under /tmp. The worker reads the project's conf file from this account's
@@ -243,7 +253,7 @@ class RealHookTest(unittest.TestCase):
         self.env = {**os.environ, "JIG_LOCK_DIR": str(self.lock_dir),
                     "JIG_START_SETTLE": "15"}
 
-        dev_origin = self.base / f"{HOOK_PROJECT}-dev.git"
+        self.dev_origin = dev_origin = self.base / f"{HOOK_PROJECT}-dev.git"
         product_origin = self.base / f"{HOOK_PROJECT}.git"
         self.seed = self.base / "seed"
         self.dev = self.base / f"{HOOK_PROJECT}-dev"
@@ -300,11 +310,15 @@ class RealHookTest(unittest.TestCase):
         lock.unlink(missing_ok=True)
         lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
 
-    def run_worker(self):
-        """Run the worker part alone; accept its stop at the folder-trust dialog."""
+    def run_worker(self, *tag_args):
+        """Run the worker part alone; accept its stop at the folder-trust dialog.
+
+        tag_args are the --tag and --approved-tag options; without them, the phase tag
+        that the fixture holds is both.
+        """
+        tag_args = tag_args or ("--approved-tag", HOOK_TAG, "--tag", HOOK_TAG)
         result = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
-                         "--expected", EXPECTED, "--model", MODEL, "--approved-tag", HOOK_TAG,
-                         "--tag", HOOK_TAG, env=self.env)
+                         "--expected", EXPECTED, "--model", MODEL, *tag_args, env=self.env)
         stopped = result.returncode == 1 and "refused: dialog:" in result.stderr
         self.assertTrue(result.returncode == 0 or stopped, result.stderr)
         print(f"worker: {'stopped at the folder-trust dialog' if stopped else 'started'}")
@@ -315,6 +329,11 @@ class RealHookTest(unittest.TestCase):
         named = self.git("-C", str(self.product), "rev-parse", "--git-path", "hooks/pre-commit")
         print(f"git rev-parse --git-path hooks/pre-commit: {named}")
         return self.product / named
+
+
+
+class RealHookTest(FixtureProjectCase):
+    """jig's pre-commit hook in the product clone of the fixture project."""
 
     def excluded(self):
         exclude = self.product / ".git" / "info" / "exclude"
@@ -340,6 +359,51 @@ class RealHookTest(unittest.TestCase):
         print(f"hook after the start without the row: {'present' if hook.exists() else 'absent'}")
         self.assertFalse(hook.exists())
         self.assertIn("/hooks/pre-commit", self.excluded())
+
+
+class RealVersionLineTagTest(FixtureProjectCase):
+    """jig start with the spec tag of a version line on the ROLE line of a prompt.
+
+    jig start reads the tags from the prompt in this account and hands them to the
+    worker part, which runs in the worker's account. The test takes the first half from
+    jig start itself, so that a change to how it reads the ROLE line shows here, and runs
+    the second half for real on the fixture project.
+    """
+
+    def test_real_start_puts_the_approved_worktree_at_a_version_line_tag(self):
+        # The line's spec comes in a commit after the phase tag, so the approved worktree
+        # can only reach it through the line's own tag.
+        (self.seed / "specs").mkdir()
+        (self.seed / "specs" / "spec.md").write_text("the spec of the line\n", encoding="utf-8")
+        self.git("-C", str(self.seed), "add", "-A")
+        self.git("-C", str(self.seed), "commit", "-q", "--no-verify", "-m", "line spec")
+        self.git("-C", str(self.seed), "push", "-q", "origin", "master")
+        self.git("-C", str(self.seed), "tag", LINE_TAG)
+        self.git("-C", str(self.seed), "push", "-q", "origin", LINE_TAG)
+        self.prompt.write_text("ROLE: implementer. Rules: CLAUDE.md, the section Comment\n"
+                               f"  standard. Spec tag: {LINE_TAG}. Prohibited sources: none.\n"
+                               "STATE: Say OK, then stop.\n", encoding="utf-8")
+
+        start = load_script("jig_start", START)
+        role_line = start.role_section(self.prompt.read_text(encoding="utf-8"))
+        tags = list(dict.fromkeys(start.ROLE_TAG.findall(role_line)))
+        approved = start.SPEC_TAG.search(role_line)
+        print(f"jig start reads the tags {tags} and the spec tag "
+              f"{approved[1] if approved else None}")
+        self.assertEqual(tags, [LINE_TAG])
+        self.assertEqual(approved[1], LINE_TAG)
+
+        self.run_worker(*[word for tag in tags for word in ("--tag", tag)],
+                        "--approved-tag", approved[1])
+        worktree = pathlib.Path(f"{self.dev}-approved")
+        at = self.git("-C", str(worktree), "rev-parse", "HEAD")
+        named = self.git("-C", str(worktree), "describe", "--tags", "--exact-match")
+        print(f"approved worktree of the fixture: at {named} {at}")
+        self.assertEqual(named, LINE_TAG)
+        self.assertEqual(at, self.git("-C", str(self.dev_origin), "rev-parse",
+                                      f"{LINE_TAG}^{{commit}}"))
+        self.assertEqual((worktree / "specs" / "spec.md").read_text(encoding="utf-8"),
+                         "the spec of the line\n")
 
 
 if __name__ == "__main__":

@@ -6,10 +6,11 @@ usage: jig start <project> <role> <ID> <prompt> --expected <minutes>
 
 The preconditions, in order, each with its own refusal: the prompt passes jig
 validate prompt and matches the arguments; no lock; the role's account in the
-conf file equals the prompt's; then, in the worker account: origin fetched and
-the branch checked out, a clean tree, a fast-forward to origin, HEAD equal to
-it, every tag of the ROLE line on origin, no pre-commit hook other than jig's in the
-worker's product clone; last, the model the prompt names. A change
+conf file equals the prompt's; the spec tag of the ROLE line, when it names one,
+is of a spec tag form; then, in the worker account: origin fetched and the branch
+checked out, a clean tree, a fast-forward to origin, HEAD equal to it, every tag of
+the ROLE line on origin, no pre-commit hook other than jig's in the worker's product
+clone; last, the model the prompt names. A change
 to impl/orch/updates.log alone does not make the tree unclean: jig orch appends its
 idle lines there, and the orchestrator commits them with its next commit.
 
@@ -63,8 +64,16 @@ MODELS = {
 
 FIRST_LINE = re.compile(r"# (\S+)  paste into: (\S+) \(([^,]+), ~/ws/src/(\S+)-dev\)")
 SECTION = re.compile(r"[A-Z][A-Z ]*:(?: |$)")
-ROLE_TAG = re.compile(r"(?<![\w-])(?:spec-p[0-9]+(?:r[0-9]+)?|(?:impl-p|kickoff-r)[0-9]+)(?![\w-])")
-SPEC_TAG = re.compile(r"Spec tag:\s*(spec-p[0-9]+(?:r[0-9]+)?)(?![\w-])")
+# A spec tag approves the specs of a phase (spec-pN) or of a version line (spec-X.Y),
+# and the suffix rM marks a revision. A tag ends at a character that cannot continue
+# it, so spec-1.2.3 is not read as spec-1.2.
+SPEC_FORM = r"spec-p[0-9]+(?:r[0-9]+)?|spec-[0-9]+\.[0-9]+(?:r[0-9]+)?"
+TAG_END = r"(?![\w-]|\.[0-9])"
+ROLE_TAG = re.compile(rf"(?<![\w-])(?:{SPEC_FORM}|(?:impl-p|kickoff-r)[0-9]+){TAG_END}")
+SPEC_TAG = re.compile(rf"Spec tag:\s*({SPEC_FORM}){TAG_END}")
+# The word after "Spec tag:" when it starts like a tag, to refuse one of no spec form.
+SPEC_TAG_WORD = re.compile(r"Spec tag:\s*(spec-[\w.-]*)")
+SPEC_FORM_NAMES = "spec-pN, spec-p<N>r<M>, spec-X.Y or spec-X.YrM"
 NAMED_MODEL = re.compile(r"^MODEL CHECK: this unit needs (\S+?)\.(?:\s|$)", re.MULTILINE)
 STATUS_LOG = "impl/log/status.log"
 # Every commit carries the trailer for Claude, the machine-written ones too.
@@ -226,6 +235,11 @@ def start(args):
     worker.check_account(conf, args.role, account)
 
     role_line = role_section(text)
+    named = SPEC_TAG_WORD.search(role_line)
+    # A full stop after the tag ends the sentence and is not part of it.
+    named_tag = named[1].rstrip(".") if named else ""
+    if named and not re.fullmatch(SPEC_FORM, named_tag):
+        refuse("tag", f"the spec tag {named_tag} on the ROLE line is not {SPEC_FORM_NAMES}")
     tags = list(dict.fromkeys(ROLE_TAG.findall(role_line)))
     spec_tag = SPEC_TAG.search(role_line)
     # The approved worktree belongs to the implementer account, whatever the role in it.

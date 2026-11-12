@@ -353,6 +353,30 @@ class StartPreconditionTest(StartCase):
                                                         f"Spec tag: {tag}."), encoding="utf-8")
                 self.assert_refused(self.start(), "tag")
 
+    def test_start_refuses_a_version_line_tag_missing_on_origin(self):
+        # The worker clone has the tag, but origin does not, and origin decides.
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: spec-1.2.")
+        self.ok(["git", "-C", self.worker_clone, "tag", "spec-1.2"])
+        result = self.start()
+        self.assert_refused(result, "tag")
+        self.assertIn("spec-1.2 is not on origin", result.stderr)
+
+    def test_start_refuses_a_version_line_tag_of_a_bad_form(self):
+        # Each tag is on origin, so that only its form can refuse it; without the form
+        # check, the start would read spec-1.2 out of either and go ahead.
+        self.ok(["git", "-C", self.seed, "tag", "spec-1.2"])
+        self.ok(["git", "-C", self.seed, "push", "-q", "origin", "spec-1.2"])
+        original = self.prompt.read_text(encoding="utf-8")
+        for tag in ("spec-1.2.3", "spec-1.2r1.4"):
+            with self.subTest(tag=tag):
+                self.ok(["git", "-C", self.seed, "tag", tag])
+                self.ok(["git", "-C", self.seed, "push", "-q", "origin", tag])
+                self.prompt.write_text(original.replace("Spec tag: spec-p0.",
+                                                        f"Spec tag: {tag}."), encoding="utf-8")
+                result = self.start()
+                self.assert_refused(result, "tag")
+                self.assertIn(f"the spec tag {tag} on the ROLE line is not", result.stderr)
+
     def test_start_refuses_a_revision_tag_on_the_role_line_missing_on_origin(self):
         self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: spec-p0, spec-p0r3.")
         self.assert_refused(self.start(), "tag")
@@ -568,6 +592,28 @@ git push -q origin master
         self.assertEqual(self.ok(["git", "-C", worktree, "rev-parse", "HEAD"]),
                          self.ok(["git", "-C", self.origin, "rev-parse", "spec-p0r2^{commit}"]))
         self.assertTrue((worktree / "more.md").is_file())
+
+    def test_start_puts_the_approved_worktree_at_a_version_line_tag(self):
+        # The conf file's line is master, not 1.2: jig start takes the tag as it is and
+        # leaves the comparison of X.Y with the line to jig tag.
+        for tag in ("spec-1.2", "spec-1.2r1"):
+            with self.subTest(tag=tag):
+                # The first start put its status commit on origin, so the seed catches up.
+                self.ok(["git", "-C", self.seed, "pull", "-q", "origin", "master"])
+                self.push_from_seed(f"{tag}.md")
+                self.ok(["git", "-C", self.seed, "tag", tag])
+                self.ok(["git", "-C", self.seed, "push", "-q", "origin", tag])
+                self.prompt.write_text(GOOD_PROMPT.read_text(encoding="utf-8").replace(
+                    "Spec tag: spec-p0.", f"Spec tag: {tag}."), encoding="utf-8")
+                result = self.start()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                worktree = self.worker_home / "ws" / "src" / "jig-dev-approved"
+                self.assertEqual(self.ok(["git", "-C", worktree, "rev-parse", "HEAD"]),
+                                 self.ok(["git", "-C", self.origin, "rev-parse",
+                                          f"{tag}^{{commit}}"]))
+                self.assertTrue((worktree / f"{tag}.md").is_file())
+                self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+                self.lock().unlink()
 
     def test_start_gives_a_spec_unit_no_worktree(self):
         self.replace_in_prompt("jig-impl-demo (implementer,", "jig-spec-demo (specwriter,")
