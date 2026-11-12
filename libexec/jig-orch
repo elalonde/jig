@@ -42,8 +42,9 @@ A line goes out once the file has held still for one poll. A file is new when it
 inode or modification time differs from those of the file last announced at that path:
 a readback written again gets a second line, an inbox file that grew may get one, and a
 file removed and written again is new. orch/announced keeps the path, inode and
-modification time of each announced file, so a file that lands while no loop runs is
-announced at the next start. At the first start, with no record yet, the files already
+modification time of each file whose line is in the event file, so a file that lands
+while no loop runs, or whose line a stop dropped from the queue, is announced at the
+next start. At the first start, with no record yet, the files already
 there are taken as announced. A record line of the older form, a path alone, stands for
 the file that is at that path now, so an upgrade announces nothing again.
 
@@ -175,6 +176,20 @@ STATUS_LOG = "impl/log/status.log"
 FETCH_CAP_SECONDS = 30.0
 # A line of orch/announced: inode, modification time in nanoseconds, path.
 RECORD_LINE = re.compile(r"(\d+) (\d+) (.+)")
+
+
+class FileMark:
+    """The inbox file or readback that a queued line names, as it was when queued.
+
+    It is a class of its own, not a tuple, because the queue tells a reminder by its
+    tuple mark.
+    """
+
+    __slots__ = ("path", "inode", "mtime")
+
+    def __init__(self, path, inode, mtime):
+        self.path, self.inode, self.mtime = path, inode, mtime
+
 # A session that exits this often within the window stops the loop.
 QUICK_EXITS = 3
 QUICK_WINDOW_SECONDS = 600
@@ -627,7 +642,7 @@ class Orch:
         temporary = self.announced_file.with_name(self.announced_file.name + ".new")
         try:
             temporary.write_text("".join(f"{inode} {mtime} {path}\n" for path, (inode, mtime)
-                                         in sorted(self.seen.items())), encoding="utf-8")
+                                         in sorted(self.announced.items())), encoding="utf-8")
             os.replace(temporary, self.announced_file)
         except OSError as error:
             self.log(f"cannot write {self.announced_file}: {error.strerror}", tee=True)
@@ -640,16 +655,21 @@ class Orch:
         announced again. A path whose file is gone drops out of the record, so a file
         written there later is new even when it gets the same inode back.
         A directory that cannot be read is skipped, so that its files are not new again.
+
+        self.seen holds the files that are queued or announced, so that a file whose
+        line still waits is not queued twice; self.announced, the written record, gets a
+        file only once its line is appended (append_queue).
         """
-        before = dict(self.seen)
+        before = dict(self.announced)
         for kind, directory in self.watched:
             present = self.files(directory)
             if present is None:
                 continue
-            inside = {path for path in [*self.seen, *self.waiting]
+            inside = {path for path in [*self.seen, *self.announced, *self.waiting]
                       if os.path.dirname(path) == str(directory)}
             for path in inside - set(present):
                 self.seen.pop(path, None)
+                self.announced.pop(path, None)
                 self.waiting.pop(path, None)
             for path, (inode, mtime, size) in sorted(present.items()):
                 if self.seen.get(path) == (inode, mtime):
@@ -659,8 +679,9 @@ class Orch:
                     continue
                 del self.waiting[path]
                 self.seen[path] = (inode, mtime)
-                self.queue.append((self.announcement(kind, path, size), None))
-        if self.seen != before:
+                self.queue.append((self.announcement(kind, path, size),
+                                   FileMark(path, inode, mtime)))
+        if self.announced != before:
             self.write_announced()
 
     def announcement(self, kind, path, size):
@@ -940,7 +961,7 @@ class Orch:
         """Append the queued events to the event file, oldest first."""
         while self.queue and not self.stopping:
             # The mark of a line is its report commit, the (item, date) pair of a
-            # reminder, or None.
+            # reminder, the FileMark of an inbox file or readback, or None.
             line, mark = self.queue[0]
             failure = self.append_event(line)
             if failure:
@@ -958,12 +979,15 @@ class Orch:
             self.log(f"appended{again}: {line}")
             if line != HOURLY_LINE and not isinstance(mark, tuple):
                 self.note_change()
-            # A report commit or a reminder goes into its record only once its line is
-            # appended, so that a line that a stop drops while it waits in the queue is
-            # appended after the restart.
+            # A report commit, a reminder or a file goes into its record only once its
+            # line is appended, so that a line that a stop drops while it waits in the
+            # queue is appended after the restart.
             if isinstance(mark, tuple):
                 self.reminded.add(mark)
                 self.write_reminded()
+            elif isinstance(mark, FileMark):
+                self.announced[mark.path] = (mark.inode, mark.mtime)
+                self.write_announced()
             elif mark:
                 self.pending.discard(mark)
                 self.reported.add(mark)
@@ -982,6 +1006,7 @@ class Orch:
             for _, directory in self.watched:
                 for path, (inode, mtime, _) in (self.files(directory) or {}).items():
                     self.seen[path] = (inode, mtime)
+        self.announced = dict(self.seen)
         # Written at once, so that a record of the older form is not read a second time.
         self.write_announced()
         self.reported, self.pending = self.read_reported(), set()

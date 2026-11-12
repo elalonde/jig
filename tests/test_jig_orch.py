@@ -651,6 +651,30 @@ class TestEventFile(OrchTestCase):
         time.sleep(4 * float(POLL))
         self.assertEqual(self.event_lines(), lines)
 
+    def test_file_whose_line_a_stop_drops_is_announced_once_at_the_next_start(self):
+        # The event file cannot be written, so the lines of an inbox file and a
+        # readback wait in the queue, and the loop stops before it can append them.
+        # Neither file is in the written record then, so the next start appends the
+        # line of each, once and in the order the files came.
+        self.start()
+        self.event_file().unlink()
+        self.event_file().mkdir()
+        note = self.srv / "in" / PROJECT / "note.md"
+        note.write_text("one\n", encoding="utf-8")
+        self.until(lambda: "cannot append" in self.log(), what="the failure")
+        (self.srv / "out" / PROJECT / "b1.txt").write_text("exit 0\n", encoding="utf-8")
+        time.sleep(4 * float(POLL))
+        self.assertEqual(self.orch("stop").returncode, 0, self.log())
+        self.until(lambda: not self.alive(), what="the end of the session")
+        self.assertNotIn(str(note), self.read(self.reviews / "orch" / "announced"))
+        self.event_file().rmdir()
+        self.start()
+        lines = [self.inbox_line(note), "readback: b1"]
+        self.until(lambda: self.events() == lines, seconds=60,
+                   what="both lines after the restart")
+        time.sleep(4 * float(POLL))
+        self.assertEqual(self.events(), lines)
+
 
 # A process that only waits; the arguments after the code are what the loop reads.
 WAITER = [sys.executable, "-c", "import time; time.sleep(120)"]
