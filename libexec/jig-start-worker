@@ -9,7 +9,8 @@ usage: jig-start-worker <project> <role> <ID> <prompt> --expected <minutes> --mo
 The check stage refuses, in order: a lock, a live session of that name, a role
 account that differs, no fetch or the wrong branch, a dirty tree, a failed
 fast-forward, a HEAD other than origin, a tag missing on origin, and another
-pre-commit hook than jig's in the product clone. A change to
+pre-commit hook than jig's, or a hook path outside the clone, in the product clone.
+A change to
 impl/orch/updates.log alone does not make the tree dirty, because jig orch appends
 idle lines there between the orchestrator's commits. The launch
 stage takes the lock, brings the clone to origin, installs or removes jig's
@@ -33,7 +34,9 @@ REPO/<project>. jig's pre-commit hook is the file that git rev-parse --git-path
 hooks/pre-commit names there, so a clone with core.hooksPath gets it at the right
 place too. Its second line is a marker, and only a file with that marker is jig's:
 another hook at the path stops the start before anything changes, so a project's
-own hook is never replaced. When checks.tsv at origin/<BRANCH> of the -dev clone
+own hook is never replaced. A hook path that lies neither in the git directory nor
+in the work tree, such as an absolute core.hooksPath, also stops the start, since a
+hook there would run for every repository that shares the path. When checks.tsv at origin/<BRANCH> of the -dev clone
 holds the row terms, the launch writes the hook, and adds its path to
 .git/info/exclude of the product clone when the path lies in the work tree, so that
 the hook never becomes a product file. Without that row, the launch removes jig's
@@ -320,15 +323,27 @@ def is_clone(path):
 
 def hook_place(product):
     """Return the path of the clone's pre-commit hook, and that path relative to the work
-    tree when it lies there, or None when it lies in the git directory or outside."""
+    tree when it lies there, or None when it lies in the git directory.
+
+    A hook path outside the clone, such as an absolute core.hooksPath from the account's
+    global git config, is refused: a hook written there would run for every repository
+    that shares the path, and would refuse their commits, since no -dev clone holds them.
+    """
     named = git_out(product, "rev-parse", "--git-path", "hooks/pre-commit")
     git_dir = git_out(product, "rev-parse", "--absolute-git-dir")
-    if not named or not git_dir:
+    common_dir = git_out(product, "rev-parse", "--git-common-dir")
+    if not named or not git_dir or not common_dir:
         refuse("hook", f"git cannot name the pre-commit hook of {product}")
     path = pathlib.Path(os.path.realpath(pathlib.Path(product) / named))
     top = pathlib.Path(os.path.realpath(product))
-    if path.is_relative_to(os.path.realpath(git_dir)) or not path.is_relative_to(top):
+    # A linked worktree keeps its hooks in the git directory that all its worktrees share.
+    git_dirs = [os.path.realpath(git_dir), os.path.realpath(pathlib.Path(product) / common_dir)]
+    if any(path.is_relative_to(directory) for directory in git_dirs):
         return path, None
+    if not path.is_relative_to(top):
+        refuse("hook", f"{path} is the pre-commit hook path that git names, and it lies "
+                       f"outside the clone {product}; jig start writes no hook there. Set "
+                       "core.hooksPath of the clone to a path inside it, then start again")
     return path, path.relative_to(top).as_posix()
 
 

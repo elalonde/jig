@@ -9,8 +9,8 @@ validate prompt and matches the arguments; no lock; the role's account in the
 conf file equals the prompt's; the spec tag of the ROLE line, when it names one,
 is of a spec tag form; then, in the worker account: origin fetched and the branch
 checked out, a clean tree, a fast-forward to origin, HEAD equal to it, every tag of
-the ROLE line on origin, no pre-commit hook other than jig's in the worker's product
-clone; last, the model the prompt names. A change
+the ROLE line on origin, no pre-commit hook other than jig's and no hook path outside
+the clone in the worker's product clone; last, the model the prompt names. A change
 to impl/orch/updates.log alone does not make the tree unclean: jig orch appends its
 idle lines there, and the orchestrator commits them with its next commit.
 

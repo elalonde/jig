@@ -1034,6 +1034,38 @@ class StartHookTest(StartCase):
         self.assertFalse(self.lock().exists())
         self.assertTrue(hook.exists())
 
+    def shared_hooks_path(self):
+        """Point core.hooksPath of the product clone at a directory outside the clone."""
+        shared = self.tmp / "shared-hooks"
+        self.ok(["git", "-C", self.product, "config", "--local", "core.hooksPath",
+                 str(shared)])
+        return shared
+
+    def test_start_refuses_a_hook_path_outside_the_clone_and_writes_nothing(self):
+        # The hooks path is an absolute directory that other repositories could share.
+        # The check stage names that path and stops, before the lock and the session,
+        # and nothing is written there or into the clone's own hook place.
+        shared = self.shared_hooks_path()
+        result = self.start()
+        self.assert_refused(result, "hook")
+        self.assertIn(str(shared / "pre-commit"), result.stderr)
+        self.assertFalse(self.lock().exists())
+        self.assertFalse(shared.exists())
+        self.assertFalse(self.default_hook().exists())
+        self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 0)
+
+    def test_start_refuses_a_hook_path_outside_the_clone_also_without_the_row(self):
+        # With no row terms the launch would write no hook, but the check stage still
+        # refuses the outside path at every start, as it refuses another hook.
+        self.set_terms_row(False)
+        shared = self.shared_hooks_path()
+        shared.mkdir()
+        result = self.start()
+        self.assert_refused(result, "hook")
+        self.assertIn(str(shared / "pre-commit"), result.stderr)
+        self.assertFalse(self.lock().exists())
+        self.assertEqual(list(shared.iterdir()), [])
+
     def test_start_leaves_a_hook_path_that_the_product_tracks(self):
         # The product keeps its own pre-commit hook in its tree: jig start neither
         # refuses it nor writes over it, and adds no exclude line for it.
