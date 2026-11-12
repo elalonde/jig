@@ -299,6 +299,55 @@ class LedgerTest(TraceCase):
                    ledger_note(commit, "later.py", "<fill>"))
         self.assert_fails_with(f"trace/ledger/{commit}.md: a rules cell still holds <fill>")
 
+    def commit_with_subject(self, name, subject):
+        """Add one product file in a commit with this subject and return its hash."""
+        self.write(self.product / name, "x = 1\n")
+        for command in (["add", "-A"], ["commit", "-q", "--no-verify", "-m", subject]):
+            git_ok(self.env(), "-C", self.product, *command)
+        return self.head()
+
+    def test_release_commit_at_head_needs_no_ledger_entry(self):
+        # The release run has just made its commit on top of the import; nobody can
+        # have written its note yet, and the check passes without it.
+        self.map_to_head()
+        self.commit_with_subject("version.py", "Release 1.4.0")
+        self.assert_passes()
+
+    def test_release_commit_with_a_later_commit_needs_its_entry(self):
+        # A commit follows the release commit and has its own note; the release
+        # commit is no longer HEAD, so its missing note is the one failure.
+        self.map_to_head()
+        release = self.commit_with_subject("version.py", "Release 1.4.0")
+        later = self.commit("later.py")
+        self.write(self.dev / f"trace/ledger/{later}.md", ledger_note(later, "later.py", "none"))
+        self.assert_fails_with(f"trace/ledger/{release}.md: no ledger entry for the product "
+                               f"commit {release}")
+
+    def test_release_commit_with_a_later_commit_and_both_entries_passes(self):
+        # The first unit after the release wrote the release commit's note too.
+        self.map_to_head()
+        release = self.commit_with_subject("version.py", "Release 1.4.0")
+        later = self.commit("later.py")
+        for commit, name in ((release, "version.py"), (later, "later.py")):
+            self.write(self.dev / f"trace/ledger/{commit}.md", ledger_note(commit, name, "none"))
+        self.assert_passes()
+
+    def test_release_subject_below_head_is_checked_like_any_commit(self):
+        # Two commits carry release subjects; only HEAD is exempt, so the earlier
+        # one without a note fails.
+        self.map_to_head()
+        first = self.commit_with_subject("one.py", "Release 1.4.0")
+        self.commit_with_subject("two.py", "Release 1.4.1")
+        self.assert_fails_with(f"trace/ledger/{first}.md: no ledger entry for the product "
+                               f"commit {first}")
+
+    def test_head_whose_subject_only_starts_like_a_release_needs_its_entry(self):
+        # A subject with words after the version is not the release commit's subject.
+        self.map_to_head()
+        commit = self.commit_with_subject("notes.py", "Release 1.4.0 notes")
+        self.assert_fails_with(f"trace/ledger/{commit}.md: no ledger entry for the product "
+                               f"commit {commit}")
+
     def test_commit_map_of_another_form_fails_with_one_line(self):
         # A row with a short hash is not the form, and one line says so.
         self.write(self.dev / "trace/commit-map.tsv",

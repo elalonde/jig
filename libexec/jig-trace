@@ -24,7 +24,10 @@ check makes sure that tie still holds:
   trace/commit-map.tsv lists, for each commit that a history rewrite replaced,
   the commit that took its place, and the import is the newest of those; a
   commit that the rewrite dropped has no new hash and takes no part in finding
-  the import;
+  the import. HEAD itself needs no note when its subject is "Release <X.Y.Z>":
+  jig release prepare makes that commit and runs this check on it in the same
+  run, so nobody could have written its note yet. Once a later commit exists, the
+  release commit needs its note like every other commit;
 - the ID map specs/id-map.tsv, when present, has its form, and while
   trace/pre-import names the commit from before the product's IDs moved into the
   trace, every ID of that commit's tree is carried. Only the files that are still
@@ -93,6 +96,8 @@ import lint_a  # noqa: E402
 from jig_trace import FormError  # noqa: E402
 
 FILL = "<fill>"
+# The subject of the commit that jig release prepare makes.
+RELEASE_SUBJECT = re.compile(r"Release [0-9]+\.[0-9]+\.[0-9]+")
 # The attributes that make git name Python and bash functions in hunk headers.
 DIFF_ATTRIBUTES = pathlib.Path(ROOT) / "share" / "trace-diff.gitattributes"
 USAGE = "jig trace check | coverage | gen <product path> ... | form <commit>"
@@ -193,8 +198,13 @@ def check_ledger(dev, product):
     if listed.returncode != 0:
         return [f"trace/commit-map.tsv: git cannot list the commits after {start}: "
                 f"{listed.stderr.strip()}"]
+    # The release commit at HEAD cannot have its note yet: the release run that
+    # made the commit is the run that checks it.
+    release = release_head(product)
     failures = []
     for commit in listed.stdout.split():
+        if commit == release:
+            continue
         note = dev / "trace" / "ledger" / f"{commit}.md"
         if not note.is_file():
             failures.append(f"trace/ledger/{commit}.md: no ledger entry for the product "
@@ -202,6 +212,15 @@ def check_ledger(dev, product):
         elif FILL in note.read_text(encoding="utf-8", errors="replace"):
             failures.append(f"trace/ledger/{commit}.md: a rules cell still holds {FILL}")
     return failures
+
+
+def release_head(product):
+    """The full hash of HEAD when it is the commit jig release prepare makes, else None."""
+    shown = jig_trace.git(product, "log", "-1", "--format=%H %s", "HEAD")
+    if shown.returncode != 0:
+        return None
+    commit, _, subject = shown.stdout.strip().partition(" ")
+    return commit if RELEASE_SUBJECT.fullmatch(subject) else None
 
 
 def read_id_map(dev):
