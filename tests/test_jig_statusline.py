@@ -440,6 +440,25 @@ class LinesTest(StatuslineTestCase):
         for stdin in ("not json", "", "[1, 2]", "\"text\""):
             self.assertEqual(self.statusline(stdin), f"{USER} · no git · ?\n", stdin)
 
+    def test_model_or_workspace_that_is_not_an_object_counts_as_absent(self):
+        # A model or a workspace given as a string, as a later form of the input
+        # might, must not cost the status line: line 1 shows "?" for the model name
+        # and the run still exits 0.
+        for data in ({"model": "Opus"}, {"model": "Opus", "workspace": "/tmp"},
+                     {"model": ["Opus"], "workspace": 3}):
+            self.assertEqual(self.statusline(data), f"{USER} · no git · ?\n", data)
+
+    def test_reset_time_that_is_not_a_finite_clock_time_still_gives_both_lines(self):
+        # A five-hour reset time that is infinite, not a number, or beyond the
+        # clock's range is an unknown reset time: both lines still print, and the
+        # five-hour part keeps its percentage without the time left and the clock.
+        for resets_at in (float("inf"), float("-inf"), float("nan"), 10 ** 30):
+            data = sample(now=self.now)
+            data["rate_limits"]["five_hour"]["resets_at"] = resets_at
+            self.assertEqual(self.statusline(data),
+                             f"{USER} · no git · Opus\n5h 24% · wk 41% · pace behind\n",
+                             resets_at)
+
     def test_branch_and_role_from_the_policy(self):
         repo = self.git_repo("ref: refs/heads/feature/x\n")
         self.write_policy("Opus", role="reviewer", cwd=repo)

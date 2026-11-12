@@ -140,9 +140,26 @@ def hours_minutes(minutes: int) -> str:
     return f"{minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
 
 
+def clock_time(resets_at) -> float | None:
+    """Return resets_at when the local clock can show it; None when it cannot.
+
+    A value that is not a number, not finite, or out of the clock's range would
+    raise in the arithmetic or in time.localtime(), and an error there would cost
+    the whole status line, so such a value counts as an unknown reset time.
+    """
+    if not isinstance(resets_at, (int, float)):
+        return None
+    try:
+        time.localtime(resets_at)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return resets_at
+
+
 def time_left(resets_at, now: float) -> str:
     """Return the time until resets_at as hours and minutes; "" when unknown."""
-    if not isinstance(resets_at, (int, float)):
+    resets_at = clock_time(resets_at)
+    if resets_at is None:
         return ""
     return hours_minutes(max(0, int(resets_at - now)) // 60)
 
@@ -158,7 +175,8 @@ def run_time(data: dict) -> str:
 
 def reset_clock(resets_at) -> str:
     """Return the local time of resets_at on a 12-hour clock with the zone; "" when unknown."""
-    if not isinstance(resets_at, (int, float)):
+    resets_at = clock_time(resets_at)
+    if resets_at is None:
         return ""
     return time.strftime("%I:%M%p %Z", time.localtime(resets_at))
 
@@ -254,9 +272,16 @@ def valid_rule(r) -> bool:
             and isinstance(expect, list) and bool(expect) and all(isinstance(e, str) for e in expect))
 
 
+def workspace_dir(data: dict):
+    """Return workspace.current_dir; None when the workspace is not an object."""
+    workspace = data.get("workspace")
+    return workspace.get("current_dir") if isinstance(workspace, dict) else None
+
+
 def model_name(data: dict) -> str:
     """Return the model's display name with the effort attached, as line 1 ends."""
-    model = (data.get("model") or {}).get("display_name") or "?"
+    model = data.get("model")
+    model = (model.get("display_name") if isinstance(model, dict) else None) or "?"
     effort = data.get("effort")
     if isinstance(effort, dict):
         effort = effort.get("level")
@@ -276,7 +301,7 @@ def model_policy(data: dict, path: str, user: str) -> tuple[str, str]:
         return "", ""  # no policy, or a parse error
     if not isinstance(rules, list) or not all(valid_rule(r) for r in rules):
         return "", ""  # an invalid rule makes the file invalid
-    cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir")
+    cwd = data.get("cwd") or workspace_dir(data)
     if not isinstance(cwd, str):
         return "", ""
     cwd = os.path.realpath(cwd)
@@ -465,7 +490,7 @@ def main() -> None:
             line, usage = render(data, now, read_usage(path))
             if usage is not None:
                 write_usage(path, usage)
-    except OSError:
+    except (OSError, ValueError, OverflowError):
         pass  # the status line matters more than the file
     if line is None:
         line, _ = render(data, now)
@@ -476,7 +501,7 @@ def main() -> None:
     policy = paths["MODEL_POLICY"]
     role, warning = model_policy(data, policy, user) if user and policy else ("", "")
     model = model_name(data)
-    cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir")
+    cwd = data.get("cwd") or workspace_dir(data)
     branch = git_branch(os.path.realpath(cwd)) if isinstance(cwd, str) else "no git"
     print(identity(user, role, branch, model))
     h = health(paths["HEALTH_FILE"], now) if paths["HEALTH_FILE"] else ""
