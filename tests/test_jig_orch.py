@@ -1,8 +1,10 @@
-"""jig orch: the supervisor loop, its announcements, the report lines, the delivery and
-the dialog report.
+"""jig orch: the supervisor loop, its event file and the watcher that reads it, the
+announcements, the report lines, the delivery of jig send and the dialog report.
 
 Each test runs a private tmux server (tmux -L with a name of its own, through a tmux
-first on PATH) and a double for claude. The tests of the report lines add an origin repo
+first on PATH) and a double for claude. The tmux on PATH notes each send-keys call, so
+that a test can show that no event was typed into the session, and keeps a copy of the
+event file as it was when each session was made. The tests of the report lines add an origin repo
 that the project's clone was cloned from, and a second clone that pushes the commits a
 unit would push. The double for claude is CLAUDE_DOUBLE from tests/support.py, which
 jig send's tests share.
@@ -17,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -38,14 +41,21 @@ TEMPLATE = ROOT / "templates" / "project.conf"
 PROJECT = "demo"
 SESSION = f"{PROJECT}-orch"
 POLL = "0.3"
-# The input box must stay empty and still this long before the loop types a line, and
-# the loop looks at it this often; the tests of that wait set a longer quiet time.
-QUIET = "0.3"
-BOX_CHECK = "0.1"
 REPORT_POLL = "1"
 BRANCH = "master"
 STANDING = "You are the orchestrator of demo.\nRead state.md first.\n"
 SOCKETS = itertools.count(1)
+
+# A tmux that runs the real one on the test's own server. It notes each send-keys call,
+# and, as a session is made, copies the event file as it is at that moment.
+TMUX_DOUBLE = '''#!/bin/bash
+if [ "$1" = send-keys ]; then printf '%s\\n' "$*" >> "$HOME/tmux-send-keys"; fi
+if [ "$1" = new-session ]; then
+    cat "$HOME/ws/reviews/demo/orch/events.log" >> "$HOME/events-at-new-session" 2>/dev/null
+    echo "--" >> "$HOME/events-at-new-session"
+fi
+exec @TMUX@ -L @SOCKET@ "$@"
+'''
 
 # A git that passes every call to the real one, except the loop's fetch while a flag file
 # in HOME asks it to hang or to fail.
@@ -67,7 +77,8 @@ class OrchTestCase(TempTestCase):
         self.bin_dir = self.tmp / "bin"
         self.bin_dir.mkdir()
         self.socket = f"jig-orch-test-{os.getpid()}-{next(SOCKETS)}"
-        self.script("tmux", f'#!/bin/bash\nexec {shutil.which("tmux")} -L {self.socket} "$@"\n')
+        self.script("tmux", TMUX_DOUBLE.replace("@TMUX@", shutil.which("tmux"))
+                    .replace("@SOCKET@", self.socket))
         self.script("claude", CLAUDE_DOUBLE)
         self.srv = self.tmp / "srv"
         for part in ("in", "out", "blocks"):
@@ -96,8 +107,6 @@ class OrchTestCase(TempTestCase):
     def base_env(self):
         return self.env(PATH=f"{self.bin_dir}:{os.environ['PATH']}", JIG_SRV=str(self.srv),
                         JIG_ORCH_POLL=POLL,
-                        JIG_ORCH_QUIET=getattr(self, "quiet", QUIET),
-                        JIG_ORCH_BOX_CHECK=BOX_CHECK,
                         JIG_ORCH_REPORT_POLL=getattr(self, "report_poll", REPORT_POLL),
                         JIG_ORCH_HOURLY=getattr(self, "hourly", "3600"),
                         JIG_ORCH_FORK_WINDOW=getattr(self, "fork_window", "60"))
@@ -151,6 +160,24 @@ class OrchTestCase(TempTestCase):
     def submitted(self):
         return self.read(self.home / "claude-submitted").splitlines()
 
+    def event_file(self):
+        return self.reviews / "orch" / "events.log"
+
+    def event_lines(self):
+        """Return every line of the event file, the start lines with them."""
+        return self.read(self.event_file()).splitlines()
+
+    def events(self):
+        """Return the events in the event file, without the start lines."""
+        return [line for line in self.event_lines() if not line.startswith("start ")]
+
+    def keys_sent(self):
+        return self.read(self.home / "tmux-send-keys").splitlines()
+
+    def session_ids(self):
+        """Return the Claude Code session ID of each start of the double, oldest first."""
+        return [call["argv"][call["argv"].index("--session-id") + 1] for call in self.calls()]
+
     def screen(self, session=SESSION):
         return self.tmux("capture-pane", "-p", "-t", f"={session}:").stdout
 
@@ -161,7 +188,7 @@ class OrchTestCase(TempTestCase):
         return "auto mode on" in self.screen(session)
 
     def inbox_line(self, path):
-        """Return the line the loop sends for the inbox file as it is now."""
+        """Return the line the loop appends for the inbox file as it is now."""
         data = path.read_bytes()
         return f"inbox: {path} ({len(data)}, sha256 {hashlib.sha256(data).hexdigest()[:8]})"
 
@@ -246,6 +273,15 @@ class TestStart(OrchTestCase):
         self.assertEqual(len(transcripts), 1)
 
 
+    def test_start_makes_the_directory_of_the_loop_when_it_is_missing(self):
+        # The account has no review directory for the project yet. The start makes it,
+        # with orch/ inside, and the event file there gets the session's start line.
+        shutil.rmtree(self.reviews)
+        self.start()
+        self.assertTrue((self.reviews / "orch").is_dir())
+        self.assertEqual(self.event_lines(), [f"start {self.session_ids()[0]}"])
+
+
 class TestAnnouncements(OrchTestCase):
     def test_new_inbox_file_is_announced_within_a_minute_with_bytes_and_hash(self):
         old = self.srv / "in" / PROJECT / "old.md"
@@ -256,31 +292,31 @@ class TestAnnouncements(OrchTestCase):
         new.write_bytes(data)
         line = f"inbox: {new} ({len(data)}, sha256 {hashlib.sha256(data).hexdigest()[:8]})"
         began = time.monotonic()
-        self.until(lambda: line in self.submitted(), seconds=60, what="the inbox line")
+        self.until(lambda: line in self.events(), seconds=60, what="the inbox line")
         self.assertLess(time.monotonic() - began, 60)
         time.sleep(4 * float(POLL))
-        self.assertEqual(self.submitted(), [line], "old.md was announced, or a line twice")
+        self.assertEqual(self.events(), [line], "old.md was announced, or a line twice")
 
     def test_new_readback_is_announced(self):
         self.start()
         (self.srv / "out" / PROJECT / "b7k2.txt").write_text("exit 0\n", encoding="utf-8")
-        self.until(lambda: "readback: b7k2" in self.submitted(), seconds=60,
+        self.until(lambda: "readback: b7k2" in self.events(), seconds=60,
                    what="the readback line")
 
     def test_file_that_lands_while_no_loop_runs_is_announced_at_the_next_start(self):
         self.start()
         first = self.srv / "out" / PROJECT / "b1.txt"
         first.write_text("exit 0\n", encoding="utf-8")
-        self.until(lambda: "readback: b1" in self.submitted(), seconds=60,
+        self.until(lambda: "readback: b1" in self.events(), seconds=60,
                    what="the first readback line")
         self.assertEqual(self.orch("stop").returncode, 0, self.log())
         self.until(lambda: not self.alive(), what="the end of the session")
         (self.srv / "out" / PROJECT / "b2.txt").write_text("exit 0\n", encoding="utf-8")
         self.start()
-        self.until(lambda: "readback: b2" in self.submitted(), seconds=60,
+        self.until(lambda: "readback: b2" in self.events(), seconds=60,
                    what="the readback that came while no loop ran")
         time.sleep(4 * float(POLL))
-        lines = [line for line in self.submitted() if line.startswith("readback:")]
+        lines = [line for line in self.events() if line.startswith("readback:")]
         self.assertEqual(lines, ["readback: b1", "readback: b2"])
 
     def test_readback_of_a_block_that_pauses_is_announced_once_when_complete(self):
@@ -294,13 +330,13 @@ class TestAnnouncements(OrchTestCase):
                                    stderr=subprocess.DEVNULL)
         self.addCleanup(running.kill)
         while running.poll() is None:
-            self.assertNotIn("readback: b9", self.submitted(), "announced while the block ran")
+            self.assertNotIn("readback: b9", self.events(), "announced while the block ran")
             time.sleep(0.1)
         self.assertEqual(running.returncode, 0)
-        self.until(lambda: "readback: b9" in self.submitted(), seconds=60,
+        self.until(lambda: "readback: b9" in self.events(), seconds=60,
                    what="the readback line")
         time.sleep(4 * float(POLL))
-        lines = [line for line in self.submitted() if line.startswith("readback:")]
+        lines = [line for line in self.events() if line.startswith("readback:")]
         self.assertEqual(lines, ["readback: b9"])
         readback = self.srv / "out" / PROJECT / "b9.txt"
         self.assertEqual(readback.read_text(encoding="utf-8"), "start\nend\n")
@@ -314,10 +350,10 @@ class TestAnnouncements(OrchTestCase):
                 stream.write(b"more\n")
                 stream.flush()
                 time.sleep(float(POLL) * 0.6)
-        self.until(lambda: any("growing.log" in line for line in self.submitted()),
+        self.until(lambda: any("growing.log" in line for line in self.events()),
                    seconds=60, what="the line for growing.log")
         time.sleep(4 * float(POLL))
-        lines = [line for line in self.submitted() if "growing.log" in line]
+        lines = [line for line in self.events() if "growing.log" in line]
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("(50, sha256 ", lines[0])
 
@@ -328,7 +364,7 @@ class TestAnnouncements(OrchTestCase):
         self.start()
         readback = self.srv / "out" / PROJECT / "b1.txt"
         readback.write_text("exit 1\n", encoding="utf-8")
-        count = lambda: self.submitted().count("readback: b1")  # noqa: E731
+        count = lambda: self.events().count("readback: b1")  # noqa: E731
         self.until(lambda: count() == 1, seconds=30, what="the first readback line")
         first = readback.stat()
         # Written again as jig run writes it, to a hidden file renamed over the old one.
@@ -350,24 +386,24 @@ class TestAnnouncements(OrchTestCase):
         self.assertEqual(count(), 3)
 
     def test_inbox_file_that_grew_gets_a_second_line(self):
-        # A file that grows after its line was sent is announced again with its new size
+        # A file that grows after its line was appended is announced again with its new size
         # and hash, so the orchestrator reads the part that came late.
         self.start()
         path = self.srv / "in" / PROJECT / "note.md"
         path.write_bytes(b"first part\n")
         first = self.inbox_line(path)
-        self.until(lambda: first in self.submitted(), seconds=30, what="the first line")
+        self.until(lambda: first in self.events(), seconds=30, what="the first line")
         with open(path, "ab") as stream:
             stream.write(b"second part\n")
         second = self.inbox_line(path)
-        self.until(lambda: second in self.submitted(), seconds=30, what="the second line")
+        self.until(lambda: second in self.events(), seconds=30, what="the second line")
         time.sleep(4 * float(POLL))
-        self.assertEqual([line for line in self.submitted() if "note.md" in line],
+        self.assertEqual([line for line in self.events() if "note.md" in line],
                          [first, second])
 
     def test_old_record_of_paths_announces_nothing_again(self):
         # A record from before inodes were kept lists paths alone. The files at those
-        # paths count as announced, so the first start after the upgrade sends only the
+        # paths count as announced, so the first start after the upgrade appends only the
         # line of a file that is really new, and the record is rewritten in the new form.
         inbox = self.srv / "in" / PROJECT / "old.md"
         inbox.write_text("announced before the upgrade\n", encoding="utf-8")
@@ -381,8 +417,8 @@ class TestAnnouncements(OrchTestCase):
         new.write_bytes(b"new\n")
         line = self.inbox_line(new)
         # Had old.md or b1.txt counted as new, its line would have come first.
-        self.until(lambda: line in self.submitted(), seconds=30, what="the line for new.md")
-        self.assertEqual(self.submitted(), [line])
+        self.until(lambda: line in self.events(), seconds=30, what="the line for new.md")
+        self.assertEqual(self.events(), [line])
         lines = record.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 3, lines)
         for entry in lines:
@@ -541,6 +577,81 @@ class TestRestart(OrchTestCase):
         self.assertEqual(len(self.calls()), 3)
 
 
+class TestEventFile(OrchTestCase):
+    def test_start_line_goes_into_the_event_file_before_the_session_starts(self):
+        # Each start of a session, the first and the one after the session was killed,
+        # appends "start <ID>" with the ID that the loop gives Claude Code. Each line is
+        # in the file already when the tmux session is made.
+        self.start()
+        self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+        self.until(lambda: len(self.calls()) == 2, what="the restart")
+        self.until(self.ready, what="the restarted session's input bar")
+        first, second = self.session_ids()
+        self.assertEqual(self.event_lines(), [f"start {first}", f"start {second}"])
+        made = self.read(self.home / "events-at-new-session").split("--\n")
+        self.assertEqual(made[:2], [f"start {first}\n", f"start {first}\nstart {second}\n"])
+
+    def test_restart_leaves_the_old_events_between_the_last_two_start_lines(self):
+        # An inbox file lands while the first session runs, the session is killed and
+        # started again, and a readback lands after that. The once-read of the watcher
+        # gives the inbox line, the events of the old session, and the follow read
+        # starts with the readback line.
+        self.start()
+        path = self.srv / "in" / PROJECT / "note.md"
+        path.write_text("hello\n", encoding="utf-8")
+        inbox = self.inbox_line(path)
+        self.until(lambda: self.events() == [inbox], what="the inbox line")
+        self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+        self.until(lambda: len(self.calls()) == 2, what="the restart")
+        (self.srv / "out" / PROJECT / "b1.txt").write_text("exit 0\n", encoding="utf-8")
+        self.until(lambda: "readback: b1" in self.events(), what="the readback line")
+        first, second = self.session_ids()
+        self.assertEqual(self.event_lines(),
+                         [f"start {first}", inbox, f"start {second}", "readback: b1"])
+        old = self.orch("events", "--old")
+        self.assertEqual((old.returncode, old.stdout), (0, f"{inbox}\n"))
+        watcher = start_watcher(self, self.base_env())
+        self.assertEqual(read_line(watcher.stdout, 5), b"readback: b1\n")
+
+    def test_no_event_is_typed_into_the_session(self):
+        # An inbox file and a readback land while the session waits at an empty input
+        # box. Both lines go into the event file, and tmux gets no send-keys call, so
+        # the box stays empty and the session submits nothing.
+        self.start()
+        path = self.srv / "in" / PROJECT / "note.md"
+        path.write_text("hello\n", encoding="utf-8")
+        (self.srv / "out" / PROJECT / "b1.txt").write_text("exit 0\n", encoding="utf-8")
+        self.until(lambda: len(self.events()) == 2, what="both lines")
+        time.sleep(6 * float(POLL))
+        self.assertEqual(sorted(self.events()), sorted([self.inbox_line(path), "readback: b1"]))
+        self.assertEqual(self.keys_sent(), [])
+        self.assertEqual(self.submitted(), [])
+        # The double draws the box between two rules; an empty box holds only its mark.
+        self.assertRegex(self.screen(), f"{'─' * 60}\n> ?\n{'─' * 60}")
+
+    def test_append_that_fails_is_logged_once_and_tried_again_in_order(self):
+        # The event file cannot be written: a directory stands at its path. Two inbox
+        # files land; the loop logs the failure once, to the tee and its log, and holds
+        # both lines. Once the directory is gone, both lines arrive, in the order the
+        # files came, each once.
+        self.start()
+        self.event_file().unlink()
+        self.event_file().mkdir()
+        first = self.srv / "in" / PROJECT / "first.md"
+        first.write_text("one\n", encoding="utf-8")
+        self.until(lambda: "cannot append" in self.log(), what="the failure")
+        second = self.srv / "in" / PROJECT / "second.md"
+        second.write_text("two\n", encoding="utf-8")
+        time.sleep(6 * float(POLL))
+        self.assertEqual(self.log().count("cannot append"), 1, self.log())
+        self.assertIn("cannot append", self.tee())
+        self.event_file().rmdir()
+        lines = [self.inbox_line(first), self.inbox_line(second)]
+        self.until(lambda: self.events() == lines, what="both lines after the failure")
+        time.sleep(4 * float(POLL))
+        self.assertEqual(self.event_lines(), lines)
+
+
 # A process that only waits; the arguments after the code are what the loop reads.
 WAITER = [sys.executable, "-c", "import time; time.sleep(120)"]
 
@@ -655,7 +766,10 @@ class TestResumes(unittest.TestCase):
 
 
 class TestDialog(OrchTestCase):
-    def test_dialog_is_reported_at_once_and_not_answered(self):
+    def test_dialog_is_reported_at_once_and_events_are_still_appended(self):
+        # The session shows a dialog. The loop reports it once, to the tee and its log,
+        # within a few polls, and answers nothing. An inbox file that lands meanwhile
+        # still gets its line in the event file, and no key reaches the session.
         self.start()
         (self.home / "claude-dialog").write_text("", encoding="utf-8")
         began = time.monotonic()
@@ -663,15 +777,15 @@ class TestDialog(OrchTestCase):
         self.until(lambda: report in self.tee(), seconds=10, what="the dialog report")
         self.assertLess(time.monotonic() - began, 3 * float(POLL) + 2)
         self.assertIn(report, self.log())
-        # While the dialog lasts, an announcement waits and no key reaches the session.
-        (self.srv / "in" / PROJECT / "note.md").write_text("hello\n", encoding="utf-8")
+        path = self.srv / "in" / PROJECT / "note.md"
+        path.write_text("hello\n", encoding="utf-8")
+        self.until(lambda: self.events() == [self.inbox_line(path)],
+                   what="the inbox line while the dialog shows")
         time.sleep(6 * float(POLL))
         self.assertFalse((self.home / "claude-answered").exists())
         self.assertEqual(self.submitted(), [])
+        self.assertEqual(self.keys_sent(), [])
         self.assertEqual(self.log().count(report), 1, "the dialog was reported twice")
-        (self.home / "claude-dialog").unlink()
-        self.until(lambda: any("note.md" in line for line in self.submitted()),
-                   what="the announcement after the dialog")
 
 
 class ReportTestCase(OrchTestCase):
@@ -724,7 +838,7 @@ class ReportTestCase(OrchTestCase):
         return f"{int(time.time()) - 3600} +0000"
 
     def reports(self):
-        return [line for line in self.submitted() if line.startswith("report:")]
+        return [line for line in self.events() if line.startswith("report:")]
 
     def watched(self):
         """Return the commit that the loop's own ref names in the clone, or ""."""
@@ -744,14 +858,14 @@ class ReportTestCase(OrchTestCase):
 class TestReportLines(ReportTestCase):
     def test_log_commit_gives_one_report_line_with_its_status(self):
         # A unit's last commit reaches origin: one line names the unit and its status,
-        # and grep finds it exactly once in what the session received.
+        # and grep finds it exactly once in the event file.
         self.start()
         self.push_log("a1", "OK: the tool and its test")
-        self.until(lambda: "report: a1 OK" in self.submitted(), seconds=30,
+        self.until(lambda: "report: a1 OK" in self.events(), seconds=30,
                    what="the report line")
         self.settle()
-        found = run(["grep", "-c", "-x", "report: a1 OK", self.home / "claude-submitted"])
-        self.assertEqual(found.stdout.strip(), "1", self.submitted())
+        found = run(["grep", "-c", "-x", "report: a1 OK", self.event_file()])
+        self.assertEqual(found.stdout.strip(), "1", self.events())
 
     def test_needs_eric_report_gives_the_status_needs_eric(self):
         # The status is the text before the first colon, so the reason stays out of it.
@@ -782,7 +896,7 @@ class TestReportLines(ReportTestCase):
                    what="the line for a2")
         self.assertEqual(self.reports(), ["report: a1 OK", "report: a2 OK"])
 
-    def test_restart_of_the_loop_sends_no_report_line_twice(self):
+    def test_restart_of_the_loop_appends_no_report_line_twice(self):
         # A report announced by one loop is not announced by the next, and a report that
         # lands while no loop runs is announced at the next start.
         self.start()
@@ -806,7 +920,7 @@ class TestReportLines(ReportTestCase):
         self.until(lambda: "report: a2 OK" in self.reports(), seconds=30,
                    what="the line for a2")
         self.assertEqual(self.reports(), ["report: a2 OK"])
-        # The loop writes the record after it sends the line, so wait for it too.
+        # The loop writes the record after it appends the line, so wait for it too.
         self.until(lambda: sorted(self.read(self.record).split()) == sorted([old, new]),
                    what="both commits in the record")
 
@@ -833,209 +947,46 @@ class TestReportLines(ReportTestCase):
         self.assertEqual(self.reports(), ["report: a2 OK"])
         self.assertIn("works again", self.log())
 
-    def test_dialog_holds_a_report_line_back(self):
-        # While a dialog shows, the loop has fetched the report but sends nothing; the
-        # line goes out once the dialog is gone.
+    def test_report_line_is_appended_while_a_dialog_shows(self):
+        # A unit reports while the session shows a dialog: the report line still goes
+        # into the event file, and nothing answers the dialog.
         self.start()
         (self.home / "claude-dialog").write_text("", encoding="utf-8")
         self.until(lambda: "dialog: session" in self.tee(), seconds=10,
                    what="the dialog report")
-        commit = self.push_log("a1", "OK")
-        self.until(lambda: self.watched() == commit, seconds=30, what="the fetch of a1")
-        time.sleep(6 * float(POLL))
-        self.assertEqual(self.submitted(), [])
-        self.assertFalse((self.home / "claude-answered").exists())
-        (self.home / "claude-dialog").unlink()
+        self.push_log("a1", "OK")
         self.until(lambda: self.reports() == ["report: a1 OK"], seconds=30,
-                   what="the line after the dialog")
+                   what="the report line while the dialog shows")
+        self.assertFalse((self.home / "claude-answered").exists())
+        self.assertEqual(self.keys_sent(), [])
 
 
-RULE = "─" * 60
-BAR = "  ⏵⏵ auto mode on (shift+tab to cycle)"
-# What Claude Code draws in an empty box by itself: a placeholder, faint, and a
-# suggested prompt, in a grey of the 256 colours. Each has the cursor, in inverse video,
-# on its first character.
-PLACEHOLDER = '\x1b[7mT\x1b[27m\x1b[2mry "write a test for the parser"\x1b[22m'
-SUGGESTION = "\x1b[7mr\x1b[27m\x1b[38;5;246mun the tests again\x1b[39m"
 
-
-def drawn_screen(box):
-    return "\n".join(["● ready", "", RULE, "> " + box, RULE, BAR]) + "\n"
-
-
-class TestBoxIsEmpty(unittest.TestCase):
-    """box_is_empty() tells what a person typed from what Claude Code draws by itself."""
-
-    def empty(self, box):
-        return jig_tmux.box_is_empty(jig_tmux.drawn_box(drawn_screen(box)))
-
-    def test_placeholder_and_suggestion_are_not_typed_text(self):
-        # Faint or grey text after the cursor is the harness's own; the box is empty.
-        self.assertTrue(self.empty(""))
-        self.assertTrue(self.empty(PLACEHOLDER))
-        self.assertTrue(self.empty(SUGGESTION))
-        self.assertTrue(self.empty("\x1b[90mor this\x1b[39m"))
-        self.assertTrue(self.empty("\x1b[38;2;153;153;153mor this\x1b[39m"))
-
-    def test_typed_text_in_the_terminal_colour_is_typed(self):
-        # Text in the terminal's own colour is typed, also with the cursor on it, after
-        # it, or before a grey completion; a pasted marker is typed however it is drawn.
-        self.assertFalse(self.empty("draft"))
-        self.assertFalse(self.empty("\x1b[7md\x1b[27m"))
-        self.assertFalse(self.empty("dr\x1b[7m \x1b[27m"))
-        self.assertFalse(self.empty("fi\x1b[7mx\x1b[27m\x1b[2m the tests\x1b[22m"))
-        self.assertFalse(self.empty("\x1b[2m[Pasted text #1 +40 lines]\x1b[22m"))
-        self.assertFalse(self.empty("\x1b[31mred\x1b[39m"))
-
-    def test_shell_mark_is_typed_and_a_screen_without_a_box_has_none(self):
-        # "!" puts the box into shell mode, which a person did; a screen without the
-        # input bar or without two rules has no box to call empty.
-        self.assertFalse(jig_tmux.box_is_empty(["! "]))
-        self.assertIsNone(jig_tmux.drawn_box("● ready\n"))
-        self.assertIsNone(jig_tmux.drawn_box(DIALOG_SCREEN))
-        self.assertIsNone(jig_tmux.drawn_box("● ready\n> \n" + BAR + "\n"))
-
-
-class TestQuietBox(OrchTestCase):
-    """The loop types a line only into an empty input box that has not changed for the
-    quiet time, here 1 s instead of 10, looked at every 0.1 s."""
-
-    quiet = "1"
-
-    def keys(self, *keys):
-        self.tmux("send-keys", "-t", f"={SESSION}:", *keys)
-
-    def inbox(self, name):
-        path = self.srv / "in" / PROJECT / name
-        path.write_text(f"{name} for the orchestrator\n", encoding="utf-8")
-        return self.inbox_line(path)
-
-    def box(self):
-        return [line for line in self.screen().splitlines() if line.startswith("> ")][-1]
-
-    def test_line_waits_while_the_box_holds_typed_text(self):
-        # A person has typed a draft and left it there. The inbox line is held, logged
-        # once, and the draft stays as it was; once the draft is erased, the line goes.
+class TestEventOrder(ReportTestCase):
+    def test_each_kind_of_event_is_one_line_in_the_order_it_came(self):
+        # A reminder is due at the start; then an inbox file, a readback and a unit's
+        # report come one after another, each after the line before it is in the file.
+        # The event file holds the start line and then each event once, in that order,
+        # in the forms the session reads.
+        today = datetime.date.today()
+        (self.clone / "impl" / "orch" / "state.md").write_text(
+            f"## Open\n\n- The login of orchestrator, act by {today}.\n", encoding="utf-8")
         self.start()
-        self.keys("-l", "draft reply")
-        self.until(lambda: self.box() == "> draft reply", what="the typed draft")
-        line = self.inbox("review.md")
-        self.until(lambda: "held until the input box" in self.log(), what="the held line")
-        time.sleep(2 * float(self.quiet))
-        self.assertEqual(self.submitted(), [])
-        self.assertEqual(self.box(), "> draft reply")
-        self.assertEqual(self.log().count("held until the input box"), 1)
-        self.keys(*["BSpace"] * len("draft reply"))
-        self.until(lambda: self.submitted() == [line], what="the inbox line")
-
-    def test_line_waits_until_the_box_has_not_changed_for_the_quiet_time(self):
-        # A person types a character and erases it every 0.4 s for about 2.4 s, so the
-        # box is often empty but never still for 1 s. The line goes only 1 s after the
-        # last change.
-        self.start()
-        self.keys("-l", "x")
-        self.until(lambda: self.box() == "> x", what="the typed character")
-        line = self.inbox("review.md")
-        for index in range(3):
-            time.sleep(0.4)
-            self.keys("BSpace")
-            last = time.monotonic()
-            time.sleep(0.4)
-            self.assertEqual(self.submitted(), [])
-            if index < 2:
-                self.keys("-l", "x")
-        self.until(lambda: self.submitted() == [line], what="the inbox line")
-        self.assertGreaterEqual(time.monotonic() - last, float(self.quiet))
-
-    def assert_goes_into(self, hint, shown):
-        # The empty box shows the harness's hint from the start. A plain capture shows
-        # its text, as if typed; the line still goes, and not before the quiet time.
-        (self.home / "claude-placeholder").write_text(hint, encoding="utf-8")
-        began = time.monotonic()
-        self.start()
-        self.assertEqual(self.box(), "> " + shown)
-        line = self.inbox("review.md")
-        self.until(lambda: self.submitted() == [line], what="the inbox line")
-        self.assertGreaterEqual(time.monotonic() - began, float(self.quiet))
-        self.assertNotIn("held until the input box", self.log())
-
-    def test_line_goes_into_an_empty_box_with_a_placeholder(self):
-        self.assert_goes_into(PLACEHOLDER, 'Try "write a test for the parser"')
-
-    def test_line_goes_into_an_empty_box_with_a_suggested_prompt(self):
-        self.assert_goes_into(SUGGESTION, "run the tests again")
-
-    def test_two_waiting_lines_go_in_the_order_they_came(self):
-        # Two inbox files land while a person's draft is in the box, the second with
-        # the name that sorts first. Both wait, and go in the order they came.
-        self.start()
-        self.keys("-l", "x")
-        self.until(lambda: self.box() == "> x", what="the typed character")
-        first = self.inbox("zeta.md")
-        self.until(lambda: "held until the input box" in self.log(), what="the held line")
-        second = self.inbox("alpha.md")
-        time.sleep(4 * float(POLL))
-        self.assertEqual(self.submitted(), [])
-        self.keys("BSpace")
-        self.until(lambda: len(self.submitted()) == 2, what="both inbox lines")
-        self.assertEqual(self.submitted(), [first, second])
-
-
-class TestDeliveryRetry(TempTestCase):
-    """The queue pass of the loop, with deliver() replaced by a script of results."""
-
-    def supervisor(self, results):
-        module = load_orch()
-        orch = object.__new__(module.Orch)
-        orch.session, orch.stopping, orch.changed = SESSION, False, False
-        orch.log_path = self.tmp / "supervisor.log"
-        orch.tee = self.tmp / "orch.txt"
-        orch.reported_file = self.tmp / "reported"
-        orch.queue, orch.held, orch.pending, orch.reported = [], None, set(), set()
-        # The input box always reads as empty and still, so that only the scripted
-        # results decide.
-        orch.box_ready = lambda: True
-        sent = []
-
-        def deliver(session, line):
-            result = results.pop(0)
-            if result is None:
-                sent.append(line)
-            return result
-
-        patch = mock.patch.object(module.jig_tmux, "deliver", deliver)
-        patch.start()
-        self.addCleanup(patch.stop)
-        return orch, sent
-
-    def test_report_line_for_a_session_in_rollover_arrives_once(self):
-        # At the first poll the session has ended for a rollover, so the delivery fails
-        # before any key is typed; at the next poll the fresh session takes the line.
-        # The line arrives once, waits ahead of a later line, and the report commit is
-        # recorded only after it arrived.
-        orch, sent = self.supervisor([f"session {SESSION} does not exist", None, None])
-        orch.queue = [("report: a1 OK", "c1"), ("inbox: x.png", None)]
-        orch.pending.add("c1")
-        orch.deliver_queue()
-        self.assertEqual(sent, [])
-        self.assertEqual(orch.queue[0], ("report: a1 OK", "c1"))
-        self.assertFalse(orch.reported_file.exists())
-        orch.deliver_queue()
-        self.assertEqual(sent, ["report: a1 OK", "inbox: x.png"])
-        self.assertEqual(orch.queue, [])
-        self.assertEqual(orch.reported_file.read_text(encoding="utf-8"), "c1\n")
-        self.assertEqual(orch.log_path.read_text(encoding="utf-8").count("held"), 1)
-
-    def test_line_typed_before_it_failed_is_not_sent_again(self):
-        # The text reached the box but stayed there after Enter. A second attempt could
-        # send the line twice, so the line is logged to the tee and recorded, not kept.
-        orch, sent = self.supervisor(["the text stayed in the input box after Enter"])
-        orch.queue = [("report: a1 OK", "c1")]
-        orch.deliver_queue()
-        orch.deliver_queue()
-        self.assertEqual(orch.queue, [])
-        self.assertIn("not delivered", orch.tee.read_text(encoding="utf-8"))
-        self.assertEqual(orch.reported_file.read_text(encoding="utf-8"), "c1\n")
+        reminder = f"reminder: The login of orchestrator, act by {today}."
+        self.until(lambda: self.events() == [reminder], what="the reminder")
+        path = self.srv / "in" / PROJECT / "note.md"
+        path.write_text("hello\n", encoding="utf-8")
+        inbox = self.inbox_line(path)
+        self.until(lambda: self.events()[-1:] == [inbox], what="the inbox line")
+        (self.srv / "out" / PROJECT / "b1.txt").write_text("exit 0\n", encoding="utf-8")
+        self.until(lambda: self.events()[-1:] == ["readback: b1"], what="the readback line")
+        self.push_log("a1", "OK: done")
+        self.until(lambda: self.events()[-1:] == ["report: a1 OK"], seconds=30,
+                   what="the report line")
+        self.settle()
+        self.assertEqual(self.orch("stop").returncode, 0, self.log())
+        self.assertEqual(self.event_lines(), [f"start {self.session_ids()[0]}", reminder,
+                                              inbox, "readback: b1", "report: a1 OK"])
 
 
 class TestReportFetch(ReportTestCase):
@@ -1090,11 +1041,181 @@ class TestReportFetch(ReportTestCase):
         path.write_text("hello\n", encoding="utf-8")
         line = self.inbox_line(path)
         timeout = "no answer within 3 s"
-        self.until(lambda: line in self.submitted(), seconds=30, what="the inbox line")
+        self.until(lambda: line in self.events(), seconds=30, what="the inbox line")
         self.assertNotIn(timeout, self.log(), "the line came only after the fetch ended")
         self.until(lambda: timeout in self.log(), seconds=30, what="the end of the fetch")
         time.sleep(float(self.report_poll) + 4 * float(POLL))
         self.assertEqual(self.log().count(timeout), 1, self.log())
+
+
+# What read_line() has read from each pipe beyond the lines it returned.
+READ_AHEAD = {}
+
+
+def start_watcher(test, env):
+    """Start the follow read of the watcher with its output on pipes; the test's
+    cleanup ends it and closes the pipes."""
+    watcher = subprocess.Popen([str(ORCH), PROJECT, "events"], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def end():
+        watcher.kill()
+        watcher.wait()
+        READ_AHEAD.pop(watcher.stdout, None)
+        watcher.stdout.close()
+        watcher.stderr.close()
+
+    test.addCleanup(end)
+    return watcher
+
+
+def read_line(stream, seconds):
+    """Return the next line of a pipe, or b"" when no whole line comes within the time.
+
+    The pipe is read by its descriptor, not through the buffer of the file object: a
+    buffered read can take two lines at once, and select would then not see the second.
+    """
+    descriptor = stream.fileno()
+    held = READ_AHEAD.pop(stream, b"")
+    deadline = time.monotonic() + seconds
+    while b"\n" not in held:
+        left = deadline - time.monotonic()
+        ready, _, _ = select.select([descriptor], [], [], max(left, 0))
+        chunk = os.read(descriptor, 4096) if ready else b""
+        if not chunk:
+            READ_AHEAD[stream] = held
+            return b""
+        held += chunk
+    line, _, rest = held.partition(b"\n")
+    READ_AHEAD[stream] = rest
+    return line + b"\n"
+
+
+class TestWatcher(TempTestCase):
+    """jig orch <project> events, the session's watcher on the event file."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.home / "ws" / "reviews" / PROJECT / "orch" / "events.log"
+        self.path.parent.mkdir(parents=True)
+
+    def write(self, *lines):
+        self.path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+
+    def once(self):
+        result = run([ORCH, PROJECT, "events", "--old"], env=self.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def follow(self):
+        return start_watcher(self, self.env())
+
+    def first_lines(self, watcher, count):
+        return [read_line(watcher.stdout, 5).decode().rstrip("\n") for _ in range(count)]
+
+    def test_once_read_gives_the_events_of_the_session_before_the_newest(self):
+        # With two start lines and more, the lines between the last two; with one, the
+        # lines before it; with none, nothing; with no file, nothing. Each exits 0.
+        self.write("report: a1 OK", "start s1", "inbox: one", "start s2", "readback: b1",
+                   "start s3", "report: a2 OK", "reminder: two", "start s4", "hourly update")
+        self.assertEqual(self.once(), ["report: a2 OK", "reminder: two"])
+        self.write("report: a1 OK", "inbox: one", "start s1", "readback: b1")
+        self.assertEqual(self.once(), ["report: a1 OK", "inbox: one"])
+        self.write("report: a1 OK", "inbox: one")
+        self.assertEqual(self.once(), [])
+        self.path.unlink()
+        self.assertEqual(self.once(), [])
+
+    def test_follow_read_starts_after_the_last_start_line(self):
+        # Two sessions have started; the follow read gives only the lines after the
+        # second start line, then nothing more until a line is appended.
+        self.write("inbox: one", "start s1", "readback: b1", "start s2", "report: a1 OK",
+                   "hourly update")
+        watcher = self.follow()
+        self.assertEqual(self.first_lines(watcher, 2), ["report: a1 OK", "hourly update"])
+        self.assertEqual(read_line(watcher.stdout, 1), b"")
+
+    def test_follow_read_with_one_start_line_and_with_none(self):
+        # One start line: the lines after it. No start line: every line from the top.
+        self.write("inbox: one", "start s1", "readback: b1")
+        self.assertEqual(self.first_lines(self.follow(), 1), ["readback: b1"])
+        self.write("inbox: one", "readback: b1")
+        self.assertEqual(self.first_lines(self.follow(), 2), ["inbox: one", "readback: b1"])
+
+    def test_appended_line_reaches_the_pipe_of_the_running_follow_read(self):
+        # The follow read runs with its output on a pipe, as under the harness tool.
+        # A line appended to the file, a start line of a new session among them, comes
+        # out within a few seconds while the watcher still runs.
+        self.write("start s1")
+        watcher = self.follow()
+        time.sleep(0.5)
+        for line in ("report: a1 OK", "start s2", "inbox: one"):
+            with open(self.path, "a", encoding="utf-8") as stream:
+                stream.write(f"{line}\n")
+            began = time.monotonic()
+            self.assertEqual(read_line(watcher.stdout, 5), f"{line}\n".encode())
+            self.assertLess(time.monotonic() - began, 5)
+        self.assertIsNone(watcher.poll(), "the watcher ended")
+
+    def test_follow_read_waits_for_a_missing_file(self):
+        # No event file exists yet: the watcher reads it as empty, prints nothing and
+        # keeps running. Once the loop writes the file, each of its lines is new and
+        # comes out, the start line too.
+        watcher = self.follow()
+        self.assertEqual(read_line(watcher.stdout, 1), b"")
+        self.assertIsNone(watcher.poll(), "the watcher ended")
+        self.write("start s1", "reminder: one")
+        self.assertEqual(self.first_lines(watcher, 2), ["start s1", "reminder: one"])
+
+    def test_line_still_being_written_comes_out_whole(self):
+        # A line arrives in two writes; the watcher prints it once, whole, after its
+        # newline.
+        self.write("start s1")
+        watcher = self.follow()
+        with open(self.path, "a", encoding="utf-8") as stream:
+            stream.write("report: a1")
+            stream.flush()
+            self.assertEqual(read_line(watcher.stdout, 1), b"")
+            stream.write(" OK\n")
+        self.assertEqual(read_line(watcher.stdout, 5), b"report: a1 OK\n")
+
+    def test_stop_signal_ends_the_follow_read_with_no_error(self):
+        self.write("start s1")
+        watcher = self.follow()
+        time.sleep(0.5)
+        watcher.terminate()
+        self.assertEqual(watcher.wait(timeout=5), 0)
+        self.assertEqual(watcher.stderr.read(), b"")
+
+
+class TestWatcherOfAnEndedSession(OrchTestCase):
+    def test_watcher_ends_when_the_session_that_started_it_ends(self):
+        # A fixture session in tmux starts the watcher as a background process in a
+        # process group of its own, with its output on a pipe, as a harness tool does.
+        # When the tmux session is killed, the watcher ends too, within a few seconds.
+        (self.reviews / "orch").mkdir()
+        self.event_file().write_text("start s1\n", encoding="utf-8")
+        pid_file = self.tmp / "watcher.pid"
+        runner = (f"import subprocess; "
+                  f"w = subprocess.Popen([{str(ORCH)!r}, {PROJECT!r}, 'events'], "
+                  f"stdout=subprocess.PIPE, start_new_session=True); "
+                  f"open({str(pid_file)!r}, 'w').write(str(w.pid)); "
+                  f"[print(line) for line in w.stdout]")
+        self.tmux("new-session", "-d", "-s", "fixture", sys.executable, "-c", runner)
+        self.until(lambda: self.read(pid_file), what="the watcher")
+        pid = int(self.read(pid_file))
+        self.assertTrue(running(pid))
+        self.tmux("kill-session", "-t", "=fixture")
+        self.until(lambda: not running(pid), seconds=5, what="the end of the watcher")
+
+
+def running(pid):
+    """Say whether a process runs; one that has ended but is not yet reaped does not."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            return stream.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
 
 
 # A timestamp as date -Iseconds prints it, which starts every line the loop writes.
@@ -1127,7 +1248,7 @@ class HourlyChecks:
         return int(counted.stdout.strip() or 0)
 
     def hourly_lines(self):
-        return [line for line in self.submitted() if line == "hourly update"]
+        return [line for line in self.events() if line == "hourly update"]
 
     def ticks(self):
         """Return the log's record of each tick, oldest first."""
@@ -1138,10 +1259,10 @@ class HourlyChecks:
 
 
 class TestHourly(HourlyChecks, OrchTestCase):
-    def test_quiet_ticks_write_idle_lines_and_send_nothing(self):
-        # Nothing reaches the session and origin cannot be fetched, so nothing changes.
-        # Each of three ticks appends an idle line that names the orchestrator and the
-        # start of the loop; the session never gets "hourly update"; every line in the
+    def test_quiet_ticks_write_idle_lines_and_append_no_event(self):
+        # No event comes and origin cannot be fetched, so nothing changes. Each of three
+        # ticks appends an idle line that names the orchestrator and the start of the
+        # loop; the event file never gets "hourly update"; every line in the
         # update log and in the loop's log starts with a timestamp.
         before = time.time()
         self.start()
@@ -1165,9 +1286,10 @@ class TestHourly(HourlyChecks, OrchTestCase):
             self.assertRegex(line, rf"^{STAMP} ")
 
     def test_inbox_line_before_a_tick_gives_one_hourly_update_and_no_idle_line(self):
-        # An inbox file reaches the session between two ticks. The next tick queues
-        # "hourly update" and writes no idle line; the ticks after it, with nothing new,
-        # write idle lines again, since the time of that inbox line, and send nothing.
+        # An inbox line goes into the event file between two ticks. The next tick
+        # appends "hourly update" and writes no idle line; the ticks after it, with
+        # nothing new, write idle lines again, since the time of that inbox line, and
+        # append no event.
         self.start()
         path = self.srv / "in" / PROJECT / "note.md"
         path.write_text("hello\n", encoding="utf-8")
@@ -1177,7 +1299,7 @@ class TestHourly(HourlyChecks, OrchTestCase):
         self.assertEqual(self.hourly_lines(), ["hourly update"])
         log = self.log().splitlines()
         delivered = next(index for index, line in enumerate(log)
-                         if f"delivered: {self.inbox_line(path)}" in line)
+                         if f"appended: {self.inbox_line(path)}" in line)
         after = [line for line in log[delivered:] if " hourly: " in line]
         self.assertIn(QUEUED, after[0])
         self.assertEqual(len([tick for tick in self.ticks() if QUEUED in tick]), 1)
@@ -1212,7 +1334,7 @@ class TestHourlyOrigin(HourlyChecks, ReportTestCase):
 
     def test_pushed_commit_that_changes_only_the_update_log_is_no_change(self):
         # The orchestrator pushes its update log alone. Once the loop has fetched it,
-        # two more ticks pass, and both write idle lines and send nothing.
+        # two more ticks pass, and both write idle lines and append no event.
         self.start()
         self.wait_for_fetch()
         path = self.writer / "impl" / "orch" / "updates.log"
@@ -1227,7 +1349,7 @@ class TestHourlyOrigin(HourlyChecks, ReportTestCase):
 
     def test_pushed_commit_that_changes_another_file_is_a_change(self):
         # A commit that changes a spec reaches origin after the first fetch: the next
-        # tick sends "hourly update".
+        # tick appends "hourly update".
         self.start()
         self.wait_for_fetch()
         path = self.writer / "specs" / "spec.md"
@@ -1267,17 +1389,17 @@ class TestReminders(HourlyChecks, OrchTestCase):
             "## Next units\n\n1. The kickoff.\n", encoding="utf-8")
 
     def reminders(self):
-        return [line for line in self.submitted() if line.startswith("reminder: ")]
+        return [line for line in self.events() if line.startswith("reminder: ")]
 
     def two_more_ticks(self):
         seen = len(self.ticks())
         self.until(lambda: len(self.ticks()) >= seen + 2, what="two more ticks")
 
-    def test_due_item_is_sent_once_across_ticks_and_restarts_and_again_for_a_new_date(self):
+    def test_due_item_is_appended_once_across_ticks_and_restarts_and_again_for_a_new_date(self):
         # The login item is due today and the token item a week later. The login item
         # gets one line, joined from its two lines, and no other tick or a restart of the
-        # loop sends it again; the token item gets none. When the login item gets a new
-        # date, already past, the next tick sends it once more.
+        # loop appends it again; the token item gets none. When the login item gets a new
+        # date, already past, the next tick appends it once more.
         today = datetime.date.today()
         later = today + datetime.timedelta(days=7)
         self.state(today, later)

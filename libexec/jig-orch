@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """The supervisor of a project's orchestrator session.
 
-usage: jig orch <project> start | stop | status
+usage: jig orch <project> start | stop | status | events [--old]
 
   start   refuses when impl/orch/ORCHESTRATOR.md is not in the project's clone, when a
           loop already runs, or when tmux session <project>-orch exists already; else it
-          starts the loop in the background
+          makes ~/ws/reviews/<project>/orch/ when it is missing and starts the loop in
+          the background
   stop    ends the loop and the session the loop started
   status  exit 0 when a loop runs, 3 when none does; with the last line of its log
+  events  the session's watcher on the event file, orch/events.log: prints each line
+          after the last line "start <session ID>", or from the top when there is none,
+          then each new line as it is appended, and runs until it is stopped, its
+          parent process ends or its output is closed; a missing file is waited for
+  events --old
+          prints once the events of the session before the newest one, the lines
+          between the last two start lines, and exits 0; with one start line, the
+          lines before it; with none, or with no file, nothing
 
   1  a refusal; 2 a usage error
 
@@ -26,7 +35,7 @@ in /<ID>.jsonl, and logs one line with its pid and the old ID. A process that en
 before the signal is no failure. It touches no other process, also none that resumes
 another session.
 
-New files. The loop sends one line into the session for each new file in
+New files. The loop appends one event for each new file in
 <root>/in/<project>/ (inbox: <file> (<bytes>, sha256 <8 hex>)) and for each readback, the
 output file that jig run writes for a block, in <root>/out/<project>/ (readback: <ID>).
 A line goes out once the file has held still for one poll. A file is new when its path,
@@ -40,26 +49,28 @@ the file that is at that path now, so an upgrade announces nothing again.
 
 Reports. Every JIG_ORCH_REPORT_POLL seconds the loop fetches the branch BRANCH of the
 conf file from origin of the project's clone, into refs/jig-orch/<BRANCH> only, and
-sends "report: <ID> <status>" for each new commit whose subject is exactly "log: <ID>",
+appends the event "report: <ID> <status>" for each new commit whose subject is exactly "log: <ID>",
 the commit that ends a unit. The status is the text before the first colon of line 1 of
 impl/log/<ID>-report.md at that commit (the whole line when it has no colon), read as
 jig close reads it, or "unreadable" when the file cannot be read. The fetch moves no
 other ref and writes no FETCH_HEAD, so it never disturbs a fetch of the same clone by
 jig wait, jig batch or a person. A fetch that fails, or that takes longer than 30 s (or
 the report poll, when that is shorter), is logged once for each run of failures and
-tried again at the next poll. orch/reported keeps the commits announced, so each gets
-one line across restarts. With no record yet, the first fetch that works takes the log
-commits already on origin as announced, except those whose commit time is at or after
-the loop's start, so a report that lands while the first fetches fail is not lost.
+tried again at the next poll. orch/reported keeps the commits announced, each written
+there once its line is appended, so each gets one line across restarts. With no record
+yet, the first fetch that works takes the log commits already on origin as announced,
+except those whose commit time is at or after the loop's start, so a report that lands
+while the first fetches fail is not lost.
 
 Hourly. Every JIG_ORCH_HOURLY seconds the loop ticks, and each tick does one of two
-things. When something changed since the last tick, the tick queues the line "hourly
+things. When something changed since the last tick, the tick queues the event "hourly
 update", which asks the orchestrator to write its update; the queue holds at most one
-such line, so ticks while a dialog shows add none. When nothing changed, the tick does
-not wake the model: it appends one idle line to impl/orch/updates.log in the project's
-clone, and sends nothing. Something changed when the loop delivered an inbox, readback
-or report line into the session (a line not delivered, and the hourly update line
-itself, do not count), or when refs/jig-orch/<BRANCH> moved and git diff --name-only
+such line, so ticks while an append keeps failing add none. When nothing changed, the
+tick does not wake the model: it appends one idle line to impl/orch/updates.log in the
+project's clone, and no event. Something changed when the loop appended an inbox,
+readback or report line to the event file (a line still waiting in the queue, the
+hourly update line itself and the reminders do not count), or when
+refs/jig-orch/<BRANCH> moved and git diff --name-only
 from its last position names a file other than impl/orch/updates.log. The first fetch
 that works only sets that position, as it sets the report record; a failed fetch
 changes nothing. The idle line reads
@@ -77,37 +88,35 @@ Reminders. At its start and at each hourly tick the loop reads impl/orch/state.m
 project's clone, the working tree and not a commit, and looks at each list item under
 the heading "## Open". An item whose text holds "act by <YYYY-MM-DD>" (the last such date
 counts) with that date today or earlier gets one line "reminder: <the item>", its lines
-joined into one. orch/reminded keeps each item text with its date once its line went
-out, so neither a later tick nor a restart sends it again; a new date, or a new text,
-sends it once more. A reminder line does not count as a change for the hourly tick. A
+joined into one. orch/reminded keeps each item text with its date once its line is
+appended, so neither a later tick nor a restart appends it again; a new date, or a new
+text, appends it once more. A reminder line does not count as a change for the hourly tick. A
 state.md that cannot be read is logged once until it can be read again.
 
-Delivery. Every line waits in one queue, and the lines go in the order they came. The
-loop types a line only when the session's input box is empty and has not changed for 10
-seconds, so that it never types into a box where a person is typing. It checks the box
-once a second, from a screen with the normal input bar, between the last two rules.
-Empty means no typed character: a placeholder or a suggested prompt that Claude Code
-draws in the box by itself, faint or grey, is not typed text. Each line it types
-changes the box, so the next line waits another 10 seconds. A line that waits stays at
-the head of the queue; a line held by typed text is logged once. A dialog in the
-session (no input bar) is reported at once, in one line to the tee and to the log, and
-never answered; nothing is sent while it lasts. A line that fails before any key is
-typed (the session does not
-exist, for example between a rollover and the next poll, it shows no input bar, or tmux
-send-keys fails) goes back to the head of the queue and is tried again at the next poll;
-a report commit goes into orch/reported only once its line is sent. A line that fails
-after its text was typed is logged once, to the tee and the log, and not tried again,
-so that no line is sent twice. JIG_SRV names <root> (/srv/jig); JIG_ORCH_POLL the seconds between
-polls (5); JIG_ORCH_QUIET the seconds the input box must stay empty and unchanged
-before a line goes (10); JIG_ORCH_BOX_CHECK the seconds between looks at the box (1);
-JIG_ORCH_REPORT_POLL the seconds between fetches (60); JIG_ORCH_HOURLY the
-seconds between ticks (3600); JIG_ORCH_FORK_WINDOW the seconds after a restart in which
-the loop still looks for forks of the old session (60).
+Delivery. The loop types nothing into the session: each event is one line appended to
+the event file, orch/events.log, which the session follows with jig orch <project>
+events. Before it starts a session the loop appends "start <session ID>", with the ID
+that it gives Claude Code by --session-id, so that a person or a check can find the
+session's transcript by it. The lines after the last start line are then the events of
+the running session, and those between the last two start lines the events of the
+session before it, among them any that came while that session ended. When the start
+line cannot be appended, the session is not started, because its watcher would show it
+the events of the old session as new; that counts as an exit. Every event waits in
+one queue, and the events go in the order they came, each once. An append that fails
+leaves its line at the head of the queue, so that no later line overtakes it; it is
+logged once, to the tee and the log, and tried again at the next poll. Events are
+appended also while a dialog shows. A dialog in the session (no input bar for a few
+polls) is reported at once, in one line to the tee and to the log, and never answered.
+JIG_SRV names <root> (/srv/jig); JIG_ORCH_POLL the seconds between polls (5);
+JIG_ORCH_REPORT_POLL the seconds between fetches (60); JIG_ORCH_HOURLY the seconds
+between ticks (3600); JIG_ORCH_FORK_WINDOW the seconds after a restart in which the
+loop still looks for forks of the old session (60).
 
-Files, under ~/ws/reviews/<project>/: orch/supervisor.log, orch/loop.lock (the pid of
-the loop), orch/announced, orch/reported, orch/reminded, orch/fetch.err (the error output of the last
-fetch), out/orch.txt (the tee), transcripts/orch/<run>/. In the project's clone: the
-idle lines in impl/orch/updates.log.
+Files, under ~/ws/reviews/<project>/: orch/events.log (the event file), orch/supervisor.log,
+orch/loop.lock (the pid of the loop), orch/session (the tmux and Claude Code IDs of the
+session the loop started last), orch/announced, orch/reported, orch/reminded,
+orch/fetch.err (the error output of the last fetch), out/orch.txt (the tee),
+transcripts/orch/<run>/. In the project's clone: the idle lines in impl/orch/updates.log.
 """
 
 import datetime
@@ -149,11 +158,15 @@ MODEL = "claude-opus-5-5"
 EFFORT = "high"
 SRV_ROOT = "/srv/jig"
 POLL_SECONDS = 5.0
-QUIET_SECONDS = 10.0
-BOX_CHECK_SECONDS = 1.0
 REPORT_POLL_SECONDS = 60.0
 HOURLY_SECONDS = 3600.0
 HOURLY_LINE = "hourly update"
+# The event file of the session, under orch/, and the line that the loop appends to it
+# before each start of a session.
+EVENTS_FILE = "events.log"
+START_LINE = re.compile(rb"start \S+")
+# How often the watcher looks for new lines, and whether its parent still runs.
+FOLLOW_SECONDS = 0.2
 # The orchestrator's log of hourly updates in its clone, where the loop also writes idle
 # lines; a commit that changes only this file is not news for the hourly update.
 UPDATES_LOG = "impl/orch/updates.log"
@@ -296,6 +309,122 @@ def try_lock(path):
     return descriptor
 
 
+# The event file. The loop appends one line to it for each event, and "start <session
+# ID>" before each start of a session; the session reads it with jig orch <project> events.
+
+def events_path(project):
+    return pathlib.Path.home() / "ws" / "reviews" / project / "orch" / EVENTS_FILE
+
+
+def start_indexes(lines):
+    return [index for index, line in enumerate(lines) if START_LINE.fullmatch(line)]
+
+
+def current_events(lines):
+    """Return the lines after the last start line, the events of the running session;
+    with no start line, every line."""
+    starts = start_indexes(lines)
+    return lines[starts[-1] + 1:] if starts else lines
+
+
+def old_events(lines):
+    """Return the events of the session before the newest one: the lines between the
+    last two start lines, or the lines before the only one; with none, no line."""
+    starts = start_indexes(lines)
+    if not starts:
+        return []
+    return lines[(starts[-2] + 1 if len(starts) > 1 else 0):starts[-1]]
+
+
+class Stopped(Exception):
+    """The watcher got a signal to end."""
+
+
+def stop_watching(signum, frame):
+    raise Stopped
+
+
+def emit(out, lines):
+    # The reader is often a pipe, as under a harness tool that wakes the session for
+    # each line it reads; without a flush a line could sit in the buffer for hours.
+    for line in lines:
+        out.write(line + b"\n")
+        out.flush()
+
+
+def follow(path, out, poll=FOLLOW_SECONDS):
+    """Print the current events of the event file, then each line appended to it.
+
+    Return when the process that started the watcher ends, which a change of the parent
+    pid shows, so that the watcher of a session that has ended does not run on beside
+    the next session's own. A missing file reads as an empty one: the watcher waits for
+    it, and each line it gets is new, its start line too. When the file is replaced or
+    cut short, the rest of the old one is read first and the new one from its top.
+    """
+    parent = os.getppid()
+    stream, pending, first = None, b"", True
+    while os.getppid() == parent:
+        if stream is None:
+            try:
+                stream = open(path, "rb")
+            except FileNotFoundError:
+                first = False
+                time.sleep(poll)
+                continue
+        data = pending + stream.read()
+        lines = data.split(b"\n")
+        # A line still being written waits for its newline.
+        pending = lines.pop()
+        if first:
+            lines, first = current_events(lines), False
+        emit(out, lines)
+        try:
+            now = os.stat(path)
+        except FileNotFoundError:
+            now = None
+        here = os.fstat(stream.fileno())
+        if now is not None and ((now.st_dev, now.st_ino) != (here.st_dev, here.st_ino)
+                                or now.st_size < stream.tell()):
+            # Read what the old file still held before the switch, so that no line of
+            # it is lost; the new file's lines are all new.
+            emit(out, (pending + stream.read()).split(b"\n")[:-1])
+            stream.close()
+            stream, pending = None, b""
+            continue
+        time.sleep(poll)
+    return DONE
+
+
+def watch_events(project, old):
+    """Run jig orch <project> events, with --old when old is true."""
+    path = events_path(project)
+    out = sys.stdout.buffer
+    if old:
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return DONE
+        except OSError as error:
+            print(f"jig orch: cannot read {path}: {error.strerror}", file=sys.stderr)
+            return REFUSED
+        emit(out, old_events(data.split(b"\n")[:-1]))
+        return DONE
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop_watching)
+    try:
+        return follow(path, out)
+    except Stopped:
+        return DONE
+    except BrokenPipeError:
+        # The reader is gone, as when the session that ran the watcher has ended. Python
+        # would flush the closed pipe again at exit and print an error about it.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), out.fileno())
+        return DONE
+    except OSError as error:
+        print(f"jig orch: cannot read {path}: {error.strerror}", file=sys.stderr)
+        return REFUSED
+
+
 class Orch:
     def __init__(self, project):
         self.project = project
@@ -310,6 +439,7 @@ class Orch:
         self.state = reviews / "orch"
         self.lock = self.state / "loop.lock"
         self.log_path = self.state / "supervisor.log"
+        self.events_file = self.state / EVENTS_FILE
         self.started_file = self.state / "session"
         self.announced_file = self.state / "announced"
         self.reported_file = self.state / "reported"
@@ -367,6 +497,13 @@ class Orch:
             worker.set_effort(str(self.clone), MODEL, EFFORT)
         except worker.Refused as error:
             self.log(f"cannot set the effort: {error}", tee=True)
+            return
+        # The start line goes in first, so that every event appended from now on lies
+        # after it, where the new session's watcher reads.
+        failure = self.append_event(f"start {self.claude_session}")
+        if failure:
+            self.log(f"cannot start session {self.session}: cannot append its start line "
+                     f"to {self.events_file}: {failure}", tee=True)
             return
         channel = f"jig-orch-{self.session}"
         add_dirs = "".join(f"--add-dir {shlex.quote(directory)} "
@@ -478,7 +615,7 @@ class Orch:
             if not line:
                 continue
             # Before inodes were kept a line was a path alone. It stands for the file at
-            # that path now, so that the first start after an upgrade sends no line again.
+            # that path now, so that the first start after an upgrade appends no line again.
             try:
                 status = os.stat(line, follow_symlinks=False)
             except OSError:
@@ -563,7 +700,8 @@ class Orch:
             self.log(f"cannot write {self.reported_file}: {error.strerror}", tee=True)
 
     def read_reminded(self):
-        """Return the (item, date) pairs that earlier loops sent, from lines "<date> <item>"."""
+        """Return the (item, date) pairs that earlier loops appended, from lines
+        "<date> <item>"."""
         try:
             lines = self.reminded_file.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
@@ -586,7 +724,7 @@ class Orch:
             self.log(f"cannot write {self.reminded_file}: {error.strerror}", tee=True)
 
     # The reminders of dated Open items in state.md. Each queued line carries its
-    # (item, date) pair, which goes into the record only once the line is sent, so a
+    # (item, date) pair, which goes into the record only once the line is appended, so a
     # reminder that a stop drops while it waits goes out after the restart.
 
     def remind(self):
@@ -708,8 +846,8 @@ class Orch:
             self.pending.add(commit)
             self.queue.append((f"report: {unit} {status}", commit))
 
-    # The hourly tick. Something changed since the last tick when the loop delivered a
-    # line into the session, other than the hourly update itself, or when origin got a
+    # The hourly tick. Something changed since the last tick when the loop appended a
+    # line to the event file, other than the hourly update itself, or when origin got a
     # commit that changes a file other than the update log. Then the tick wakes the
     # model with "hourly update"; else the loop writes the idle line itself, so that a
     # quiet hour costs no model time.
@@ -742,9 +880,9 @@ class Orch:
         self.remind()
         if self.changed:
             self.changed = False
-            # One hourly update at a time: ticks while a dialog holds the queue add none.
+            # One hourly update at a time: ticks while an append keeps failing add none.
             if any(line == HOURLY_LINE for line, _ in self.queue):
-                self.log("hourly: something changed; the hourly update still waits to be sent")
+                self.log("hourly: something changed; the hourly update still waits in the queue")
             else:
                 self.queue.append((HOURLY_LINE, None))
                 self.log("hourly: something changed; queued the hourly update")
@@ -768,103 +906,71 @@ class Orch:
     def stop_request(self, signum, frame):
         self.stopping = True
 
-    def failed_before_typing(self, failure):
-        """Say whether deliver() failed before it typed a key into the session.
+    def append_event(self, line):
+        """Append one line to the event file; return None, or why it failed.
 
-        Such a line can go again without being sent twice. The session that does not
-        exist is the common case: it ended for a rollover between two polls, and the
-        loop starts the fresh one at the next poll.
+        The line goes out in one write to a file opened for appending, so that a line
+        that a block appends at the same time is not mixed into it.
         """
-        return (failure in (f"session {self.session} does not exist",
-                            f"session {self.session} shows no input bar")
-                or failure.startswith("tmux send-keys failed"))
-
-    def check_box(self):
-        """Look at the session's input box, and note when it last changed.
-
-        A screen without the input bar, or without a box between two rules, shows no
-        box; it counts as a change, because what a person typed meanwhile cannot be
-        seen, and it never counts as empty.
-        """
-        moment = time.monotonic()
-        screen = jig_tmux.capture(self.session, styled=True)
-        box = None if screen is None else jig_tmux.drawn_box(screen)
-        drawn = None if box is None else "\n".join(box)
-        if drawn is None or drawn != self.box_drawn:
-            self.box_since = moment
-        self.box_drawn = drawn
-        self.box_typed = box is None or not jig_tmux.box_is_empty(box)
-        self.next_box_check = moment + self.box_check
-
-    def box_ready(self):
-        """Say whether a line may be typed now: the box, looked at once more, is empty
-        and has not changed for the quiet time."""
-        self.check_box()
-        return not self.box_typed and time.monotonic() - self.box_since >= self.quiet
+        try:
+            descriptor = os.open(self.events_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                                 0o644)
+        except OSError as error:
+            return error.strerror
+        try:
+            data = f"{line}\n".encode("utf-8")
+            if os.write(descriptor, data) != len(data):
+                return "the line was written only in part"
+        except OSError as error:
+            return error.strerror
+        finally:
+            os.close(descriptor)
+        return None
 
     def rest(self, seconds):
-        """Wait for the next poll, and look at the input box once a second meanwhile,
-        so that a change in it is seen even when the polls are further apart."""
+        """Wait for the next poll, in short steps, so that a stop is not kept waiting."""
         end = time.monotonic() + seconds
         while not self.stopping:
-            if time.monotonic() >= self.next_box_check:
-                self.check_box()
             moment = time.monotonic()
             if moment >= end:
                 return
-            time.sleep(max(0.0, min(end, self.next_box_check) - moment))
+            time.sleep(min(end - moment, 0.5))
 
-    def deliver_queue(self):
+    def append_queue(self):
+        """Append the queued events to the event file, oldest first."""
         while self.queue and not self.stopping:
-            if not self.box_ready():
-                # The line stays at the head of the queue, so that the lines keep their
-                # order. Only a box with typed text is logged: the wait after a line
-                # that the loop typed itself is the normal case.
-                line = self.queue[0][0]
-                if self.box_typed and self.held != line:
-                    self.held = line
-                    self.log(f"held until the input box is empty and still: {line}")
-                return
             # The mark of a line is its report commit, the (item, date) pair of a
             # reminder, or None.
-            line, commit = self.queue.pop(0)
-            failure = jig_tmux.deliver(self.session, line)
-            if failure and self.failed_before_typing(failure):
-                # The line goes back to the head of the queue, so that the lines keep
-                # their order, and the pass ends; the next poll tries again. It is
-                # logged once, not at every poll that it waits.
-                self.queue.insert(0, (line, commit))
+            line, mark = self.queue[0]
+            failure = self.append_event(line)
+            if failure:
+                # The line stays at the head of the queue, so that the lines keep their
+                # order, and the next poll tries again. It is logged once, not at every
+                # poll that it waits.
                 if self.held != line:
                     self.held = line
-                    self.log(f"held for the next poll ({failure}): {line}")
+                    self.log(f"cannot append to {self.events_file} ({failure}), tried "
+                             f"again at the next poll: {line}", tee=True)
                 return
+            self.queue.pop(0)
+            again = " after a failure" if self.held == line else ""
             self.held = None
-            # The line's own text changed the box, whether or not it went.
-            self.box_since = time.monotonic()
-            if failure:
-                # The text was typed, so a second attempt could send the line twice.
-                self.log(f"not delivered ({failure}): {line}", tee=True)
-            else:
-                self.log(f"delivered: {line}")
-                if line != HOURLY_LINE and not isinstance(commit, tuple):
-                    self.note_change()
-            # A report commit goes into the record only once its line has been sent, or
-            # typed by an attempt that failed after it, so a line that a stop drops while
-            # it waits in the queue is sent after the restart.
-            if isinstance(commit, tuple):
-                self.reminded.add(commit)
+            self.log(f"appended{again}: {line}")
+            if line != HOURLY_LINE and not isinstance(mark, tuple):
+                self.note_change()
+            # A report commit or a reminder goes into its record only once its line is
+            # appended, so that a line that a stop drops while it waits in the queue is
+            # appended after the restart.
+            if isinstance(mark, tuple):
+                self.reminded.add(mark)
                 self.write_reminded()
-            elif commit:
-                self.pending.discard(commit)
-                self.reported.add(commit)
+            elif mark:
+                self.pending.discard(mark)
+                self.reported.add(mark)
                 self.write_reported()
 
-    def loop(self, poll, report_poll, hourly, fork_window, quiet=QUIET_SECONDS,
-             box_check=BOX_CHECK_SECONDS):
+    def loop(self, poll, report_poll, hourly, fork_window):
         self.stopping = False
-        self.quiet, self.box_check = quiet, box_check
-        self.box_drawn, self.box_typed = None, True
-        self.box_since = self.next_box_check = time.monotonic()
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(signum, self.stop_request)
         self.loop_started = time.time()
@@ -920,13 +1026,15 @@ class Orch:
                 continue
             self.scan()
             self.watch_reports()
+            # Events go to the file whatever the screen shows, a dialog included: the
+            # session reads them once the dialog is answered.
+            self.append_queue()
             screen = jig_tmux.capture(self.session)
             if screen is None:
                 self.rest(poll)
                 continue
             if jig_tmux.has_input_bar(screen):
                 no_bar, reported = 0, False
-                self.deliver_queue()
             else:
                 no_bar += 1
                 if no_bar >= jig_tmux.DIALOG_POLLS and not reported:
@@ -1020,24 +1128,27 @@ class Orch:
 def main(argv):
     commands = ("start", "stop", "status")
     hidden = len(argv) == 3 and argv[1] == "loop" and argv[2].isdigit()
-    if not (len(argv) == 2 and argv[1] in commands or hidden) \
+    watcher = argv[1:] in (["events"], ["events", "--old"])
+    if not (len(argv) == 2 and argv[1] in commands or hidden or watcher) \
             or not jig_units.PROJECT.fullmatch(argv[0]):
         print("\n\n".join(__doc__.strip().split("\n\n")[1:3]), file=sys.stderr)
         return USAGE
+    if watcher:
+        # The watcher reads only the event file, so it needs no conf file and takes no
+        # lock: it runs in the session beside the loop.
+        return watch_events(argv[0], len(argv) == 3)
     try:
         poll = setting("JIG_ORCH_POLL", POLL_SECONDS)
         report_poll = setting("JIG_ORCH_REPORT_POLL", REPORT_POLL_SECONDS)
         hourly = setting("JIG_ORCH_HOURLY", HOURLY_SECONDS)
         fork_window = setting("JIG_ORCH_FORK_WINDOW", FORK_WINDOW_SECONDS)
-        quiet = setting("JIG_ORCH_QUIET", QUIET_SECONDS)
-        box_check = setting("JIG_ORCH_BOX_CHECK", BOX_CHECK_SECONDS)
         orch = Orch(argv[0])
         if hidden:
             # The descriptor holds the lock that start took; it stays open while this runs.
             descriptor = int(argv[2])
             os.ftruncate(descriptor, 0)
             os.pwrite(descriptor, f"{os.getpid()}\n".encode(), 0)
-            return orch.loop(poll, report_poll, hourly, fork_window, quiet, box_check)
+            return orch.loop(poll, report_poll, hourly, fork_window)
         return getattr(orch, argv[1])()
     except jig_units.Refused as error:
         print(f"jig orch: {error}", file=sys.stderr)

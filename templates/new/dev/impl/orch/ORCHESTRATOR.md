@@ -135,8 +135,8 @@ When `log: <ID>` reaches origin, `jig batch` runs `jig report @PROJECT@ <ID>`,
 and starts the next row only when the report's status is `OK` and the
 validation passed. It closes the reporting worker with `jig close` before the
 next start in the same account, and otherwise 10 minutes after the report.
-Every report commit also wakes you: the supervisor sends
-`report: <ID> <status>` into this session. In a batch, run `jig wait` on the
+Every report commit also wakes you: the supervisor appends
+`report: <ID> <status>` to the event file, and your watcher prints it. In a batch, run `jig wait` on the
 running unit; an end with no change does not stop `jig batch`. A rerun of the
 same file skips the rows that are closed OK already.
 
@@ -180,6 +180,19 @@ the exit code.
 
 ## Session rules
 
+- The first thing after each start of this session: start one background
+  watcher, `jig orch @PROJECT@ events`, through the harness tool that gives
+  you a turn for each new line that a command prints (in Claude Code, the
+  Monitor tool). Start no second one. The supervisor types nothing into this
+  session: it appends each event as one line to the event file,
+  `~/ws/reviews/@PROJECT@/orch/events.log` (the line `hourly update`, the
+  `inbox:` and `readback:` lines, the lines `report: <ID> <status>` and the
+  reminders), and the line `start <session ID>` before it starts a session.
+  The watcher prints each line after the last start line, then each new
+  line. Then read, once, the events of the old session, the lines between
+  the last two start lines: `jig orch @PROJECT@ events --old`. Act on each
+  of these events that `state.md` and `handoff.md` do not show as handled,
+  because an event that came while the old session ended is among them.
 - After each step, run `jig ctx`. It prints the context size that the status
   line wrote for this session, and its exit code says what to do next:
   - 0: go on.
@@ -194,7 +207,8 @@ the exit code.
 - A running unit is a separate session in a worker account, and a rollover
   does not affect it. Name it in `handoff.md`.
 - A fresh session reads this file, `state.md`, `handoff.md`, the jig change
-  log since the pinned version, and the newest report if a unit runs; nothing
+  log since the pinned version, the newest report if a unit runs, and the
+  events of the old session (`jig orch @PROJECT@ events --old`); nothing
   else unless `state.md` names a file. Its first message to the console is a
   summary of the last session and the next steps. Its first hourly update
   cites the commit of `handoff.md`.
@@ -235,7 +249,8 @@ Stop the item and ask Eric for:
   check, run that unit again, then the unit that runs `prepare`.
 - One fine-grained token per project, held by @IMPL@. Its expiry date and the
   claude.ai login of each account are items in `state.md` Open, each acted on
-  7 days before it expires; the supervisor sends the reminder.
+  7 days before it expires; the supervisor appends the reminder to the event
+  file.
 - Eric does the first publication, the rulesets, token renewal, and the yes
   for a minor or major release.
 
@@ -279,8 +294,8 @@ line above it that names the account and the machine.
 ## Inbox
 
 Files reach you in `@SRV@/in/@PROJECT@/` and readbacks in
-`@SRV@/out/@PROJECT@/`. The supervisor announces each one as a line in this
-session. Read the file by its path. A worker gets an inbox file as a copy
+`@SRV@/out/@PROJECT@/`. The supervisor appends one line for each to the
+event file, and your watcher prints it. Read the file by its path. A worker gets an inbox file as a copy
 that `jig start` puts beside its prompt.
 
 ## Project part

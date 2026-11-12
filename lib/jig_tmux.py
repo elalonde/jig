@@ -1,17 +1,13 @@
 """A Claude Code session in tmux: the dialog test and the delivery of one line.
 
 jig wait and the supervisor (jig orch) test for a dialog the same way: the session's
-normal input bar is missing for DIALOG_POLLS polls in a row. jig send
-and the supervisor deliver a line the same way: the text, a pause, Enter, then
-a check that the text reached the session and left its input box, because text and
-Enter sent together were measured to stay unsubmitted. The supervisor also asks, before
-it types, whether a person has typed into the box: box_is_empty() reads the box as
-drawn, so that a hint the harness draws in it is not taken for typed text.
+normal input bar is missing for DIALOG_POLLS polls in a row. jig send delivers a line:
+the text, a pause, Enter, then a check that the text reached the session and left its
+input box, because text and Enter sent together were measured to stay unsubmitted.
 
 tmux is the one on PATH, with its default server; a test puts its own tmux first.
 """
 
-import re
 import subprocess
 import time
 
@@ -29,26 +25,6 @@ DIALOG_POLLS = 2
 RULE = "─"
 # Claude Code can show a long text as this marker in the box instead of the text.
 PASTED = "[Pasted text"
-# A pasted image shows as this marker. Both markers stand for what a person put in the
-# box, however they are drawn.
-PASTED_IMAGE = "[Image #"
-# The mark at the start of an empty box. A mark of another mode, such as "!" for a shell
-# command, is something a person typed.
-PROMPT_MARKS = (">", "❯")
-BOX_SIDE = "│"
-
-# The escape sequences of a screen captured with tmux capture-pane -e: a control
-# sequence, an operating system command such as a link, or a two-character escape.
-# Only a control sequence that ends in "m" changes how the next characters are drawn.
-ESCAPE = re.compile(r"\x1b(?:\[([0-?]*)[ -/]*([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
-# Claude Code draws a placeholder or a suggested prompt in an empty box as faint or grey
-# text, with its cursor, a character in inverse video, on the first character; a person's
-# typed text is drawn in the terminal's own colour. These are the codes of faint and of
-# grey: the faint attribute, bright black, and the grey ramp of the 256 colours.
-FAINT, FAINT_OFF, INVERSE, INVERSE_OFF = 2, 22, 7, 27
-GREY = 90
-GREY_RAMP = range(232, 256)
-GREY_SPREAD = 16
 
 PAUSE_SECONDS = 0.5
 CHECK_SECONDS = 5.0
@@ -70,13 +46,9 @@ def tmux(*args):
     return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
 
 
-def capture(session, styled=False):
-    """Return the session's screen, or None when the session does not exist.
-
-    A styled screen keeps how each character is drawn, as escape sequences.
-    """
-    styles = ("-e",) if styled else ()
-    result = tmux("capture-pane", "-p", *styles, "-t", f"={session}:")
+def capture(session):
+    """Return the session's screen, or None when the session does not exist."""
+    result = tmux("capture-pane", "-p", "-t", f"={session}:")
     return result.stdout if result.returncode == 0 else None
 
 
@@ -102,120 +74,6 @@ def input_box(screen):
     if len(rules) >= 2:
         return "\n".join(lines[rules[-2] + 1:rules[-1]])
     return "\n".join(non_blank(screen)[-BAR_LINES:])
-
-
-def plain(text):
-    """The text of a styled screen without its escape sequences."""
-    return ESCAPE.sub("", text)
-
-
-def drawn_box(screen):
-    """Return the lines of the input box of a styled screen, escapes kept, or None.
-
-    The box is read only from a screen with the normal input bar, as the dialog test
-    reads it, and only between two rules: without them, the lines that would stand in
-    for the box could be anything, and an empty box must not be guessed.
-    """
-    lines = screen.splitlines()
-    shown = [plain(line) for line in lines]
-    if not has_input_bar("\n".join(shown)):
-        return None
-    rules = [index for index, line in enumerate(shown) if is_rule(line)]
-    if len(rules) < 2:
-        return None
-    return lines[rules[-2] + 1:rules[-1]]
-
-
-def _faint_colour(params):
-    """Say whether a foreground colour of 256 colours or of RGB is grey; return the
-    answer and the number of parameters it took."""
-    if len(params) >= 2 and params[0] == 5:
-        return params[1] in GREY_RAMP or params[1] == 8, 2
-    if len(params) >= 4 and params[0] == 2:
-        rgb = params[1:4]
-        return max(rgb) - min(rgb) <= GREY_SPREAD, 4
-    return False, len(params)
-
-
-def _style(state, text):
-    """Apply the parameters of one SGR sequence to state, a dict of faint, grey and
-    inverse."""
-    params = []
-    for part in (text or "0").split(";"):
-        # A parameter with colons, as in 38:5:245, carries its own sub-parameters.
-        params.extend(int(piece) if piece.isdigit() else 0 for piece in part.split(":"))
-    index = 0
-    while index < len(params):
-        code = params[index]
-        index += 1
-        if code == 0:
-            state.update(faint=False, grey=False, inverse=False)
-        elif code == FAINT:
-            state["faint"] = True
-        elif code == FAINT_OFF:
-            state["faint"] = False
-        elif code == INVERSE:
-            state["inverse"] = True
-        elif code == INVERSE_OFF:
-            state["inverse"] = False
-        elif code == GREY:
-            state["grey"] = True
-        elif code == 38:
-            state["grey"], taken = _faint_colour(params[index:])
-            index += taken
-        elif 30 <= code <= 39 or 91 <= code <= 97:
-            state["grey"] = False
-        elif code == 48:
-            # A background colour of 256 colours or RGB: its parameters are skipped.
-            index += _faint_colour(params[index:])[1]
-
-
-def _cells(lines):
-    """Return each line as a list of (character, faint, inverse), with the drawing
-    state carried from line to line as a terminal carries it."""
-    state = {"faint": False, "grey": False, "inverse": False}
-    result = []
-    for line in lines:
-        cells, position = [], 0
-        for match in ESCAPE.finditer(line):
-            for char in line[position:match.start()]:
-                cells.append((char, state["faint"] or state["grey"], state["inverse"]))
-            if match.group(2) == "m":
-                _style(state, match.group(1))
-            position = match.end()
-        for char in line[position:]:
-            cells.append((char, state["faint"] or state["grey"], state["inverse"]))
-        result.append(cells)
-    return result
-
-
-def box_is_empty(box):
-    """Say whether the lines of a drawn input box hold no typed character.
-
-    A character counts as typed unless it is blank, a side of the box, the prompt mark
-    at the start, faint or grey text, or the cursor on the first character of such
-    text. The cursor on a typed character, or after it, leaves that character typed.
-    """
-    shown = plain("\n".join(box))
-    if PASTED in shown or PASTED_IMAGE in shown:
-        return False
-    for number, cells in enumerate(_cells(box)):
-        visible = [index for index, cell in enumerate(cells) if not cell[0].isspace()]
-        if visible and cells[visible[0]][0] == BOX_SIDE:
-            visible.pop(0)
-        if visible and cells[visible[-1]][0] == BOX_SIDE:
-            visible.pop()
-        if number == 0 and visible and cells[visible[0]][0] in PROMPT_MARKS:
-            visible.pop(0)
-        for place, index in enumerate(visible):
-            char, faint, inverse = cells[index]
-            if faint:
-                continue
-            following = visible[place + 1] if place + 1 < len(visible) else None
-            if inverse and following is not None and cells[following][1]:
-                continue
-            return False
-    return True
 
 
 def squeeze(text):

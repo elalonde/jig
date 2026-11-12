@@ -256,6 +256,29 @@ class JigNewTest(TempTestCase):
             self.assertIn(line, text)
         self.assertNotIn("phase 1", text)
 
+    def test_standing_prompt_starts_the_event_watcher_first(self):
+        # The supervisor types nothing into the session, so an orchestrator that never
+        # starts its watcher would miss every event. The first rule of the session rules
+        # names the watcher command, the Monitor tool and the once-read of the old
+        # session's events; a fresh session reads those events too, and no line says
+        # that the supervisor sends a line into the session.
+        text = self.made_text("impl/orch/ORCHESTRATOR.md")
+        rules = text.split("## Session rules", 1)[1]
+        first = rules.split(" - ", 2)[1]
+        for part in ("The first thing after each start of this session: start one "
+                     "background watcher, `jig orch demo events`,",
+                     "(in Claude Code, the Monitor tool)",
+                     "`~/ws/reviews/demo/orch/events.log`",
+                     "the lines between the last two start lines: `jig orch demo events --old`.",
+                     "Act on each of these events that `state.md` and `handoff.md` do not "
+                     "show as handled"):
+            self.assertIn(part, first)
+        self.assertIn("the events of the old session (`jig orch demo events --old`)", rules)
+        self.assertNotIn("into this session", text.replace("types nothing into this session",
+                                                           ""))
+        self.assertNotIn("supervisor sends", text)
+        self.assertNotIn("announces", text)
+
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
         # form of the table that jig tag reads, or the first revision tag is refused.
