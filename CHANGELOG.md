@@ -5,6 +5,32 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.4.1
+
+What changed: the supervisor `jig orch` no longer types a line into a session
+while someone is writing in it. Each line that it delivers from its queue now waits until the input box of the session
+is empty and has not changed for 10 seconds; the box is looked at once a second
+while the supervisor rests between polls. Waiting lines go in the order they
+came, and a line held by typed text is logged once, not at every look. Faint or
+grey text in the box, such as a placeholder or a suggested prompt, counts as
+empty; text in the normal colour, a pasted-text or image mark, or a "!" shell
+line counts as typed. A line the supervisor types itself counts as a change, so
+the next queued line waits the quiet time again. Dialog handling, the rules for a
+line that fails, `deliver` and `jig send` are unchanged.
+
+Files and formats: changed `libexec/jig-orch` (new settings `JIG_ORCH_QUIET`,
+the seconds the box must stay empty and unchanged, default 10, and
+`JIG_ORCH_BOX_CHECK`, the seconds between looks, default 1) and
+`lib/jig_tmux.py` (a styled screen capture and the reading of the input box). No
+file format changes.
+
+Migration: none for a project. A host moves to this version with
+`jig upgrade 0.4.1` and restarts the supervisor so that the new loop runs.
+
+Requested by: Eric.
+
+Units: 0 minor, 1 patch, 2 none
+
 ## 0.4.0
 
 What changed: jig releases itself and other projects. `jig release <project>
