@@ -9,8 +9,9 @@ TOOL_DIRS = ("bin", "libexec", "hooks", "tools")
 # Tools that a shell sources, so they are not executable and the walk does not find them.
 SOURCED_TOOLS = ("share/jigfn.sh",)
 # Tools that get no motd line: the owner decided that no new jig tool adds one, and the
-# motd list itself is on its way out. jig's pre-commit hook came after that decision.
-NO_MOTD_LINE = ("hooks/pre-commit",)
+# motd list itself is on its way out. jig's pre-commit hook and the status line came
+# after that decision.
+NO_MOTD_LINE = ("hooks/pre-commit", "libexec/jig-statusline")
 
 
 def rows():

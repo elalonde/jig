@@ -20,14 +20,16 @@ CO_AUTHOR_ADDRESS = "@".join(["noreply", "anthropic.com"])
 PUBLIC_ADDRESS = "@".join(["eric", "lalonde.com"])
 
 # Variables that would make a test depend on where it runs: CI sets some, a git
-# hook sets others, a proxy would swallow requests to a local fake server, and
-# a tmux variable would point a test at the real server.
+# hook sets others, the status line's overrides would point it at other files, a
+# proxy would swallow requests to a local fake server, and a tmux variable would
+# point a test at the real server.
 UNSET = {"CI", "LINT_TERMS", "JIG_ROOT", "JIG_GITHUB_API", "JIG_SSH", "JIG_LOCK_DIR",
          "JIG_UPGRADE_REPO",
          "JIG_START_SETTLE", "JIG_SRV", "JIG_HOST", "JIGSHOT_CMD", "JIGSHOT_DIR",
          "JIG_WAIT_POLL", "JIG_WAIT_CHECK", "JIG_BATCH_DIR", "JIG_BATCH_CLOSE_DELAY",
          "JIG_HOLD_DIR", "JIG_ORCH_POLL", "JIG_CTX_DIR", "JIG_CTX_SOFT", "JIG_CTX_HARD",
          "JIG_SEND_PAUSE", "JIG_SEND_CHECK", "JIG_CI_POLL", "JIG_RELEASE_CI_WAIT",
+         "JIG_STATUSLINE_CONF", "HEALTH_FILE", "MODEL_POLICY", "USAGE_FILE", "CTX_DIR",
          "TMUX", "TMUX_PANE", "TMUX_TMPDIR",
          "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"}
 

@@ -1,0 +1,500 @@
+#!/usr/bin/env -S python3 -IS
+"""The status line of Claude Code: who and where on line 1, time and use on line 2.
+
+usage: jig-statusline < <status JSON>
+
+Claude Code runs this as the statusLine command of its settings, with no
+arguments, and passes the status JSON on stdin. It prints two lines:
+
+    $username · $role · $branch · $model ($effort)
+    run $run_time · 5h $five_hour_use ($time_left · $reset_time) · wk $week_use
+      · pace $pace · health: $fail_count FAIL · model: $model ≠ $expected_model
+
+(the second line is shown here on two lines; the tool prints it on one).
+
+Line 1 is the account's user name, the role (from the matching policy rule;
+left out without one), the git branch of the session's directory ("no git"
+outside a repository, the short commit when detached), the model and the
+effort (left out when the input has none). Line 2 is left out when it would be
+empty. Each line is cut to 99 columns; a long branch is shortened first, so
+that the model stays visible.
+
+Line 2 begins with the session's run time, as "run $hours h $minutes m" or
+"run $minutes m", from cost.total_duration_ms; it is left out when that field
+is missing or not a non-negative number. Then come the two rate-limit windows
+of the input: the 5-hour use with the time until it resets and the local
+wall-clock time of the reset (12-hour clock and zone abbreviation, from TZ or
+the host's zone; both left out without resets_at), and the weekly use with the
+pace: ahead, even or behind the share of the week that has passed, with a
+margin of 5 points. Given rate_limits, the 5-hour segment is never dropped:
+without a usable five_hour it reads "5h 0%".
+
+The health note reads "health: $fail_count FAIL" when the last run of the
+host's health check had FAIL lines, or "health: stale" when that run is more
+than 36 hours old (staleness wins: its FAIL lines are out of date).
+
+The model warning reads "model: $model ≠ $expected_model" when the model
+breaks the host's model policy, a TOML file of [[rule]] tables. The first rule
+whose user, cwd (a path prefix of the session's resolved directory) and
+optional phase (the PHASE file at or above that directory) match decides; the
+model's display name must contain one of its expect strings. The rule's
+optional role string is shown on line 1. No file, no matching rule or an
+invalid file means no role and no warning.
+
+Host config: the two host paths come from /srv/jig/statusline.conf, one
+KEY=value per line, with the keys HEALTH_FILE (the result file of the health
+check) and MODEL_POLICY (the model policy file). An environment variable of the
+same name overrides each key, and JIG_STATUSLINE_CONF names another config
+file. A missing or unreadable config file gives no value. A key with no value
+leaves out only its part: the health note for HEALTH_FILE, the role and the
+model warning for MODEL_POLICY.
+
+Files it writes:
+  ~/.claude/usage.json (USAGE_FILE overrides), when the input has both windows:
+    the two windows, the share of the week that has passed, the pace and the
+    time of the write, for other tools of the host that pace their own use.
+    More than one Claude Code process runs this, and some pass stale
+    rate_limits, so each window is merged with the one already in the file:
+    an earlier resets_at keeps the file's window, an equal one keeps the larger
+    used_percentage, and a later one starts a new window. An exclusive lock on
+    usage.json.lock covers the read, the merge and the write. The line shows
+    the merged values.
+  Inside tmux (TMUX set), it renames the current window to $role_short:$branch
+  (spec, impl or rev for the roles spec writer, implementer and reviewer; the
+  user name without a role), only when the name differs, and writes the
+  context file /run/jig/ctx/$tmux_session.json (CTX_DIR overrides the
+  directory), which jig ctx reads. TMUX_BIN overrides the tmux command.
+
+Exit code: 0 always. A status line that fails would leave the session without
+one, so a bad input, a bad config file or a file it cannot write still gives
+the lines it can make.
+"""
+
+import fcntl
+import json
+import os
+import pwd
+import sys
+import time
+
+WEEK_S = 7 * 24 * 3600
+PACE_MARGIN = 5.0
+HEALTH_STALE_S = 36 * 3600
+MAX_COLS = 99
+ROLE_SHORT = {"spec writer": "spec", "implementer": "impl", "reviewer": "rev"}
+# The host config file of jig, shared by every account. It names the two host
+# files that differ from host to host, so that no such path lives in this code.
+CONFIG_FILE = "/srv/jig/statusline.conf"
+CONFIG_KEYS = ("HEALTH_FILE", "MODEL_POLICY")
+CTX_DIR = "/run/jig/ctx"
+
+
+def read_config(path: str) -> dict:
+    """Return the KEY=value pairs of the host config file; {} when it cannot be read.
+
+    Lines without "=" and keys other than the two known ones are ignored, so a
+    stray line does not cost the status line its other parts.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, ValueError):
+        return {}
+    values = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key in CONFIG_KEYS:
+            values[key] = value.strip()
+    return values
+
+
+def host_paths() -> dict:
+    """Return each config key's value: the environment first, else the config file.
+
+    An empty value means the key has no value, and the part it gives is left out.
+    The config file is read only when the environment leaves a key open.
+    """
+    values = {key: os.environ.get(key, "") for key in CONFIG_KEYS}
+    if not all(values.values()):
+        config = read_config(os.environ.get("JIG_STATUSLINE_CONF") or CONFIG_FILE)
+        for key in CONFIG_KEYS:
+            values[key] = values[key] or config.get(key, "")
+    return values
+
+
+def elapsed_fraction(resets_at: float, now: float) -> float:
+    return min(1.0, max(0.0, 1.0 - (resets_at - now) / WEEK_S))
+
+
+def pace(used: float, elapsed: float) -> str:
+    diff = used - elapsed * 100.0
+    if diff > PACE_MARGIN:
+        return "ahead"
+    if diff < -PACE_MARGIN:
+        return "behind"
+    return "even"
+
+
+def hours_minutes(minutes: int) -> str:
+    return f"{minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
+
+
+def time_left(resets_at, now: float) -> str:
+    """Return the time until resets_at as hours and minutes; "" when unknown."""
+    if not isinstance(resets_at, (int, float)):
+        return ""
+    return hours_minutes(max(0, int(resets_at - now)) // 60)
+
+
+def run_time(data: dict) -> str:
+    """Return the run time from cost.total_duration_ms; "" when missing or not a number."""
+    cost = data.get("cost")
+    ms = cost.get("total_duration_ms") if isinstance(cost, dict) else None
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not 0 <= ms < float("inf"):
+        return ""  # also rejects NaN and negatives
+    return "run " + hours_minutes(int(ms // 60000))
+
+
+def reset_clock(resets_at) -> str:
+    """Return the local time of resets_at on a 12-hour clock with the zone; "" when unknown."""
+    if not isinstance(resets_at, (int, float)):
+        return ""
+    return time.strftime("%I:%M%p %Z", time.localtime(resets_at))
+
+
+def window(rate_limits: dict, name: str) -> dict | None:
+    w = rate_limits.get(name)
+    if not isinstance(w, dict) or not isinstance(w.get("used_percentage"), (int, float)):
+        return None
+    return w
+
+
+def merge_window(old, new: dict) -> dict:
+    """Return whichever of the file's window and the new one is current."""
+    new = {"used_percentage": new["used_percentage"], "resets_at": new.get("resets_at")}
+    if not isinstance(old, dict) or not isinstance(old.get("used_percentage"), (int, float)):
+        return new
+    o, n = old.get("resets_at"), new["resets_at"]
+    if not isinstance(o, (int, float)) or not isinstance(n, (int, float)):
+        return new  # nothing to compare
+    if n < o or (n == o and old["used_percentage"] > new["used_percentage"]):
+        return {"used_percentage": old["used_percentage"], "resets_at": o}
+    return new
+
+
+def read_usage(path: str) -> dict | None:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_usage(path: str, data: dict) -> None:
+    # tempfile costs about 12 ms to import; a file named for the process in the
+    # same directory is enough, and the rename keeps readers from a half file.
+    tmp = os.path.join(os.path.dirname(path), f".usage-{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def health(path: str, now: float) -> str:
+    """Return the line-2 health note for the health check's result file."""
+    try:
+        with open(path) as f:
+            age = now - os.fstat(f.fileno()).st_mtime
+            fails = sum(1 for line in f if line.startswith("FAIL "))
+    except (OSError, ValueError):
+        return ""  # not installed, or unreadable
+    if age > HEALTH_STALE_S:
+        return "health: stale"
+    if fails:
+        return f"health: {fails} FAIL"
+    return ""
+
+
+def find_phase(cwd: str) -> str | None:
+    """Return the stripped PHASE file at or above cwd, or None."""
+    d = cwd
+    while True:
+        try:
+            with open(os.path.join(d, "PHASE")) as f:
+                return f.read().strip()
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except (OSError, ValueError):
+            return None  # there, but unreadable
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def under(path: str, prefix: str) -> bool:
+    prefix = os.path.realpath(prefix)
+    return path == prefix or path.startswith(prefix.rstrip("/") + "/")
+
+
+def valid_rule(r) -> bool:
+    if not isinstance(r, dict):
+        return False
+    expect = r.get("expect")
+    return (isinstance(r.get("user"), str) and isinstance(r.get("cwd"), str)
+            and isinstance(r.get("phase", ""), str) and isinstance(r.get("role", ""), str)
+            and isinstance(expect, list) and bool(expect) and all(isinstance(e, str) for e in expect))
+
+
+def model_name(data: dict) -> str:
+    """Return the model's display name with the effort attached, as line 1 ends."""
+    model = (data.get("model") or {}).get("display_name") or "?"
+    effort = data.get("effort")
+    if isinstance(effort, dict):
+        effort = effort.get("level")
+    if isinstance(effort, str) and effort:
+        model += f" ({effort})"
+    return model
+
+
+def model_policy(data: dict, path: str, user: str) -> tuple[str, str]:
+    """Return (role, model warning) from the first matching policy rule; "" for each when absent."""
+    try:
+        with open(path, "rb") as f:
+            # About 7 ms to import; only paid when the file exists.
+            import tomllib
+            rules = tomllib.load(f).get("rule", [])
+    except (OSError, ValueError):
+        return "", ""  # no policy, or a parse error
+    if not isinstance(rules, list) or not all(valid_rule(r) for r in rules):
+        return "", ""  # an invalid rule makes the file invalid
+    cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir")
+    if not isinstance(cwd, str):
+        return "", ""
+    cwd = os.path.realpath(cwd)
+    model = model_name(data)
+    phase = None
+    for r in rules:
+        if r["user"] != user or not under(cwd, r["cwd"]):
+            continue
+        if "phase" in r:
+            phase = phase or find_phase(cwd)
+            if phase != r["phase"]:
+                continue
+        role = r.get("role", "")
+        if any(e in model for e in r["expect"]):
+            return role, ""
+        return role, f"model: {model} ≠ {r['expect'][0]}"
+    return "", ""
+
+
+def git_branch(cwd: str) -> str:
+    """Return the branch (or short commit when detached) of the repository at or above cwd."""
+    d = cwd
+    while True:
+        dot = os.path.join(d, ".git")
+        try:
+            if os.path.isfile(dot):  # worktree or submodule: "gitdir: <path>"
+                with open(dot) as f:
+                    first = f.readline().strip()
+                if not first.startswith("gitdir:"):
+                    return "no git"
+                dot = os.path.join(d, first[len("gitdir:"):].strip())
+            if os.path.isdir(dot):
+                with open(os.path.join(dot, "HEAD")) as f:
+                    head = f.read().strip()
+                if head.startswith("ref: "):
+                    ref = head[5:]
+                    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+                return head[:7] or "no git"
+        except (OSError, ValueError):
+            return "no git"
+        parent = os.path.dirname(d)
+        if parent == d:
+            return "no git"
+        d = parent
+
+
+def fit(text: str) -> str:
+    return text if len(text) <= MAX_COLS else text[:MAX_COLS - 1] + "…"
+
+
+def identity(user: str, role: str, branch: str, model: str) -> str:
+    """Return line 1; a long branch is shortened so that the model stays visible."""
+    def build(b):
+        return " · ".join(p for p in (user, role, b, model) if p)
+    line = build(branch)
+    over = len(line) - MAX_COLS
+    if over > 0 and len(branch) > over + 1:
+        line = build(branch[:len(branch) - over - 1] + "…")
+    return fit(line)
+
+
+def rename_window(name: str, tmux: str) -> None:
+    """Rename this pane's tmux window to name unless it already has that name."""
+    import subprocess  # only paid inside tmux
+    target = os.environ.get("TMUX_PANE")
+    t = ["-t", target] if target else []
+    try:
+        cur = subprocess.run([tmux, "display-message", "-p", *t, "#{window_name}"],
+                             capture_output=True, text=True, timeout=2)
+        if cur.returncode == 0 and cur.stdout.rstrip("\n") != name:
+            subprocess.run([tmux, "rename-window", *t, name], capture_output=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        pass  # a status line must not fail over tmux
+
+
+def render(data: dict, now: float, previous: dict | None = None) -> tuple[str, dict | None]:
+    """Return the use part of line 2 and the usage file's contents (None: leave it alone).
+
+    previous is the usage file's current contents; its windows are merged in.
+    """
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return "", None
+    previous = previous or {}
+    five, week = window(rl, "five_hour"), window(rl, "seven_day")
+    if five:
+        five = merge_window(previous.get("five_hour"), five)
+    if week:
+        week = merge_window(previous.get("seven_day"), week)
+    parts, usage = [], None
+    if five:
+        left, clock = time_left(five.get("resets_at"), now), reset_clock(five.get("resets_at"))
+        parts.append(f"5h {five['used_percentage']:.0f}%" + (f" ({left} · {clock})" if left and clock else ""))
+    else:
+        parts.append("5h 0%")  # never drop the segment, e.g. for a minute at the window reset
+    if week:
+        parts.append(f"wk {week['used_percentage']:.0f}%")
+        resets_at = week.get("resets_at")
+        if isinstance(resets_at, (int, float)):
+            elapsed = elapsed_fraction(resets_at, now)
+            p = pace(week["used_percentage"], elapsed)
+            parts.append(f"pace {p}")
+            # The readers of the file need both windows; a partial file would
+            # hide the last good one.
+            if five:
+                usage = {
+                    "five_hour": five,
+                    "seven_day": week,
+                    "elapsed_fraction": round(elapsed, 4),
+                    "pace": p,
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+                }
+    return " · ".join(parts), usage
+
+
+def write_ctx(data: dict, ctx_dir: str, tmux: str) -> None:
+    """Write jig's context file, <ctx_dir>/<tmux session>.json.
+
+    jig ctx reads this file to see how full a session's context is, so that a
+    session can stop before the harness compacts it. The shape is the one jig
+    ctx reads: session, total_input_tokens, context_window_size,
+    used_percentage and the write time. A refresh whose input lacks one of the
+    three figures keeps the last file, so the last known size stays readable.
+    """
+    cw = data.get("context_window")
+    if not isinstance(cw, dict):
+        return
+    tokens = cw.get("total_input_tokens")
+    size = cw.get("context_window_size")
+    pct = cw.get("used_percentage")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in (tokens, size, pct)):
+        return
+    if not os.path.isdir(ctx_dir):
+        return
+    import subprocess  # only paid inside tmux
+    target = os.environ.get("TMUX_PANE")
+    t = ["-t", target] if target else []
+    try:
+        r = subprocess.run([tmux, "display-message", "-p", *t, "#S"],
+                           capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return
+    session = r.stdout.strip()
+    # The name becomes a file name, so it may not climb out of the directory or
+    # hide as a dot file.
+    if r.returncode != 0 or not session or "/" in session \
+            or session.startswith("."):
+        return
+    zone = time.strftime("%z")
+    record = {"session": session, "total_input_tokens": int(tokens),
+              "context_window_size": int(size), "used_percentage": pct,
+              "written": time.strftime("%Y-%m-%dT%H:%M:%S")
+              + zone[:3] + ":" + zone[3:]}
+    path = os.path.join(ctx_dir, session + ".json")
+    tmp = os.path.join(ctx_dir, f".{session}-{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(record, f)
+            f.write("\n")
+        # Mode 664, so that the orchestrator account, in the same group, can
+        # read a worker's file.
+        os.chmod(tmp, 0o664)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def main() -> None:
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    now, line = time.time(), None
+    paths = host_paths()
+    path = os.environ.get("USAGE_FILE") or os.path.expanduser("~/.claude/usage.json")
+    try:
+        # Never unlink the lock file: a writer holding the old inode would not exclude a new one.
+        with open(path + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            line, usage = render(data, now, read_usage(path))
+            if usage is not None:
+                write_usage(path, usage)
+    except OSError:
+        pass  # the status line matters more than the file
+    if line is None:
+        line, _ = render(data, now)
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        user = ""
+    policy = paths["MODEL_POLICY"]
+    role, warning = model_policy(data, policy, user) if user and policy else ("", "")
+    model = model_name(data)
+    cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir")
+    branch = git_branch(os.path.realpath(cwd)) if isinstance(cwd, str) else "no git"
+    print(identity(user, role, branch, model))
+    h = health(paths["HEALTH_FILE"], now) if paths["HEALTH_FILE"] else ""
+    second = " · ".join(p for p in (run_time(data), line, h, warning) if p)
+    if second:
+        print(fit(second))
+    if os.environ.get("TMUX"):
+        short = ROLE_SHORT.get(role, role) or user
+        tmux = os.environ.get("TMUX_BIN") or "tmux"
+        rename_window(f"{short}:{branch}", tmux)
+        write_ctx(data, os.environ.get("CTX_DIR") or CTX_DIR, tmux)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # A status line that fails leaves the session without one; whatever
+        # went wrong, the exit code stays 0.
+        pass
+    sys.exit(0)
