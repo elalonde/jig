@@ -75,7 +75,11 @@ def draw():
     if dialog():
         body = DIALOG
     else:
-        body = "\n".join(history[-12:] + ["", RULE, "> " + buffer, RULE, BAR]) + "\n"
+        # An empty box shows the text of claude-placeholder as it is, escapes and all,
+        # as Claude Code draws a placeholder or a suggested prompt.
+        hint = home / "claude-placeholder"
+        shown = buffer or (hint.read_text() if hint.exists() else "")
+        body = "\n".join(history[-12:] + ["", RULE, "> " + shown, RULE, BAR]) + "\n"
     sys.stdout.write("\033[H\033[2J" + body)
     sys.stdout.flush()
 
@@ -92,6 +96,9 @@ try:
                 break
             moment = time.monotonic()
             for index, key in enumerate(chunk):
+                if key == "\x7f":
+                    buffer = buffer[:-1]
+                    continue
                 if key not in "\r\n":
                     buffer += key
                     continue

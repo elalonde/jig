@@ -38,6 +38,10 @@ TEMPLATE = ROOT / "templates" / "project.conf"
 PROJECT = "demo"
 SESSION = f"{PROJECT}-orch"
 POLL = "0.3"
+# The input box must stay empty and still this long before the loop types a line, and
+# the loop looks at it this often; the tests of that wait set a longer quiet time.
+QUIET = "0.3"
+BOX_CHECK = "0.1"
 REPORT_POLL = "1"
 BRANCH = "master"
 STANDING = "You are the orchestrator of demo.\nRead state.md first.\n"
@@ -92,6 +96,8 @@ class OrchTestCase(TempTestCase):
     def base_env(self):
         return self.env(PATH=f"{self.bin_dir}:{os.environ['PATH']}", JIG_SRV=str(self.srv),
                         JIG_ORCH_POLL=POLL,
+                        JIG_ORCH_QUIET=getattr(self, "quiet", QUIET),
+                        JIG_ORCH_BOX_CHECK=BOX_CHECK,
                         JIG_ORCH_REPORT_POLL=getattr(self, "report_poll", REPORT_POLL),
                         JIG_ORCH_HOURLY=getattr(self, "hourly", "3600"),
                         JIG_ORCH_FORK_WINDOW=getattr(self, "fork_window", "60"))
@@ -844,6 +850,137 @@ class TestReportLines(ReportTestCase):
                    what="the line after the dialog")
 
 
+RULE = "─" * 60
+BAR = "  ⏵⏵ auto mode on (shift+tab to cycle)"
+# What Claude Code draws in an empty box by itself: a placeholder, faint, and a
+# suggested prompt, in a grey of the 256 colours. Each has the cursor, in inverse video,
+# on its first character.
+PLACEHOLDER = '\x1b[7mT\x1b[27m\x1b[2mry "write a test for the parser"\x1b[22m'
+SUGGESTION = "\x1b[7mr\x1b[27m\x1b[38;5;246mun the tests again\x1b[39m"
+
+
+def drawn_screen(box):
+    return "\n".join(["● ready", "", RULE, "> " + box, RULE, BAR]) + "\n"
+
+
+class TestBoxIsEmpty(unittest.TestCase):
+    """box_is_empty() tells what a person typed from what Claude Code draws by itself."""
+
+    def empty(self, box):
+        return jig_tmux.box_is_empty(jig_tmux.drawn_box(drawn_screen(box)))
+
+    def test_placeholder_and_suggestion_are_not_typed_text(self):
+        # Faint or grey text after the cursor is the harness's own; the box is empty.
+        self.assertTrue(self.empty(""))
+        self.assertTrue(self.empty(PLACEHOLDER))
+        self.assertTrue(self.empty(SUGGESTION))
+        self.assertTrue(self.empty("\x1b[90mor this\x1b[39m"))
+        self.assertTrue(self.empty("\x1b[38;2;153;153;153mor this\x1b[39m"))
+
+    def test_typed_text_in_the_terminal_colour_is_typed(self):
+        # Text in the terminal's own colour is typed, also with the cursor on it, after
+        # it, or before a grey completion; a pasted marker is typed however it is drawn.
+        self.assertFalse(self.empty("draft"))
+        self.assertFalse(self.empty("\x1b[7md\x1b[27m"))
+        self.assertFalse(self.empty("dr\x1b[7m \x1b[27m"))
+        self.assertFalse(self.empty("fi\x1b[7mx\x1b[27m\x1b[2m the tests\x1b[22m"))
+        self.assertFalse(self.empty("\x1b[2m[Pasted text #1 +40 lines]\x1b[22m"))
+        self.assertFalse(self.empty("\x1b[31mred\x1b[39m"))
+
+    def test_shell_mark_is_typed_and_a_screen_without_a_box_has_none(self):
+        # "!" puts the box into shell mode, which a person did; a screen without the
+        # input bar or without two rules has no box to call empty.
+        self.assertFalse(jig_tmux.box_is_empty(["! "]))
+        self.assertIsNone(jig_tmux.drawn_box("● ready\n"))
+        self.assertIsNone(jig_tmux.drawn_box(DIALOG_SCREEN))
+        self.assertIsNone(jig_tmux.drawn_box("● ready\n> \n" + BAR + "\n"))
+
+
+class TestQuietBox(OrchTestCase):
+    """The loop types a line only into an empty input box that has not changed for the
+    quiet time, here 1 s instead of 10, looked at every 0.1 s."""
+
+    quiet = "1"
+
+    def keys(self, *keys):
+        self.tmux("send-keys", "-t", f"={SESSION}:", *keys)
+
+    def inbox(self, name):
+        path = self.srv / "in" / PROJECT / name
+        path.write_text(f"{name} for the orchestrator\n", encoding="utf-8")
+        return self.inbox_line(path)
+
+    def box(self):
+        return [line for line in self.screen().splitlines() if line.startswith("> ")][-1]
+
+    def test_line_waits_while_the_box_holds_typed_text(self):
+        # A person has typed a draft and left it there. The inbox line is held, logged
+        # once, and the draft stays as it was; once the draft is erased, the line goes.
+        self.start()
+        self.keys("-l", "draft reply")
+        self.until(lambda: self.box() == "> draft reply", what="the typed draft")
+        line = self.inbox("review.md")
+        self.until(lambda: "held until the input box" in self.log(), what="the held line")
+        time.sleep(2 * float(self.quiet))
+        self.assertEqual(self.submitted(), [])
+        self.assertEqual(self.box(), "> draft reply")
+        self.assertEqual(self.log().count("held until the input box"), 1)
+        self.keys(*["BSpace"] * len("draft reply"))
+        self.until(lambda: self.submitted() == [line], what="the inbox line")
+
+    def test_line_waits_until_the_box_has_not_changed_for_the_quiet_time(self):
+        # A person types a character and erases it every 0.4 s for about 2.4 s, so the
+        # box is often empty but never still for 1 s. The line goes only 1 s after the
+        # last change.
+        self.start()
+        self.keys("-l", "x")
+        self.until(lambda: self.box() == "> x", what="the typed character")
+        line = self.inbox("review.md")
+        for index in range(3):
+            time.sleep(0.4)
+            self.keys("BSpace")
+            last = time.monotonic()
+            time.sleep(0.4)
+            self.assertEqual(self.submitted(), [])
+            if index < 2:
+                self.keys("-l", "x")
+        self.until(lambda: self.submitted() == [line], what="the inbox line")
+        self.assertGreaterEqual(time.monotonic() - last, float(self.quiet))
+
+    def assert_goes_into(self, hint, shown):
+        # The empty box shows the harness's hint from the start. A plain capture shows
+        # its text, as if typed; the line still goes, and not before the quiet time.
+        (self.home / "claude-placeholder").write_text(hint, encoding="utf-8")
+        began = time.monotonic()
+        self.start()
+        self.assertEqual(self.box(), "> " + shown)
+        line = self.inbox("review.md")
+        self.until(lambda: self.submitted() == [line], what="the inbox line")
+        self.assertGreaterEqual(time.monotonic() - began, float(self.quiet))
+        self.assertNotIn("held until the input box", self.log())
+
+    def test_line_goes_into_an_empty_box_with_a_placeholder(self):
+        self.assert_goes_into(PLACEHOLDER, 'Try "write a test for the parser"')
+
+    def test_line_goes_into_an_empty_box_with_a_suggested_prompt(self):
+        self.assert_goes_into(SUGGESTION, "run the tests again")
+
+    def test_two_waiting_lines_go_in_the_order_they_came(self):
+        # Two inbox files land while a person's draft is in the box, the second with
+        # the name that sorts first. Both wait, and go in the order they came.
+        self.start()
+        self.keys("-l", "x")
+        self.until(lambda: self.box() == "> x", what="the typed character")
+        first = self.inbox("zeta.md")
+        self.until(lambda: "held until the input box" in self.log(), what="the held line")
+        second = self.inbox("alpha.md")
+        time.sleep(4 * float(POLL))
+        self.assertEqual(self.submitted(), [])
+        self.keys("BSpace")
+        self.until(lambda: len(self.submitted()) == 2, what="both inbox lines")
+        self.assertEqual(self.submitted(), [first, second])
+
+
 class TestDeliveryRetry(TempTestCase):
     """The queue pass of the loop, with deliver() replaced by a script of results."""
 
@@ -855,6 +992,9 @@ class TestDeliveryRetry(TempTestCase):
         orch.tee = self.tmp / "orch.txt"
         orch.reported_file = self.tmp / "reported"
         orch.queue, orch.held, orch.pending, orch.reported = [], None, set(), set()
+        # The input box always reads as empty and still, so that only the scripted
+        # results decide.
+        orch.box_ready = lambda: True
         sent = []
 
         def deliver(session, line):

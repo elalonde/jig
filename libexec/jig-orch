@@ -82,15 +82,25 @@ out, so neither a later tick nor a restart sends it again; a new date, or a new 
 sends it once more. A reminder line does not count as a change for the hourly tick. A
 state.md that cannot be read is logged once until it can be read again.
 
-Delivery. Every line waits in one queue. A dialog in the session (no input bar) is
-reported at once, in one line to the tee and to the log, and never answered; nothing is
-sent while it lasts. A line that fails before any key is typed (the session does not
+Delivery. Every line waits in one queue, and the lines go in the order they came. The
+loop types a line only when the session's input box is empty and has not changed for 10
+seconds, so that it never types into a box where a person is typing. It checks the box
+once a second, from a screen with the normal input bar, between the last two rules.
+Empty means no typed character: a placeholder or a suggested prompt that Claude Code
+draws in the box by itself, faint or grey, is not typed text. Each line it types
+changes the box, so the next line waits another 10 seconds. A line that waits stays at
+the head of the queue; a line held by typed text is logged once. A dialog in the
+session (no input bar) is reported at once, in one line to the tee and to the log, and
+never answered; nothing is sent while it lasts. A line that fails before any key is
+typed (the session does not
 exist, for example between a rollover and the next poll, it shows no input bar, or tmux
 send-keys fails) goes back to the head of the queue and is tried again at the next poll;
 a report commit goes into orch/reported only once its line is sent. A line that fails
 after its text was typed is logged once, to the tee and the log, and not tried again,
 so that no line is sent twice. JIG_SRV names <root> (/srv/jig); JIG_ORCH_POLL the seconds between
-polls (5); JIG_ORCH_REPORT_POLL the seconds between fetches (60); JIG_ORCH_HOURLY the
+polls (5); JIG_ORCH_QUIET the seconds the input box must stay empty and unchanged
+before a line goes (10); JIG_ORCH_BOX_CHECK the seconds between looks at the box (1);
+JIG_ORCH_REPORT_POLL the seconds between fetches (60); JIG_ORCH_HOURLY the
 seconds between ticks (3600); JIG_ORCH_FORK_WINDOW the seconds after a restart in which
 the loop still looks for forks of the old session (60).
 
@@ -139,6 +149,8 @@ MODEL = "claude-opus-5-5"
 EFFORT = "high"
 SRV_ROOT = "/srv/jig"
 POLL_SECONDS = 5.0
+QUIET_SECONDS = 10.0
+BOX_CHECK_SECONDS = 1.0
 REPORT_POLL_SECONDS = 60.0
 HOURLY_SECONDS = 3600.0
 HOURLY_LINE = "hourly update"
@@ -767,8 +779,52 @@ class Orch:
                             f"session {self.session} shows no input bar")
                 or failure.startswith("tmux send-keys failed"))
 
+    def check_box(self):
+        """Look at the session's input box, and note when it last changed.
+
+        A screen without the input bar, or without a box between two rules, shows no
+        box; it counts as a change, because what a person typed meanwhile cannot be
+        seen, and it never counts as empty.
+        """
+        moment = time.monotonic()
+        screen = jig_tmux.capture(self.session, styled=True)
+        box = None if screen is None else jig_tmux.drawn_box(screen)
+        drawn = None if box is None else "\n".join(box)
+        if drawn is None or drawn != self.box_drawn:
+            self.box_since = moment
+        self.box_drawn = drawn
+        self.box_typed = box is None or not jig_tmux.box_is_empty(box)
+        self.next_box_check = moment + self.box_check
+
+    def box_ready(self):
+        """Say whether a line may be typed now: the box, looked at once more, is empty
+        and has not changed for the quiet time."""
+        self.check_box()
+        return not self.box_typed and time.monotonic() - self.box_since >= self.quiet
+
+    def rest(self, seconds):
+        """Wait for the next poll, and look at the input box once a second meanwhile,
+        so that a change in it is seen even when the polls are further apart."""
+        end = time.monotonic() + seconds
+        while not self.stopping:
+            if time.monotonic() >= self.next_box_check:
+                self.check_box()
+            moment = time.monotonic()
+            if moment >= end:
+                return
+            time.sleep(max(0.0, min(end, self.next_box_check) - moment))
+
     def deliver_queue(self):
         while self.queue and not self.stopping:
+            if not self.box_ready():
+                # The line stays at the head of the queue, so that the lines keep their
+                # order. Only a box with typed text is logged: the wait after a line
+                # that the loop typed itself is the normal case.
+                line = self.queue[0][0]
+                if self.box_typed and self.held != line:
+                    self.held = line
+                    self.log(f"held until the input box is empty and still: {line}")
+                return
             # The mark of a line is its report commit, the (item, date) pair of a
             # reminder, or None.
             line, commit = self.queue.pop(0)
@@ -783,6 +839,8 @@ class Orch:
                     self.log(f"held for the next poll ({failure}): {line}")
                 return
             self.held = None
+            # The line's own text changed the box, whether or not it went.
+            self.box_since = time.monotonic()
             if failure:
                 # The text was typed, so a second attempt could send the line twice.
                 self.log(f"not delivered ({failure}): {line}", tee=True)
@@ -801,8 +859,12 @@ class Orch:
                 self.reported.add(commit)
                 self.write_reported()
 
-    def loop(self, poll, report_poll, hourly, fork_window):
+    def loop(self, poll, report_poll, hourly, fork_window, quiet=QUIET_SECONDS,
+             box_check=BOX_CHECK_SECONDS):
         self.stopping = False
+        self.quiet, self.box_check = quiet, box_check
+        self.box_drawn, self.box_typed = None, True
+        self.box_since = self.next_box_check = time.monotonic()
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(signum, self.stop_request)
         self.loop_started = time.time()
@@ -860,7 +922,7 @@ class Orch:
             self.watch_reports()
             screen = jig_tmux.capture(self.session)
             if screen is None:
-                time.sleep(poll)
+                self.rest(poll)
                 continue
             if jig_tmux.has_input_bar(screen):
                 no_bar, reported = 0, False
@@ -871,7 +933,7 @@ class Orch:
                     reported = True
                     self.log(f"dialog: session {self.session} shows no input bar; jig orch "
                              f"does not answer it: tmux attach -t {self.session}", tee=True)
-            time.sleep(poll)
+            self.rest(poll)
         if self.ours():
             worker.tmux("kill-session", "-t", f"={self.session}")
             self.copy_transcript()
@@ -967,13 +1029,15 @@ def main(argv):
         report_poll = setting("JIG_ORCH_REPORT_POLL", REPORT_POLL_SECONDS)
         hourly = setting("JIG_ORCH_HOURLY", HOURLY_SECONDS)
         fork_window = setting("JIG_ORCH_FORK_WINDOW", FORK_WINDOW_SECONDS)
+        quiet = setting("JIG_ORCH_QUIET", QUIET_SECONDS)
+        box_check = setting("JIG_ORCH_BOX_CHECK", BOX_CHECK_SECONDS)
         orch = Orch(argv[0])
         if hidden:
             # The descriptor holds the lock that start took; it stays open while this runs.
             descriptor = int(argv[2])
             os.ftruncate(descriptor, 0)
             os.pwrite(descriptor, f"{os.getpid()}\n".encode(), 0)
-            return orch.loop(poll, report_poll, hourly, fork_window)
+            return orch.loop(poll, report_poll, hourly, fork_window, quiet, box_check)
         return getattr(orch, argv[1])()
     except jig_units.Refused as error:
         print(f"jig orch: {error}", file=sys.stderr)
