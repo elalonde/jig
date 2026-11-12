@@ -2,13 +2,14 @@
 # jig new @PROJECT@: the steps that need the owner, in order 1 to 7.
 # 1 facts and the gh login; 2 GitHub repos; 3 deploy keys; 4 first
 # push of the seed repos; 5 clones in the role accounts; 6 model
-# policy rules; 7 status line, session-log hooks, ~/.tmux.conf.
-# gh asks for a login only when it has none, and logs out at the end.
-# Safe to run twice: each step keeps what is already there.
+# policy rules; 7 jig's status line in each account's Claude Code
+# settings, and ~/.tmux.conf. The settings get no hook of another
+# tool. gh asks for a login only when it has none, and logs out at
+# the end. Safe to run twice: each step keeps what is already there.
 # Checked by jig new: the accounts answer by ssh; the deploy keys and
-# the seed repos exist; the policy file, the status line and the
-# session-log tool exist. Not checked: that the GitHub names are
-# free; that the status line and the hooks run in a new session.
+# the seed repos exist; the policy file exists. Not checked: that the
+# GitHub names are free; that the status line command exists, which
+# jig upgrade installs; that it runs in a new session.
 set -eu -o pipefail
 
 P=@PROJECT@
@@ -20,8 +21,7 @@ ORCH_HOME=@ORCH_HOME@
 SPEC_HOME=@SPEC_HOME@
 IMPL_HOME=@IMPL_HOME@
 POLICY=@POLICY@
-LOG=@SESSION_LOG@
-LINE=@STATUSLINE@
+LINE=@STATUS_LINE@
 URL=https://github.com/$GH
 G=(git -c credential.helper=
   -c "credential.helper=!gh auth git-credential")
@@ -133,39 +133,36 @@ tomllib.load(open(sys.argv[1], "rb"))' "$POLICY"; then
   die "the policy is not valid; restored"
 fi
 
-echo "step 7: status line, session-log hooks, ~/.tmux.conf"
+echo "step 7: status line, ~/.tmux.conf"
 want=$(sha256sum < ~/.tmux.conf | cut -c1-8)
 for a in "$ORCH" "$SPEC" "$IMPL"; do
-  ssh -o BatchMode=yes "$a@localhost" python3 -I - "$LINE" "$LOG" \
-    <<'PY'
-import json, os, shutil, subprocess, sys
-line, log = sys.argv[1], sys.argv[2]
+  # Only the statusLine entry is written, so the settings get no hook.
+  # A status line of another command is replaced; the file as it was
+  # before the first change stays in settings.json.bak-new.
+  ssh -o BatchMode=yes "$a@localhost" python3 -I - "$LINE" <<'PY'
+import json, os, shutil, sys
+line = sys.argv[1]
 f = os.path.expanduser("~/.claude/settings.json")
 try:
     with open(f, encoding="utf-8") as h:
         d = json.load(h)
 except FileNotFoundError:
     d = {}
-has_line = "statusLine" in d
-has_log = "session-log" in json.dumps(d.get("hooks", {}))
-if has_line and has_log:
+old = d.get("statusLine")
+if isinstance(old, dict) and old.get("command") == line:
     print("settings kept")
     sys.exit(0)
 if os.path.exists(f) and not os.path.exists(f + ".bak-new"):
     shutil.copyfile(f, f + ".bak-new")
     os.chmod(f + ".bak-new", 0o600)
-if not has_line:
-    d["statusLine"] = {"type": "command", "command": line,
-                       "refreshInterval": 60}
+d["statusLine"] = {"type": "command", "command": line,
+                   "refreshInterval": 60}
 os.makedirs(os.path.dirname(f), exist_ok=True)
 with open(f + ".tmp", "w", encoding="utf-8") as h:
     json.dump(d, h, indent=2)
     h.write("\n")
 os.chmod(f + ".tmp", 0o600)
 os.replace(f + ".tmp", f)
-if not has_log:
-    subprocess.run([log + "/merge-hooks.py", f, log + "/hooks.json"],
-                   check=True)
 print("settings made")
 PY
   have=$(on "$a" "sha256sum < ~/.tmux.conf | cut -c1-8" 2>/dev/null ||
@@ -182,9 +179,24 @@ PY
 done
 
 # Readback. Expected: steps 1 to 7 in order; "made" lines on the first
-# run and "kept" lines on a second run; then one head per account, the
-# same hash three times; rules=3; tmux equal to want for each account.
+# run and "kept" lines on a second run; then one line per account:
+# the account, the word statusLine, and the command of LINE above; one
+# head per account, the same hash three times; rules=3; tmux equal to
+# want for each account.
 echo "--- readback new"
+for a in "$ORCH" "$SPEC" "$IMPL"; do
+  c=$(ssh -o BatchMode=yes "$a@localhost" python3 -I - <<'PY'
+import json, os
+f = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(f, encoding="utf-8") as h:
+        print(json.load(h)["statusLine"]["command"])
+except (OSError, ValueError, KeyError, TypeError):
+    print("none")
+PY
+)
+  echo "$a statusLine $c"
+done
 for a in "$ORCH" "$SPEC" "$IMPL"; do
   echo "$a head $(on "$a" "git -C ~/$d log -1 --format=%h")"
 done

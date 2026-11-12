@@ -15,12 +15,14 @@ After the product's first commit, jig's pre-commit hook goes into the seed produ
 clone, at the path git names for it, with that path in .git/info/exclude.
 
 What needs the owner's login (the GitHub repos, deploy keys, the first push,
-the clones in the other accounts, the model policy rules, the status line,
-the session-log hooks, ~/.tmux.conf) goes into the block <srv>/blocks/
-<project>/new.sh, and the line that runs it is printed last.
+the clones in the other accounts, the model policy rules, jig's status line in
+each account's Claude Code settings, ~/.tmux.conf) goes into the block
+<srv>/blocks/<project>/new.sh, and the line that runs it is printed last. The
+settings get no hook of another tool. The status line is jig's own install,
+which jig upgrade makes, so jig new does not look for it.
 
-The owner's login, the host name and the GitHub owner come from
-<srv>/host.conf, so they never appear in this tree. A file that exists is never
+The owner's login, the host name, the GitHub owner and the model policy file
+come from <srv>/host.conf, so they never appear in this tree. A file that exists is never
 changed: a second run changes nothing and exits 0. A project that exists and
 that jig new did not make is refused, and so is a bad name. Exits 1 on a
 refusal, 2 on a usage error.
@@ -53,6 +55,8 @@ PRE_COMMIT = ROOT / "hooks" / "pre-commit"
 SRV_ROOT = "/srv/jig"
 BLOCK_ID = "new"
 FIRST_BRANCH = "0.1"
+# The statusLine command of every account: jig's status line in the newest install.
+STATUS_LINE = "/opt/jig/current/libexec/jig-statusline"
 
 # Lower-case letters, digits and single hyphens. A name that ends in -dev would
 # be confused with a sidecar.
@@ -62,19 +66,17 @@ NAME_MAX = 24
 VALUE = re.compile(r"[A-Za-z0-9._/~-]+")
 MARK = re.compile(r"@[A-Z_]+@")
 
-REQUIRED = ("OWNER", "HOST", "GITHUB_OWNER")
+REQUIRED = ("OWNER", "HOST", "GITHUB_OWNER", "MODEL_POLICY")
 MEANING = {
     "OWNER": "the owner's login on this host",
     "HOST": "this host's name",
     "GITHUB_OWNER": "the GitHub account that holds the repos",
+    "MODEL_POLICY": "the model policy file the block adds rules to",
 }
 DEFAULTS = {
     "ORCH_ACCOUNT": "orchestrator",
     "SPEC_ACCOUNT": "specwriter",
     "IMPL_ACCOUNT": "implementer",
-    "MODEL_POLICY": "/srv/claude/model-policy.toml",
-    "SESSION_LOG": "/opt/session-log",
-    "STATUSLINE": "/opt/statusline/statusline.py",
 }
 
 # Lint A and the hook of the product are jig's own, so a fix reaches every project.
@@ -129,12 +131,8 @@ def check_name(project):
 
 
 def check_facts(host):
-    for key in ("MODEL_POLICY", "STATUSLINE"):
-        if not pathlib.Path(host[key]).is_file():
-            raise Refusal(f"{key}: {host[key]} is not a file")
-    for name in ("merge-hooks.py", "hooks.json"):
-        if not (pathlib.Path(host["SESSION_LOG"]) / name).is_file():
-            raise Refusal(f"SESSION_LOG: {host['SESSION_LOG']}/{name} is not a file")
+    if not pathlib.Path(host["MODEL_POLICY"]).is_file():
+        raise Refusal(f"MODEL_POLICY: {host['MODEL_POLICY']} is not a file")
 
 
 def project_paths(srv, project):
@@ -388,7 +386,7 @@ def new(project):
         "GITHUB_OWNER": host["GITHUB_OWNER"], "SRV": str(srv),
         "ORCH": host["ORCH_ACCOUNT"], "SPEC": host["SPEC_ACCOUNT"],
         "IMPL": host["IMPL_ACCOUNT"], "POLICY": host["MODEL_POLICY"],
-        "SESSION_LOG": host["SESSION_LOG"], "STATUSLINE": host["STATUSLINE"],
+        "STATUS_LINE": STATUS_LINE,
         "ORCH_HOME": homes["orch"], "SPEC_HOME": homes["spec"],
         "IMPL_HOME": homes["impl"],
         # Last, so that no other name is filled inside the preferences' text.
@@ -399,8 +397,8 @@ def new(project):
     digest = hashlib.sha256(block.read_bytes()).hexdigest()[:8]
     say("")
     say(f"The block {BLOCK_ID} makes the GitHub repos and keys, pushes the seed repos,")
-    say("clones them in the other accounts, and sets the policy rules, the status")
-    say("line, the session-log hooks and ~/.tmux.conf. Its readback is in "
+    say("clones them in the other accounts, and sets the policy rules, jig's status")
+    say("line and ~/.tmux.conf. Its readback is in "
         f"{srv / 'out' / project / (BLOCK_ID + '.txt')}.")
     say(f"# as {host['OWNER']} on {host['HOST']}")
     say(f"jig run {project} {BLOCK_ID} {digest}")

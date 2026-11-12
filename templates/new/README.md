@@ -36,15 +36,18 @@ refuses and prints this list.
 | `OWNER` | yes | the owner's login on this host, who runs the block | |
 | `HOST` | yes | this host's name | |
 | `GITHUB_OWNER` | yes | the GitHub account that holds the repos | |
+| `MODEL_POLICY` | yes | the model policy file the block adds rules to | |
 | `ORCH_ACCOUNT` | no | the orchestrator account | `orchestrator` |
 | `SPEC_ACCOUNT` | no | the spec writer account | `specwriter` |
 | `IMPL_ACCOUNT` | no | the implementer account | `implementer` |
-| `MODEL_POLICY` | no | the model policy file the block adds rules to | `/srv/claude/model-policy.toml` |
-| `SESSION_LOG` | no | the session-log tool, with `merge-hooks.py` and `hooks.json` | `/opt/session-log` |
-| `STATUSLINE` | no | the status line command | `/opt/statusline/statusline.py` |
 
 The owner, the host name and the GitHub owner also go into the new project's
 `terms.txt`, so lint A keeps them out of its product.
+
+The block sets the `statusLine` command of each account's Claude Code settings
+to jig's status line, `/opt/jig/current/libexec/jig-statusline`, which `jig
+upgrade` installs; it adds no hook of another tool. That path is jig's own
+install, not a host fact, so it has no key.
 
 ## Template names
 

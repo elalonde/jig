@@ -1,6 +1,7 @@
 """jig new: a test project in a temporary root, with doubles for ssh and the other accounts."""
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -22,6 +23,8 @@ OWNER = "ownerx"
 HOST = "bench7"
 GITHUB = "ghowner"
 PROJECT = "demo"
+# The statusLine command that every account gets: jig's own status line.
+JIG_STATUS_LINE = "/opt/jig/current/libexec/jig-statusline"
 PLACEHOLDER = re.compile(r"@[A-Z_]+@|<[a-z][a-z0-9 ]*>")
 PATTERN_TEMPLATE = ROOT / "templates" / "new" / "product" / "tools" / "lint-a-patterns.txt"
 
@@ -65,16 +68,13 @@ class JigNewTest(TempTestCase):
         self.ssh = self.bin_dir / "ssh-double"
         self.ssh.write_text(SSH_DOUBLE, encoding="utf-8")
         self.ssh.chmod(0o755)
-        tools = self.tmp / "tools"
-        (tools / "session-log").mkdir(parents=True)
-        for name in ("merge-hooks.py", "hooks.json"):
-            (tools / "session-log" / name).write_text("{}\n", encoding="utf-8")
-        (tools / "statusline.py").write_text("\n", encoding="utf-8")
-        (tools / "policy.toml").write_text("", encoding="utf-8")
+        # Only the policy file is a host fact on disk: no status line file and no
+        # tool of another kind exists, and jig new must not need one.
+        self.policy = self.tmp / "tools" / "policy.toml"
+        self.policy.parent.mkdir()
+        self.policy.write_text("", encoding="utf-8")
         self.host_conf(ORCH_ACCOUNT=ORCH, OWNER=OWNER, HOST=HOST, GITHUB_OWNER=GITHUB,
-                       MODEL_POLICY=tools / "policy.toml",
-                       SESSION_LOG=tools / "session-log",
-                       STATUSLINE=tools / "statusline.py")
+                       MODEL_POLICY=self.policy)
 
     def host_conf(self, **values):
         text = "# host facts\n" + "".join(f"{key}={value}\n" for key, value in values.items())
@@ -626,6 +626,81 @@ class JigNewTest(TempTestCase):
                 seeded = run(["git", "-C", source, "rev-parse", branch], env=self.env())
                 self.assertEqual(pushed.stdout, seeded.stdout, f"{repo} {branch}")
 
+    def run_settings_step(self):
+        """Run the block's header, step 7 and the status line readback on fixture accounts.
+
+        ssh is replaced by a shell function that runs the command in the account's
+        fixture home, and tmux by a double that does nothing, so no real account,
+        session or tmux server is touched.
+        """
+        text = (self.srv / "blocks/demo/new.sh").read_text(encoding="utf-8")
+        header = text[text.index("set -eu"):text.index('echo "step 1:')]
+        step = text[text.index('echo "step 7:'):text.index("# Readback.")]
+        start = text.index('echo "--- readback new"')
+        readback = text[start:text.index('  echo "$a head', start)]
+        readback = readback[:readback.rindex("for a in")]
+        fake_ssh = ('ssh() {\n  [ "$1" = -o ] && shift 2\n  local home="$FAKE/accounts/${1%@*}"\n'
+                    '  shift\n  (cd "$home" && HOME="$home" bash -c "$*")\n}\n')
+        tmux = self.bin_dir / "tmux"
+        tmux.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tmux.chmod(0o755)
+        env = self.env(FAKE=str(self.fake), PATH=f"{self.bin_dir}:{os.environ['PATH']}",
+                       TMUX_TMPDIR=str(self.tmp), TMPDIR=str(self.tmp))
+        return run(["bash", "-c", header + fake_ssh + step + readback], env=env)
+
+    def settings(self, account):
+        path = self.account(account) / ".claude/settings.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_block_settings_step_writes_jig_status_line_and_no_other_hook(self):
+        # Two accounts have no settings yet; the implementer has a status line of
+        # another command and a hook of its own. After the step every account's
+        # statusLine runs jig's status line, no hooks entry is added, the existing
+        # one is left as it was, and the readback prints each account's command.
+        self.made()
+        (self.fake / "accounts" / ORCH).mkdir()
+        (self.home / ".tmux.conf").write_text("set -g mouse on\n", encoding="utf-8")
+        hooks = {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}
+        existing = self.account("implementer") / ".claude/settings.json"
+        existing.parent.mkdir()
+        existing.write_text(json.dumps({"statusLine": {"type": "command",
+                                                       "command": "/usr/bin/other-line"},
+                                        "hooks": hooks}), encoding="utf-8")
+        result = self.run_settings_step()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("settings made"), 3, result.stdout)
+        for account in (ORCH, "specwriter", "implementer"):
+            settings = self.settings(account)
+            self.assertEqual(settings["statusLine"],
+                             {"type": "command", "command": JIG_STATUS_LINE,
+                              "refreshInterval": 60})
+            self.assertIn(f"{account} statusLine {JIG_STATUS_LINE}\n", result.stdout)
+        for account in (ORCH, "specwriter"):
+            self.assertNotIn("hooks", self.settings(account))
+        self.assertEqual(self.settings("implementer")["hooks"], hooks)
+        self.assertTrue((existing.parent / "settings.json.bak-new").is_file())
+        again = self.run_settings_step()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(again.stdout.count("settings kept"), 3, again.stdout)
+
+    def test_block_sets_jig_status_line_and_names_no_other_tool(self):
+        # The block names jig's status line as the command, reads it back per
+        # account, and says that jig new did not check it; nothing in it names the
+        # session-log hooks or the host tool of the old status line.
+        self.made()
+        text = (self.srv / "blocks/demo/new.sh").read_text(encoding="utf-8")
+        self.assertIn(f"LINE={JIG_STATUS_LINE}\n", text)
+        self.assertIn('echo "$a statusLine $c"', text)
+        readback_note = text[text.index("# Readback. Expected:"):text.index("--- readback")]
+        self.assertIn("statusLine", readback_note)
+        header = text[text.index("Checked by jig new:"):text.index("set -eu")]
+        checked, not_checked = header.split("Not checked:")
+        self.assertNotIn("status line", checked)
+        self.assertIn("status line", not_checked)
+        for word in ("session-log", "merge-hooks", "hooks.json", "SESSION_LOG",
+                     "STATUSLINE", "statusline.py"):
+            self.assertNotIn(word, text)
+
     def test_refuses_when_not_run_as_the_orchestrator(self):
         result = self.new(PROJECT, USER="someone", LOGNAME="someone")
         self.assertEqual(result.returncode, 1)
@@ -645,14 +720,41 @@ class JigNewTest(TempTestCase):
         result = self.new(PROJECT)
         self.assertEqual(result.returncode, 1)
         self.assertIn("cannot read", result.stderr)
-        for key in ("OWNER", "HOST", "GITHUB_OWNER", "ORCH_ACCOUNT=orchestrator",
-                    "SPEC_ACCOUNT=", "IMPL_ACCOUNT=", "MODEL_POLICY=", "SESSION_LOG=",
-                    "STATUSLINE="):
+        for key in ("OWNER", "HOST", "GITHUB_OWNER", "MODEL_POLICY  the model policy",
+                    "ORCH_ACCOUNT=orchestrator", "SPEC_ACCOUNT=", "IMPL_ACCOUNT="):
             self.assertIn(f"  {key}", result.stderr)
+        # The keys of the old status line and the session-log hooks are gone, and no
+        # key has a host path as its default.
+        for key in ("SESSION_LOG", "STATUSLINE"):
+            self.assertNotIn(key, result.stderr)
+        optional = result.stderr.split("Optional", 1)[1].splitlines()[1:]
+        self.assertEqual(len(optional), 3, result.stderr)
+        for line in optional:
+            self.assertNotIn("/", line)
         readme = (ROOT / "templates" / "new" / "README.md").read_text(encoding="utf-8")
         for key in ("OWNER", "HOST", "GITHUB_OWNER", "ORCH_ACCOUNT", "SPEC_ACCOUNT",
-                    "IMPL_ACCOUNT", "MODEL_POLICY", "SESSION_LOG", "STATUSLINE"):
+                    "IMPL_ACCOUNT", "MODEL_POLICY"):
             self.assertIn(f"| `{key}` |", readme)
+        for key in ("SESSION_LOG", "STATUSLINE"):
+            self.assertNotIn(f"`{key}`", readme)
+        self.assertIn("| `MODEL_POLICY` | yes |", readme)
+        self.assertFalse((self.srv / "blocks" / PROJECT).exists())
+
+    def test_refuses_without_the_model_policy_and_names_the_key(self):
+        # The policy file has no default: a host.conf without it is refused before
+        # anything is made.
+        self.host_conf(ORCH_ACCOUNT=ORCH, OWNER=OWNER, HOST=HOST, GITHUB_OWNER=GITHUB)
+        result = self.new(PROJECT)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("sets no MODEL_POLICY", result.stderr)
+        self.assertFalse((self.srv / "blocks" / PROJECT).exists())
+
+    def test_refuses_when_the_model_policy_is_not_a_file(self):
+        # The key is there but names nothing; the refusal names the key.
+        self.policy.unlink()
+        result = self.new(PROJECT)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"MODEL_POLICY: {self.policy} is not a file", result.stderr)
         self.assertFalse((self.srv / "blocks" / PROJECT).exists())
 
     def test_unreachable_account_refuses_and_a_rerun_completes(self):
