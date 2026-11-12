@@ -109,6 +109,14 @@ c="git clone -q -b 0.1"
 on "$SPEC" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
 on "$IMPL" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
 on "$IMPL" "[ -d ~/$d/$P ] || $c github-$P:$GH/$P ~/$d/$P"
+# A product that tracks its hooks directory gets git to read it in every
+# product clone, as in the seed clone. Otherwise jig start puts the
+# pre-commit hook in .git/hooks, and once the product's make check sets
+# the hooks path, git skips that hook for the rest of the first unit.
+# Setting the same value again is harmless, so the step can run twice.
+hp="[ ! -d ~/$d/$P/hooks ] || git -C ~/$d/$P config core.hooksPath hooks"
+on "$ORCH" "$hp"
+on "$IMPL" "$hp"
 echo "step 5 ok"
 
 echo "step 6: model policy rules"

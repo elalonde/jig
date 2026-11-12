@@ -41,6 +41,10 @@ There it skips the commit-msg hook, because the tree is not a git clone, and
 lint A reads the generic patterns only, because the private terms file is not
 part of the source.
 
+The hooks path that `make check` sets also runs the tracked `hooks/pre-commit`,
+which runs the term check of the `-dev` clone that holds this clone, so a clone
+of jig outside a `-dev` clone cannot commit after `make hook`.
+
 ## Release files
 
     make version-bump VERSION=<X.Y.Z>   # write the version into VERSION

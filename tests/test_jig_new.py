@@ -261,13 +261,25 @@ class JigNewTest(TempTestCase):
         # starts its watcher would miss every event. The first rule of the session rules
         # names the watcher command, the Monitor tool and the once-read of the old
         # session's events; a fresh session reads those events too, and no line says
-        # that the supervisor sends a line into the session.
+        # that the supervisor sends a line into the session. The harness tool ends a
+        # watcher at a deadline, so the same rule says to start it with the longest
+        # deadline and again after each end, and how to treat the lines that a
+        # restarted watcher prints again.
         text = self.made_text("impl/orch/ORCHESTRATOR.md")
         rules = text.split("## Session rules", 1)[1]
         first = rules.split(" - ", 2)[1]
         for part in ("The first thing after each start of this session: start one "
                      "background watcher, `jig orch demo events`,",
                      "(in Claude Code, the Monitor tool)",
+                     "Never run two watchers at once.",
+                     "When the harness tool ends a watcher at a deadline, start it with the "
+                     "longest deadline that the tool allows, and start it again at each "
+                     "notice that it ended;",
+                     "A restarted watcher prints first the lines that the earlier watcher of "
+                     "this session printed, in the same order.",
+                     "Act only on the lines after them, and on a line of that replay only "
+                     "when you have no record, in this session or in `state.md` and "
+                     "`handoff.md`, of having handled it.",
                      "`~/ws/reviews/demo/orch/events.log`",
                      "the lines between the last two start lines: `jig orch demo events --old`.",
                      "Act on each of these events that `state.md` and `handoff.md` do not "
@@ -278,6 +290,8 @@ class JigNewTest(TempTestCase):
                                                            ""))
         self.assertNotIn("supervisor sends", text)
         self.assertNotIn("announces", text)
+        self.assertNotIn("Start no second one", text)
+        self.assertNotIn("minutes", first)
 
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
@@ -651,6 +665,21 @@ class JigNewTest(TempTestCase):
     def settings(self, account):
         path = self.account(account) / ".claude/settings.json"
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_block_sets_the_hooks_path_in_each_product_clone_of_the_clone_step(self):
+        # The clone step makes the implementer's product clone; the orchestrator holds
+        # the seed clone. Both must read the product's tracked hooks directory, so the
+        # step sets core.hooksPath in each of them when that directory exists, and
+        # does so before it reports the step as done.
+        self.made()
+        text = (self.srv / "blocks/demo/new.sh").read_text(encoding="utf-8")
+        step = text.split('echo "step 5: clones"', 1)[1].split('echo "step 5 ok"', 1)[0]
+        self.assertIn('hp="[ ! -d ~/$d/$P/hooks ] || '
+                      'git -C ~/$d/$P config core.hooksPath hooks"', step)
+        self.assertIn('on "$ORCH" "$hp"\n', step)
+        self.assertIn('on "$IMPL" "$hp"\n', step)
+        self.assertLess(step.index("$c github-$P:$GH/$P ~/$d/$P"),
+                        step.index('on "$IMPL" "$hp"'))
 
     def test_block_settings_step_writes_jig_status_line_and_no_other_hook(self):
         # Two accounts have no settings yet; the implementer has a status line of

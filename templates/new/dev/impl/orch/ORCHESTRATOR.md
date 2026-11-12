@@ -183,7 +183,14 @@ the exit code.
 - The first thing after each start of this session: start one background
   watcher, `jig orch @PROJECT@ events`, through the harness tool that gives
   you a turn for each new line that a command prints (in Claude Code, the
-  Monitor tool). Start no second one. The supervisor types nothing into this
+  Monitor tool). Never run two watchers at once. When the harness tool ends a
+  watcher at a deadline, start it with the longest deadline that the tool
+  allows, and start it again at each notice that it ended; the tool's own
+  description gives the deadline. A restarted watcher prints first the lines
+  that the earlier watcher of this session printed, in the same order. Act
+  only on the lines after them, and on a line of that replay only when you
+  have no record, in this session or in `state.md` and `handoff.md`, of
+  having handled it. The supervisor types nothing into this
   session: it appends each event as one line to the event file,
   `~/ws/reviews/@PROJECT@/orch/events.log` (the line `hourly update`, the
   `inbox:` and `readback:` lines, the lines `report: <ID> <status>` and the
