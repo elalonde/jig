@@ -355,6 +355,16 @@ class ValidatePromptTest(ValidateCase):
                           "    standard. Spec tag: spec-p0.", *blocks["ROLE"][1:]]
         self.assert_valid("prompt", prompt_text(first, blocks, last))
 
+    def test_validate_prompt_accepts_each_spec_tag_form_of_a_version_line(self):
+        # A project that ships releases names spec-X.Y or spec-X.YrM where a project
+        # that runs by phases names spec-pN; the prompt passes with either.
+        text = fixture("good-prompt.md")
+        self.assertIn("Spec tag: spec-p0.", text)
+        for tag in ("spec-1.2", "spec-1.2r1", "spec-12.30r10"):
+            with self.subTest(tag):
+                self.assert_valid("prompt", text.replace("Spec tag: spec-p0.",
+                                                         f"Spec tag: {tag}."))
+
     def test_validate_prompt_accepts_a_specwriter_prompt_without_the_comment_standard(self):
         first, blocks, last = prompt_parts()
         first = "# demo  paste into: jig-spec-demo (specwriter, ~/ws/src/jig-dev)"

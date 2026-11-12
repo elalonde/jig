@@ -64,7 +64,7 @@ class TagCase(TempTestCase):
         return result.stdout.strip()
 
     def commit(self, files, removed=(), subject="change"):
-        """Commit files in the work clone and push the line; return the full hash."""
+        """Commit files in the work clone and push its branch; return the full hash."""
         for name, text in files.items():
             path = self.work / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,7 +73,7 @@ class TagCase(TempTestCase):
             (self.work / name).unlink()
         self.ok(["git", "-C", self.work, "add", "-A"])
         self.ok(["git", "-C", self.work, "commit", "-q", "--no-verify", "-m", subject])
-        self.ok(["git", "-C", self.work, "push", "-q", "origin", LINE])
+        self.ok(["git", "-C", self.work, "push", "-q", "origin", "HEAD"])
         return self.ok(["git", "-C", self.work, "rev-parse", "HEAD"])
 
     def approve(self, tag, commit):
@@ -114,11 +114,16 @@ class TagCase(TempTestCase):
 
 
 class TagFormsTest(TagCase):
-    def test_each_of_the_four_forms_is_tagged_pushed_and_read_back(self):
-        # The revision follows the phase tag on the same commit, so no document differs.
-        for tag in ("spec-p3", "spec-p3r1", "impl-p3", "kickoff-r12"):
+    def test_each_of_the_six_forms_is_tagged_pushed_and_read_back(self):
+        # Each revision follows its base tag on the same commit, so no document differs.
+        # A tag of a version line needs that line in BRANCH, so origin holds the lines.
+        for line in ("1.2", "12.30"):
+            self.ok(["git", "-C", self.work, "push", "-q", "origin", f"HEAD:refs/heads/{line}"])
+        for tag, line in (("spec-p3", LINE), ("spec-p3r1", LINE), ("impl-p3", LINE),
+                          ("kickoff-r12", LINE), ("spec-1.2", "1.2"), ("spec-1.2r1", "1.2"),
+                          ("spec-12.30", "12.30"), ("spec-12.30r10", "12.30")):
             with self.subTest(tag):
-                result = self.tag(tag, self.first)
+                result = self.tag(tag, self.first, BRANCH=line)
                 self.assert_tagged(result, tag, self.first)
                 self.assertIn(tag, result.stdout)
 
@@ -163,11 +168,15 @@ class TagRefusalTest(TagCase):
         self.assert_refused(self.tag("impl-p3", self.first, BRANCH=None), "branch")
         self.assertIsNone(self.on_origin("impl-p3"))
 
-    def test_a_tag_of_none_of_the_four_forms_is_refused(self):
+    def test_a_tag_of_none_of_the_six_forms_is_refused(self):
+        # The form is checked before the line, so BRANCH may hold the line a tag names.
         for tag in ("spec-p", "spec-px", "spec-p3r", "spec-p3r1x", "impl-p3r1", "kickoff-1",
-                    "kickoff-rx", "v0.3.0", "release-p3", "spec-p-3"):
+                    "kickoff-rx", "v0.3.0", "release-p3", "spec-p-3", "spec-1", "spec-1.",
+                    "spec-.2", "spec-1.2.3", "spec-1.2r", "spec-1.2r1.4", "spec-1.2-r1",
+                    "spec-1.2R1", "spec-p1.2", "impl-1.2", "kickoff-1.2", "spec-1,2",
+                    "spec-1.2x"):
             with self.subTest(tag):
-                self.assert_refused(self.tag(tag, self.first), "form", tag)
+                self.assert_refused(self.tag(tag, self.first, BRANCH="1.2"), "form", tag)
                 self.assertIsNone(self.on_origin(tag))
 
     def test_a_tag_that_exists_on_origin_is_refused(self):
@@ -295,6 +304,73 @@ class TagRevisionTest(TagCase):
     def test_a_document_outside_specs_needs_no_row(self):
         changed = self.commit({"impl/notes.md": "notes\n", "README": "b\n"})
         self.assert_tagged(self.tag("spec-p4r1", changed), "spec-p4r1", changed)
+
+
+class TagVersionLineTest(TagCase):
+    """The tags of a project that ships releases: spec-X.Y and its revisions spec-X.YrM.
+
+    Origin holds the lines 1.2 and 1.3, so a refusal for the line comes from the tag's
+    own X.Y and not from a line that origin lacks. The work clone writes on 1.2.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.ok(["git", "-C", self.work, "checkout", "-q", "-b", "1.2"])
+        self.ok(["git", "-C", self.work, "push", "-q", "origin", "HEAD"])
+        self.ok(["git", "-C", self.work, "push", "-q", "origin", "HEAD:refs/heads/1.3"])
+
+    def closed_loop(self, document_commit, unit="rv1"):
+        """Commit the row and the clean findings file of a loop that read document_commit."""
+        return self.commit({STATUS: status_text((DOC, document_commit, unit)),
+                            f"impl/log/{unit}-findings.md": findings_text("info")})
+
+    def test_a_line_tag_is_made_when_branch_names_its_line(self):
+        self.assert_tagged(self.tag("spec-1.2", self.first, BRANCH="1.2"),
+                           "spec-1.2", self.first)
+
+    def test_a_line_tag_for_another_line_than_branch_is_refused(self):
+        # 1.3 is on origin and holds the commit, so only the tag's own line can refuse it.
+        # 1.20 shows that the line is compared whole, not as a prefix.
+        for tag, branch in (("spec-1.2", "1.3"), ("spec-1.2r1", "1.3"), ("spec-1.3", "1.2"),
+                            ("spec-1.20", "1.2")):
+            with self.subTest(tag=tag, branch=branch):
+                self.assert_refused(self.tag(tag, self.first, BRANCH=branch), "line", tag,
+                                    f"BRANCH is {branch}")
+                self.assertIsNone(self.on_origin(tag))
+
+    def test_a_line_revision_whose_changed_document_has_no_closed_loop_is_refused(self):
+        self.approve("spec-1.2", self.first)
+        changed = self.commit({DOC: "two\n"})
+        self.assert_refused(self.tag("spec-1.2r1", changed, BRANCH="1.2"), "review",
+                            "since spec-1.2", DOC, "no row")
+        self.assertIsNone(self.on_origin("spec-1.2r1"))
+
+    def test_a_line_revision_whose_changed_document_has_a_closed_loop_is_tagged(self):
+        self.approve("spec-1.2", self.first)
+        changed = self.commit({DOC: "two\n"})
+        recorded = self.closed_loop(changed)
+        self.assert_tagged(self.tag("spec-1.2r1", recorded, BRANCH="1.2"),
+                           "spec-1.2r1", recorded)
+
+    def test_a_line_revision_compares_with_a_phase_tag_when_that_is_nearest(self):
+        # The project switched to version lines without a spec-X.Y tag in between, so the
+        # last phase tag is the previous approval: the change since it needs a loop.
+        self.approve("spec-p4", self.first)
+        changed = self.commit({DOC: "two\n"})
+        self.assert_refused(self.tag("spec-1.2r1", changed, BRANCH="1.2"), "review",
+                            "since spec-p4", DOC, "no row")
+        recorded = self.closed_loop(changed)
+        self.assert_tagged(self.tag("spec-1.2r1", recorded, BRANCH="1.2"),
+                           "spec-1.2r1", recorded)
+
+    def test_a_line_tag_after_a_phase_tag_is_the_nearest_previous_tag(self):
+        # The document changed after the phase tag, and spec-1.2 approved that change, so
+        # a revision that changes nothing more needs no row.
+        self.approve("spec-p4", self.first)
+        changed = self.commit({DOC: "two\n"})
+        self.approve("spec-1.2", changed)
+        later = self.commit({"README": "b\n"})
+        self.assert_tagged(self.tag("spec-1.2r1", later, BRANCH="1.2"), "spec-1.2r1", later)
 
 
 class TagCleanupTest(TagCase):

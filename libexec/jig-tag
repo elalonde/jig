@@ -3,10 +3,12 @@
 
 usage: jig tag <project> <tag> <commit>
 
-Eric runs this in a tag block. A tag has one of four forms: spec-pN approves the specs
-of a phase, spec-p<N>r<M> a revision of approved specs, impl-pN a phase close and
-kickoff-rN a kickoff record, where N and M are whole numbers. Only the form is checked,
-not whether the number comes next in its series.
+Eric runs this in a tag block. A tag has one of six forms. While a project runs by
+phases, spec-pN approves the specs of a phase, spec-p<N>r<M> a revision of approved
+specs and impl-pN a phase close. Once it ships releases instead, spec-X.Y approves the
+specs of the version line X.Y and spec-X.YrM a revision of them. kickoff-rN approves a
+kickoff record in either case. N, M, X and Y are whole numbers. Only the form is
+checked, not whether the number comes next in its series.
 
 The version line comes only from BRANCH in the environment, which the tag block sets:
 a conf file of the account that runs this may name another line, or none. The origin
@@ -15,14 +17,18 @@ or, when there is no such file or it sets no REPO, of ~/ws/src/<project>-dev. Th
 happens in a temporary clone of that origin, which is removed at the end whatever the
 outcome, so that the account's own clone stays as it was.
 
-The tag is refused when it exists on origin, or when the commit is not on the line of
-origin. A revision tag is also refused unless every spec document that differs from
-the previous approved tag has a closed review loop. A spec document is a file under
-specs/ other than the kickoff record and the status file, specs/00-kickoff.md and
-specs/00-status.md. The previous approved tag is the nearest tag of a spec form that
-is an ancestor of the commit. A document's loop is closed when a row of the table
-"Closed review loops" in specs/00-status.md names the document, the document at the
-commit to tag is the same as at the commit of the row, and the row's review left
+A spec-X.Y or spec-X.YrM tag is refused when X.Y is not the line in BRANCH, because
+such a tag approves the specs of that one line and the tag block works on the current
+line only. The tag is refused when it exists on origin, or when the commit is not on
+the line of origin. A revision tag, spec-p<N>r<M> or spec-X.YrM, is also refused unless
+every spec document that differs from the previous approved tag has a closed review
+loop. A spec document is a file under specs/ other than the kickoff record and the
+status file, specs/00-kickoff.md and specs/00-status.md. The previous approved tag is
+the nearest tag of any of the four spec forms that is an ancestor of the commit, so
+the first revision on a new version line compares with the last phase tag when no
+spec-X.Y tag came between. A document's loop is closed when a row of the table "Closed
+review loops" in specs/00-status.md names the document, the document at the commit to
+tag is the same as at the commit of the row, and the row's review left
 impl/log/<ID>-findings.md with no must-fix finding. The status file and the findings
 file are read at the commit to tag, because that is the tree the tag approves.
 
@@ -44,9 +50,13 @@ PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]*")
 # The commit is given as a hash, full or abbreviated; a branch name or another
 # expression could name a different commit by the time the tag is made.
 COMMIT = re.compile(r"[0-9a-f]{4,40}")
-FORMS = re.compile(r"spec-p[0-9]+(?:r[0-9]+)?|impl-p[0-9]+|kickoff-r[0-9]+")
-SPEC_TAG = re.compile(r"spec-p[0-9]+(?:r[0-9]+)?")
-REVISION_TAG = re.compile(r"spec-p[0-9]+r[0-9]+")
+SPEC_TAG = re.compile(r"spec-p[0-9]+(?:r[0-9]+)?|spec-[0-9]+\.[0-9]+(?:r[0-9]+)?")
+FORMS = re.compile(rf"{SPEC_TAG.pattern}|impl-p[0-9]+|kickoff-r[0-9]+")
+REVISION_TAG = re.compile(r"spec-p[0-9]+r[0-9]+|spec-[0-9]+\.[0-9]+r[0-9]+")
+# The version line that a tag of the product stage approves, as the group.
+LINE_TAG = re.compile(r"spec-([0-9]+\.[0-9]+)(?:r[0-9]+)?")
+FORM_NAMES = "spec-pN, spec-p<N>r<M>, impl-pN, kickoff-rN, spec-X.Y or spec-X.YrM"
+SPEC_FORM_NAMES = "spec-pN, spec-p<N>r<M>, spec-X.Y or spec-X.YrM"
 UNIT_ID = re.compile(r"[a-z0-9]{1,6}")
 STATUS = "specs/00-status.md"
 NOT_SPEC_DOCUMENTS = {"specs/00-kickoff.md", STATUS}
@@ -245,7 +255,7 @@ def loop_failure(clone, commit, document, rows):
 def check_revision(clone, commit):
     previous = previous_tag(clone, commit)
     if previous is None:
-        refuse("previous", f"no tag spec-pN or spec-p<N>r<M> is an ancestor of {commit[:12]}, "
+        refuse("previous", f"no tag {SPEC_FORM_NAMES} is an ancestor of {commit[:12]}, "
                            f"so a revision has nothing to revise")
     name, target = previous
     rows = loop_rows(show(clone, commit, STATUS))
@@ -307,7 +317,10 @@ def tag(project, name, commit):
     if not branch:
         refuse("branch", "BRANCH is not set in the environment; the tag block sets it")
     if not FORMS.fullmatch(name):
-        refuse("form", f"{name} is not spec-pN, spec-p<N>r<M>, impl-pN or kickoff-rN")
+        refuse("form", f"{name} is not {FORM_NAMES}")
+    line = LINE_TAG.fullmatch(name)
+    if line and line[1] != branch:
+        refuse("line", f"{name} approves the line {line[1]}, but BRANCH is {branch}")
     url = origin_url(project)
     work = tempfile.mkdtemp(prefix="jig-tag.")
     try:
