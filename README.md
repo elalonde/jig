@@ -21,7 +21,8 @@ and makes its releases.
 - `hooks/commit-msg`: the commit message check that `make check` installs.
 - `templates/`: the files that `jig new` writes into a new project, and the
   forms of a unit prompt and a unit report.
-- `share/`: the motd lines of every tool and the client shell functions.
+- `share/`: the client shell functions, and the git attributes with which
+  `jig trace form` names the functions of a commit.
 - `prefs.md`: the owner's standing preferences for messages to the owner.
 - `CHANGELOG.md`: one entry for each version, newest first.
 
