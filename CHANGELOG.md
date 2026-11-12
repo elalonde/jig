@@ -5,6 +5,133 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.5.0
+
+What changed: this is the first release of the line 0.5. It moves the term
+check in front of every commit, replaces the lines that the supervisor typed
+into the orchestrator's session with an event file, and brings the status line
+of Claude Code into jig.
+
+jig has a pre-commit hook, `hooks/pre-commit`, that runs the term check before
+each commit in a product clone. It runs the command of the row `terms` of the
+project's `checks.tsv` from the root of the `-dev` clone around the product
+clone, within the row's time cap, and refuses the commit when that command
+fails, runs out of time, or when the row is missing. Its second line is the
+marker `# jig pre-commit hook`. `jig start` installs the hook in the worker's
+product clone before it starts the session, when `checks.tsv` holds the row
+`terms`, and removes a hook with the marker when the row is gone; `jig new`
+installs it in each product clone it makes. A hook that lies inside the work
+tree is added to the clone's `.git/info/exclude`, so it never becomes a product
+file; a hook file that the product tracks is left alone. `jig start` refuses, and writes nothing, when another pre-commit
+hook is in the way or when the hook path lies outside the product clone. Before
+it looks for the hook, `jig start` sets `core.hooksPath` to `hooks` in a product
+clone that tracks a directory `hooks/` and has no hooks path yet. `jig
+run-check` runs the row `terms` in the implementer account and in the spec
+writer account alike, because both commit to the product.
+
+The supervisor `jig orch` no longer types anything into the orchestrator's
+session. It appends each event, in the form of the line it used to type, to
+the event file `events.log` in the supervisor's directory `orch/` of the
+project, once and in order, also while a dialog is open. Before it starts a
+session it appends the line `start <session ID>`; when that append fails, the
+session does not start. An append that fails is logged once and tried again at
+the next poll, in order. The session reads the file with the new watcher `jig
+orch <project> events`, which prints each line after the last `start` line and
+then each new line as it comes, and ends with the session. `jig orch <project>
+events --old` prints once the lines between the last two `start` lines, the
+events of the session before, and exits. The waiting for an empty input box
+that 0.4.1 added is gone with the typing.
+
+`jig-statusline` is the status line of Claude Code, now part of jig. It shows
+two lines: the user, role, branch, model and effort; then the run time, the
+5-hour and weekly use with the pace, the host's health note and the model
+policy warning. It also keeps the usage file for the host's tools, names the
+tmux window, and writes the context figure that `jig ctx` reads. It reads its
+two host paths from the host config file `/srv/jig/statusline.conf`; the
+product holds no host value. A missing or unreadable config file only leaves
+out the parts it would give, and the tool always exits 0, also on input of an
+unexpected shape. It runs from `/opt/jig/current/`, so one install serves every
+account and project.
+
+`jig new` sets the `statusLine` command of each account's Claude Code settings
+to `/opt/jig/current/libexec/jig-statusline` and adds no hook of another tool;
+a `statusLine` with another command is replaced, and the settings file from
+before the first change is kept as `settings.json.bak-new`. Its readback lists
+each account's `statusLine` command. `MODEL_POLICY` now comes only from the
+host config `/srv/jig/host.conf`: it has no default, and `jig new` refuses a
+host config without it. The host config keys `STATUSLINE` and `SESSION_LOG` are
+no longer read. jig's tools no longer ship message-of-the-day lines.
+
+`jig tag` takes the approval tags of the product stage, `spec-X.Y` and
+`spec-X.YrM`, besides the four phase forms; it refuses such a tag whose `X.Y`
+is not the version line that units start from. `jig start` reads both forms on
+the ROLE line of a prompt and checks them on origin. A spec tag word in no
+known form is refused, and `spec-1.2.3` or `spec-1.2r1.4` is no longer read as
+`spec-1.2`.
+
+`jig trace check` no longer asks for the ledger entry of the product's head
+commit when that commit is a release commit, with the subject exactly `Release
+X.Y.Z`. So the check passes inside the one run of `jig release prepare`; the
+next unit that commits to the product writes that entry first.
+
+Fixes found when the line was reviewed: the standing prompt of the
+orchestrator says to run one watcher only, to start it again at each notice
+that it ended, and to act on a replayed event only when nothing shows it as
+handled; the block of `jig new` sets `core.hooksPath` to `hooks` in each
+product clone it makes when the product tracks `hooks/`; an inbox file is
+recorded as announced only after its line is appended, so a stop between the
+two announces it once at the next start; the status line counts a model or
+workspace that is not an object as absent, and treats a reset time that is not
+a valid clock time as unknown; `jig start` refuses a hook path outside the
+product clone.
+
+Files and formats: new `hooks/pre-commit`, `libexec/jig-statusline`, the
+event file `events.log` (one event per line, as the supervisor used to type
+it, and a line `start <session ID>` before each session), and the host config
+file `/srv/jig/statusline.conf` (one `KEY=value` per line, with the keys
+`HEALTH_FILE`, the result file of the host's health check, and `MODEL_POLICY`,
+the host's model policy file; environment variables of the same names, and
+`JIG_STATUSLINE_CONF` for another file, override them). Changed
+`libexec/jig-orch` (the command `events`; the settings `JIG_ORCH_QUIET` and
+`JIG_ORCH_BOX_CHECK` are gone), `lib/jig_tmux.py` (the input box reader and the
+styled capture are gone), `libexec/jig-start`, `libexec/jig-start-worker`,
+`libexec/jig-new`, `libexec/jig-tag`, `libexec/jig-trace`,
+`libexec/jig-run-check`, `templates/new/block.sh.in`,
+`templates/new/README.md`, `templates/new/dev/checks.tsv` (the row `terms`),
+`templates/new/dev/impl/orch/ORCHESTRATOR.md` (the watcher as the first step
+after each start), `README.md` and `Makefile`. In `/srv/jig/host.conf` the key
+`MODEL_POLICY` is now required, and `STATUSLINE` and `SESSION_LOG` are no
+longer read. Removed `share/motd.tsv`.
+
+Migration: a host and each project move to 0.5.0 in this order.
+
+1. Run `jig upgrade 0.5.0`.
+2. Put the key `MODEL_POLICY` in `/srv/jig/host.conf`, with the path of the
+   host's model policy file, before the next `jig new`; the keys `STATUSLINE`
+   and `SESSION_LOG` may be removed.
+3. Run the switch block: it writes `/srv/jig/statusline.conf`, mode 644, with
+   `HEALTH_FILE` and `MODEL_POLICY`, and in each account whose Claude Code
+   settings name the old host status line it keeps a copy of the settings file
+   with the suffix `.pre-jig` and sets the `statusLine` command to
+   `/opt/jig/current/libexec/jig-statusline`. Its readback lists each settings
+   file with its `statusLine` command.
+4. Restart each project's supervisor, `jig orch <project> stop` and then `jig
+   orch <project> start`, so that it writes the event file instead of typing.
+5. In each project's `impl/orch/ORCHESTRATOR.md`, take the watcher step from
+   the template of `jig new`: the first thing after each start of the session
+   is one background watcher, `jig orch <project> events`, through the harness
+   tool that gives a turn for each new line (in Claude Code, the Monitor tool),
+   and a single read of `jig orch <project> events --old` for the events of the
+   session before.
+6. For the pre-commit hook, give each project's `checks.tsv` the row `terms`
+   when it lacks one. A product that tracks `hooks/` needs `core.hooksPath` set
+   to `hooks` in its clones; `jig start` sets it in the worker's product clone
+   at the next start, and `jig new` sets it in the clones it makes.
+
+Requested by: Eric.
+
+Units: 5 minor, 1 patch, 16 none
+
 ## 0.4.1
 
 What changed: the supervisor `jig orch` no longer types a line into a session
