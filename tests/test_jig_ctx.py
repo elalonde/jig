@@ -164,9 +164,13 @@ class JigCtxTest(TempTestCase):
         # test has written the file, and writes what it printed and its exit code to files.
         out, code = self.tmp / "out", self.tmp / "code"
         path = self.ctx_dir / f"{SESSION}.json"
-        created = self.start_session(f"until [ -e {path} ]; do sleep 0.1; done; "
-                                     f"{TOOL} > {out} 2>&1; echo $? > {code}; sleep 60")
-        context_file(self.ctx_dir, SESSION, 1000, created)
+        self.start_session(f"until [ -e {path} ]; do sleep 0.1; done; "
+                           f"{TOOL} > {out} 2>&1; echo $? > {code}; sleep 60")
+        # The figure is from 50 ms after the process in the pane started, so it is this
+        # session's own. A figure from the first tick of the clock after the start reads
+        # as none, because jig ctx rounds the start up to the next tick.
+        moment = self.pane_started() + datetime.timedelta(milliseconds=50)
+        context_file(self.ctx_dir, SESSION, 1000, moment, modified=moment)
         deadline = time.monotonic() + 20
         while not code.exists() or not code.read_text():
             self.assertLess(time.monotonic(), deadline, "the tool in tmux did not finish")
