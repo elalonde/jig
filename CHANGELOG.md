@@ -38,6 +38,11 @@ the pane's process as the start of the running session, so a Claude Code
 session that is respawned in the same pane does not read the context figure of
 the session before it and roll over at once.
 
+`jig ctx` compares the start of the pane's process and the time of the context
+figure to a fraction of a second, so a session started again in the same pane
+no longer takes the figure of the session before it as its own and exits, even
+within the same second.
+
 The `ORCHESTRATOR.md` template of `jig new` asks for a celebration of every
 release of every project, a patch release too, in the console and in
 `updates.log`, sized by the version change: at most 5 lines for a patch, 12
@@ -73,7 +78,7 @@ orchestrator account, with the session of the 0.5.0 supervisor still running.
 
 Requested by: Eric.
 
-Units: 0 minor, 1 patch, 4 none
+Units: 0 minor, 2 patch, 7 none
 
 ## 0.5.0
 
