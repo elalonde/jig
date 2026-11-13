@@ -5,6 +5,76 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.5.1
+
+What changed: the supervisor `jig orch` now keeps the orchestrator's tmux
+session across a rollover and across `jig orch <project> stop`, so that a tmux
+client that is attached to the session stays attached.
+
+The supervisor sets the tmux option `remain-on-exit` on the session, so the
+pane stays, dead, when Claude Code exits. The session counts as live only when
+its pane is not dead. When the session is gone, the supervisor starts the next
+Claude Code session in a new tmux session, as before; when the session is
+there with a dead pane, it starts the next Claude Code session in that same
+pane with `tmux respawn-pane`, and the tee of the session goes on into the same
+file. `jig orch <project> stop` ends Claude Code in the pane, with SIGTERM and
+SIGKILL after 10 seconds, and leaves the tmux session with its dead pane; it
+never kills the session. The next `jig orch <project> start` respawns the
+pane. When the loop stops after three quick exits, it also leaves the session
+with its dead pane.
+
+Before it touches the session, the supervisor tests that the session is its
+own, on two IDs: the tmux session ID, which stays the same across a respawn,
+and the Claude Code session ID, which it reads from the start command of the
+pane. Both must equal the IDs that it wrote at its last start or respawn.
+`jig orch <project> start` refuses a session that is not its own and names it;
+`jig orch <project> stop` ends the loop and leaves such a session as it is;
+the loop respawns nothing in such a session, writes a line to
+`supervisor.log`, and stops. `jig orch <project> status` prints the state of
+the pane (`live`, `dead` or `none`) and whether the session is its own.
+
+`jig ctx` takes the later of the creation of the tmux session and the start of
+the pane's process as the start of the running session, so a Claude Code
+session that is respawned in the same pane does not read the context figure of
+the session before it and roll over at once.
+
+The `ORCHESTRATOR.md` template of `jig new` asks for a celebration of every
+release of every project, a patch release too, in the console and in
+`updates.log`, sized by the version change: at most 5 lines for a patch, 12
+for a minor release, 30 for a major release.
+
+Files and formats: the file `session-ids` takes the place of the file
+`session` under `~/ws/reviews/<project>/orch/`. It holds, on one line, the
+tmux session ID and the Claude Code session ID of the session that the loop
+started or respawned last, the same two words as the old file. Changed:
+`jig-orch`, `jig-ctx` and the `ORCHESTRATOR.md` template of `jig new`.
+
+Migration: a project moves from 0.5.0 to 0.5.1 in this order, as the
+orchestrator account, with the session of the 0.5.0 supervisor still running.
+
+1. Run `jig upgrade <project> 0.5.1`. It installs 0.5.1 under
+   `/opt/jig/0.5.1/` when it is missing, and pins the project to 0.5.1, so that
+   the stop and the start below run 0.5.1. A stop that runs 0.5.0 ends the
+   session, and with it an attached client.
+2. Before the restart, rename the session file and set `remain-on-exit` on the
+   running session:
+   `mv ~/ws/reviews/<project>/orch/session ~/ws/reviews/<project>/orch/session-ids`
+   and `tmux set-option -w -t =<project>-orch: remain-on-exit on`. Without the
+   rename, 0.5.1 finds no IDs and treats the session as not its own, so its
+   start refuses; the rename also keeps the 0.5.0 loop, when it ends, from
+   killing the session. Without `remain-on-exit`, the pane closes when Claude
+   Code exits, and the attached client with it.
+3. Restart the supervisor: `jig orch <project> stop`, and then `jig orch
+   <project> start`. The stop leaves the session with a dead pane, and the
+   start respawns the pane. `jig orch <project> status` then prints `pane
+   live, its own`.
+4. In each project's `ORCHESTRATOR.md`, take the paragraph on release
+   celebrations from the template of `jig new`, when the project wants it.
+
+Requested by: Eric.
+
+Units: 0 minor, 1 patch, 4 none
+
 ## 0.5.0
 
 What changed: this is the first release of the line 0.5. It moves the term
