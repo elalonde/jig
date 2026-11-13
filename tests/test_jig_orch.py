@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from tests.support import CLAUDE_DOUBLE, ROOT, TempTestCase, run
@@ -182,10 +183,39 @@ class OrchTestCase(TempTestCase):
         return self.tmux("capture-pane", "-p", "-t", f"={session}:").stdout
 
     def alive(self, session=SESSION):
-        return self.tmux("has-session", "-t", f"={session}").returncode == 0
+        """Say whether the session exists with a live pane, as the loop tells it."""
+        result = self.tmux("display-message", "-p", "-t", f"={session}:", "#{pane_dead}")
+        return result.returncode == 0 and result.stdout.strip() == "0"
 
     def ready(self, session=SESSION):
         return "auto mode on" in self.screen(session)
+
+    def pane(self):
+        """Return the session's pane as tmux shows it, or None when the session is gone."""
+        result = self.tmux("display-message", "-p", "-t", f"={SESSION}:",
+                           "#{session_id}\t#{pane_dead}\t#{pane_pid}\t#{pane_start_command}")
+        if result.returncode != 0:
+            return None
+        tmux_id, dead, pid, command = result.stdout.rstrip("\n").split("\t", 3)
+        return {"id": tmux_id, "dead": dead == "1", "pid": int(pid), "command": command}
+
+    def recorded_ids(self):
+        return self.read(self.reviews / "orch" / "session-ids")
+
+    def new_sessions(self):
+        """Count the calls of tmux new-session; a respawn in the same pane adds none."""
+        return self.read(self.home / "events-at-new-session").count("--\n")
+
+    def end_claude(self):
+        """Make Claude Code in the session's pane exit, as at a rollover."""
+        os.kill(self.pane()["pid"], signal.SIGTERM)
+        self.until(lambda: self.pane()["dead"] or len(self.calls()) > 1,
+                   what="the end of Claude Code")
+
+    def respawn_as_a_person(self, command):
+        """Run another command in the session's pane, as a person can with tmux."""
+        result = self.tmux("respawn-pane", "-k", "-t", f"={SESSION}:", command)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def inbox_line(self, path):
         """Return the line the loop appends for the inbox file as it is now."""
@@ -220,7 +250,7 @@ class TestStart(OrchTestCase):
         self.tmux("new-session", "-d", "-s", SESSION, "sleep 60")
         result = self.orch("start")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("exists", result.stderr)
+        self.assertIn(f"tmux session {SESSION} is not the loop's own", result.stderr)
         self.assertEqual(self.orch("stop").returncode, 0)
         self.assertTrue(self.alive(), "stop ended a session that no loop started")
 
@@ -244,7 +274,7 @@ class TestStart(OrchTestCase):
         self.assertEqual(settings["permissions"], {"defaultMode": "auto"})
         status = self.orch("status")
         self.assertEqual(status.returncode, 0, status.stdout)
-        self.assertIn(f"session {SESSION} up", status.stdout)
+        self.assertIn(f"session {SESSION}: pane live, its own", status.stdout)
 
     def test_start_keeps_the_mode_that_the_local_settings_name(self):
         # The clone's local settings already name the mode acceptEdits, a low effort and
@@ -261,16 +291,29 @@ class TestStart(OrchTestCase):
         self.assertEqual(settings["effortLevel"], "high")
         self.assertEqual(settings["modelSettings"], {"claude-opus-5-5": {"effortLevel": "high"}})
 
-    def test_stop_ends_the_loop_and_the_session(self):
+    def test_stop_leaves_the_session_with_a_dead_pane_and_the_next_start_respawns_it(self):
+        # Stop ends the loop and Claude Code, but the tmux session stays with its pane
+        # dead, so that an attached client stays. The next start runs a new Claude Code
+        # in that same pane, and records the same tmux ID with the new Claude Code ID.
         self.start()
+        before = self.pane()
         result = self.orch("stop")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(self.alive())
+        self.assertIn(f"session {SESSION} stays with its dead pane", result.stdout)
+        after = self.pane()
+        self.assertEqual((after["id"], after["dead"]), (before["id"], True))
         status = self.orch("status")
         self.assertEqual(status.returncode, 3, status.stdout)
         self.assertIn("loop stopped by jig orch stop", status.stdout)
         transcripts = list((self.reviews / "transcripts" / "orch").glob("*/*.jsonl"))
         self.assertEqual(len(transcripts), 1)
+        self.start()
+        first, second = self.session_ids()
+        again = self.pane()
+        self.assertEqual((again["id"], again["dead"]), (before["id"], False))
+        self.assertIn(f"--session-id {second}", again["command"])
+        self.assertEqual(self.recorded_ids(), f"{before['id']} {second}\n")
+        self.assertEqual(self.new_sessions(), 1)
 
 
     def test_start_makes_the_directory_of_the_loop_when_it_is_missing(self):
@@ -575,6 +618,164 @@ class TestRestart(OrchTestCase):
         self.assertIn(f"stopped: session {SESSION} exited 3 times in 10 minutes", self.tee())
         time.sleep(4 * float(POLL))
         self.assertEqual(len(self.calls()), 3)
+        # Each Claude Code exited at once, and still the session stayed: made once,
+        # respawned twice, and left with its dead pane for the next start.
+        pane = self.pane()
+        self.assertIsNotNone(pane, "the loop left no session")
+        self.assertTrue(pane["dead"])
+        self.assertEqual(self.recorded_ids(), f"{pane['id']} {self.session_ids()[2]}\n")
+        self.assertEqual(self.new_sessions(), 1)
+
+
+class TestSessionPane(OrchTestCase):
+    """The session outlives each Claude Code in it, and the loop touches only its own."""
+
+    def test_session_that_exits_is_respawned_in_the_same_pane(self):
+        # Claude Code exits while the loop runs. The loop starts the next one in the
+        # same pane of the same tmux session, with a new Claude Code ID in the pane's
+        # command, a second start line in the event file, the record of both IDs, and
+        # the tee still fed by the pane.
+        self.start()
+        before = self.pane()
+        self.end_claude()
+        self.until(lambda: len(self.calls()) == 2, what="the respawn")
+        self.until(self.ready, what="the respawned session's input bar")
+        first, second = self.session_ids()
+        after = self.pane()
+        self.assertEqual((after["id"], after["dead"]), (before["id"], False))
+        self.assertIn(f"--session-id {second}", after["command"])
+        self.assertNotIn(first, after["command"])
+        self.assertEqual(self.event_lines(), [f"start {first}", f"start {second}"])
+        self.assertEqual(self.recorded_ids(), f"{before['id']} {second}\n")
+        self.assertEqual(self.new_sessions(), 1)
+        size = len(self.tee())
+        self.until(lambda: len(self.tee()) > size, seconds=5,
+                   what="new output of the respawned pane in the tee")
+
+    def test_attached_client_stays_across_the_respawn_and_the_stop(self):
+        # A tmux client in control mode, attached as a person would be, is still listed
+        # by tmux after Claude Code exits and the loop respawns the pane, and after
+        # jig orch stop.
+        self.start()
+        output = open(self.tmp / "control-client.out", "wb")
+        self.addCleanup(output.close)
+        client = subprocess.Popen([str(self.bin_dir / "tmux"), "-C", "attach", "-t",
+                                   f"={SESSION}"], stdin=subprocess.PIPE, stdout=output,
+                                  stderr=subprocess.STDOUT, env=self.base_env())
+
+        def detach():
+            client.stdin.close()
+            try:
+                client.wait(5)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait()
+
+        self.addCleanup(detach)
+
+        def attached():
+            listed = self.tmux("list-clients", "-t", f"={SESSION}", "-F", "#{client_pid}")
+            return listed.stdout.split() == [str(client.pid)]
+
+        self.until(attached, what="the attached client")
+        self.end_claude()
+        self.until(lambda: len(self.calls()) == 2, what="the respawn")
+        self.until(self.ready, what="the respawned session's input bar")
+        self.assertTrue(attached(), "the client left at the respawn")
+        self.assertEqual(self.orch("stop").returncode, 0)
+        self.assertTrue(self.pane()["dead"])
+        self.assertTrue(attached(), "the client left at the stop")
+        self.assertIsNone(client.poll())
+
+    def test_start_refuses_and_stop_leaves_a_session_that_is_not_its_own(self):
+        # After a stop, two sessions under the loop's name that are not its own, each
+        # with a dead pane: the loop's session after a person ran a command with another
+        # Claude Code ID in its pane, then a new session of a person whose command names
+        # the recorded Claude Code ID. Start refuses each with a line that names it and
+        # starts no loop, and stop leaves the pane as it was.
+        self.start()
+        self.assertEqual(self.orch("stop").returncode, 0)
+        for case in ("other Claude Code ID", "other tmux ID"):
+            with self.subTest(case):
+                if case == "other Claude Code ID":
+                    self.respawn_as_a_person(f"true --session-id {uuid.uuid4()}")
+                else:
+                    recorded = self.recorded_ids().split()[1]
+                    # A second session keeps the server up; a new server would number
+                    # its sessions from the start and give the loop's tmux ID again.
+                    self.tmux("new-session", "-d", "-s", "keeper", "sleep 60")
+                    self.tmux("kill-session", "-t", f"={SESSION}")
+                    self.tmux("new-session", "-d", "-s", SESSION,
+                              f"sleep 0.5; true --session-id {recorded}")
+                    self.tmux("set-option", "-w", "-t", f"={SESSION}:", "remain-on-exit", "on")
+                self.until(lambda: self.pane()["dead"], what="the end of the person's command")
+                before = self.pane()
+                result = self.orch("start")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"tmux session {SESSION} is not the loop's own", result.stderr)
+                self.assertEqual(self.orch("status").returncode, 3)
+                stopped = self.orch("stop")
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertIn("left it as it is", stopped.stdout)
+                self.assertEqual(self.pane(), before)
+                self.assertEqual(len(self.calls()), 1)
+
+    def test_loop_leaves_a_session_that_is_not_its_own(self):
+        # While the loop runs, a person runs another command in the pane. With that
+        # command live, stop ends the loop and leaves it running. Started again, the
+        # loop sees the person's command exit, respawns nothing, logs why and stops.
+        self.start()
+        other_id = str(uuid.uuid4())
+        self.respawn_as_a_person(f"bash -c 'sleep 60' --session-id {other_id}")
+        person = self.pane()
+        stopped = self.orch("stop")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertIn("left it as it is", stopped.stdout)
+        self.assertEqual(self.pane(), person)
+        self.assertIn(f"tmux session {SESSION} is not the loop's own", self.log())
+        # The loop's own session again, and then a command of the person that exits.
+        self.tmux("kill-session", "-t", f"={SESSION}")
+        self.start()
+        calls = len(self.calls())
+        self.respawn_as_a_person(f"sleep 0.5; true --session-id {other_id}")
+        self.until(lambda: self.orch("status").returncode == 3, seconds=10,
+                   what="the end of the loop")
+        self.assertIn(f"stopped: tmux session {SESSION} is not the loop's own", self.log())
+        self.assertEqual(len(self.calls()), calls)
+        pane = self.pane()
+        self.assertTrue(pane["dead"])
+        self.assertIn(other_id, pane["command"])
+
+    def test_status_prints_the_pane_and_whether_the_session_is_its_own(self):
+        # Status names the state of the pane and the result of the own-session test,
+        # with a loop and without one, and keeps its exit codes: 0 with a loop, 3
+        # without. Along the way: no session, the loop's live session, the same with
+        # its loop killed, after stop, and with a person's command in the pane.
+        status = self.orch("status")
+        self.assertEqual(status.returncode, 3)
+        self.assertIn(f"session {SESSION}: pane none, not its own", status.stdout)
+        self.start()
+        status = self.orch("status")
+        self.assertEqual(status.returncode, 0)
+        self.assertIn(f"session {SESSION}: pane live, its own", status.stdout)
+        # A loop that dies leaves its Claude Code running: start refuses that live
+        # pane, and stop ends Claude Code itself.
+        os.kill(self.loop_pid(), signal.SIGKILL)
+        self.until(lambda: self.orch("status").returncode == 3, what="the end of the loop")
+        status = self.orch("status")
+        self.assertIn(f"session {SESSION}: pane live, its own", status.stdout)
+        refused = self.orch("start")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(f"tmux session {SESSION} exists with a live pane, and no loop runs",
+                      refused.stderr)
+        self.assertEqual(self.orch("stop").returncode, 0)
+        status = self.orch("status")
+        self.assertEqual(status.returncode, 3)
+        self.assertIn(f"session {SESSION}: pane dead, its own", status.stdout)
+        self.respawn_as_a_person(f"bash -c 'sleep 60' --session-id {uuid.uuid4()}")
+        status = self.orch("status")
+        self.assertEqual(status.returncode, 3)
+        self.assertIn(f"session {SESSION}: pane live, not its own", status.stdout)
 
 
 class TestEventFile(OrchTestCase):

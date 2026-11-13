@@ -4,11 +4,15 @@
 usage: jig orch <project> start | stop | status | events [--old]
 
   start   refuses when impl/orch/ORCHESTRATOR.md is not in the project's clone, when a
-          loop already runs, or when tmux session <project>-orch exists already; else it
-          makes ~/ws/reviews/<project>/orch/ when it is missing and starts the loop in
-          the background
-  stop    ends the loop and the session the loop started
-  status  exit 0 when a loop runs, 3 when none does; with the last line of its log
+          loop already runs, or when tmux session <project>-orch exists and is not the
+          loop's own or has a live pane; else it makes ~/ws/reviews/<project>/orch/ when
+          it is missing and starts the loop in the background
+  stop    ends the loop and the Claude Code session that the loop started, and leaves
+          the tmux session with its dead pane; a session that is not the loop's own is
+          left as it is
+  status  exit 0 when a loop runs, 3 when none does; with the state of the session's
+          pane (live, dead or none), whether the session is the loop's own, and the
+          last line of its log
   events  the session's watcher on the event file, orch/events.log: prints each line
           after the last line "start <session ID>", or from the top when there is none,
           then each new line as it is appended, and runs until it is stopped, its
@@ -24,6 +28,22 @@ The loop starts Claude Code in tmux <project>-orch, Opus at high effort, with
 ORCHESTRATOR.md as its first message, --remote-control <project>-orch and the
 orchestrator's directories as --add-dir. When the session exits, the loop copies its
 transcript and starts it again; the third exit in 10 minutes stops the loop instead.
+
+The session's pane. A person's tmux client attached to the session stays attached across
+each restart and each stop, because the session itself never ends: the loop sets the
+window option remain-on-exit, so that the pane stays, dead, when Claude Code exits. The
+session is live when its pane is not dead; a session that exists can be down. When the
+session does not exist, the loop makes it with tmux new-session; when it exists with a
+dead pane, the loop starts the next Claude Code in that pane with tmux respawn-pane -k,
+and the tee goes on. Each start gives Claude Code a new --session-id, and the loop then
+writes the tmux session ID and that Claude Code session ID to orch/session-ids. The
+session is the loop's own only when both match that file: the tmux ID of the session,
+and the ID after --session-id in the pane's start command. The loop tests this before
+it respawns the pane, and stops, with a line in its log, when the session is not its
+own. On a stop the loop sends SIGTERM to the pane's process, Claude Code, and SIGKILL
+10 s later when it still runs; stop does the same when no loop did it. A session that
+is not the loop's own is never touched, and the third exit in 10 minutes leaves the
+dead pane for the next start.
 
 Forks of the old session. A session that exits while it still has background work can
 be carried on by Claude Code with Remote Control in a background process, started with
@@ -114,8 +134,8 @@ between ticks (3600); JIG_ORCH_FORK_WINDOW the seconds after a restart in which 
 loop still looks for forks of the old session (60).
 
 Files, under ~/ws/reviews/<project>/: orch/events.log (the event file), orch/supervisor.log,
-orch/loop.lock (the pid of the loop), orch/session (the tmux and Claude Code IDs of the
-session the loop started last), orch/announced, orch/reported, orch/reminded,
+orch/loop.lock (the pid of the loop), orch/session-ids (the tmux session ID and the
+Claude Code session ID of the session the loop started last, on one line), orch/announced, orch/reported, orch/reminded,
 orch/fetch.err (the error output of the last fetch), out/orch.txt (the tee),
 transcripts/orch/<run>/. In the project's clone: the idle lines in impl/orch/updates.log.
 """
@@ -197,6 +217,35 @@ START_WAIT_SECONDS = 5.0
 # Long enough for a fork that Claude Code starts while the old session exits to show up.
 FORK_WINDOW_SECONDS = 60.0
 STOP_WAIT_SECONDS = 30.0
+# Claude Code gets this long after SIGTERM before SIGKILL; it is shorter than the wait of
+# jig orch stop for the loop's lock, so a loop that ends its session still frees the lock
+# in time.
+END_WAIT_SECONDS = 10.0
+# One line about the session's only pane, its fields split by tabs; the start command,
+# last, can hold blanks.
+PANE_FORMAT = "#{session_id}\t#{pane_dead}\t#{pane_pid}\t#{pane_pipe}\t#{pane_start_command}"
+# The Claude Code session ID in the pane's start command. The command is nested in
+# bash -lc, and in sg for a member of the session group, so it is found by its pattern
+# and not by splitting the command into words.
+CLAUDE_ID = re.compile(r"--session-id\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})")
+
+
+class Pane:
+    """The pane of the orchestrator's tmux session, as tmux shows it at one moment."""
+
+    __slots__ = ("session_id", "dead", "pid", "piped", "command")
+
+    def __init__(self, line):
+        session_id, dead, pid, piped, self.command = line.split("\t", 4)
+        self.session_id, self.dead, self.pid = session_id, dead == "1", int(pid)
+        self.piped = piped == "1"
+
+    def claude_session(self):
+        found = CLAUDE_ID.search(self.command)
+        return found.group(1) if found else None
+
+    def state(self):
+        return "dead" if self.dead else "live"
 
 
 def setting(name, default):
@@ -455,7 +504,7 @@ class Orch:
         self.lock = self.state / "loop.lock"
         self.log_path = self.state / "supervisor.log"
         self.events_file = self.state / EVENTS_FILE
-        self.started_file = self.state / "session"
+        self.ids_file = self.state / "session-ids"
         self.announced_file = self.state / "announced"
         self.reported_file = self.state / "reported"
         self.reminded_file = self.state / "reminded"
@@ -489,23 +538,67 @@ class Orch:
 
     # The session.
 
-    def alive(self):
-        return worker.tmux("has-session", "-t", f"={self.session}").returncode == 0
-
-    def session_id(self):
-        result = worker.tmux("display-message", "-p", "-t", f"={self.session}:",
-                             "#{session_id}")
-        return result.stdout.strip() if result.returncode == 0 else None
-
-    def ours(self):
-        """Say whether the session is the one the loop started last, not one of a person."""
+    def pane(self):
+        """Return the session's pane, or None when the session does not exist."""
+        result = worker.tmux("display-message", "-p", "-t", f"={self.session}:", PANE_FORMAT)
+        if result.returncode != 0:
+            return None
         try:
-            started = self.started_file.read_text(encoding="utf-8").split()
+            return Pane(result.stdout.rstrip("\n"))
+        except ValueError:
+            return None
+
+    def alive(self):
+        # With remain-on-exit the session outlives Claude Code, so a session that exists
+        # can hold a dead pane: only a live pane counts.
+        pane = self.pane()
+        return pane is not None and not pane.dead
+
+    def ours(self, pane=None):
+        """Say whether the session is the one the loop started last, not one of a person.
+
+        Both IDs must match the record: the tmux session ID, which a respawn keeps, and
+        the Claude Code session ID in the pane's start command, which each respawn
+        changes. A session that a person made under the same name has another tmux ID;
+        a pane that a person respawned has another Claude Code ID.
+        """
+        pane = pane or self.pane()
+        if pane is None:
+            return False
+        try:
+            recorded = self.ids_file.read_text(encoding="utf-8").split()
         except OSError:
             return False
-        return bool(started) and started[0] == self.session_id()
+        return recorded == [pane.session_id, pane.claude_session()]
 
-    def open_session(self):
+    def foreign(self):
+        return (f"tmux session {self.session} is not the loop's own: its tmux or Claude "
+                f"Code session ID differs from {self.ids_file}")
+
+    def launch(self):
+        """Start the next Claude Code session; return False when the loop must stop.
+
+        A session that does not exist is made anew. The loop's own session with a dead
+        pane gets the new Claude Code in that pane, so that a person's attached client
+        stays. Any other session is left as it is.
+        """
+        pane = self.pane()
+        if pane is None:
+            self.open_session(None)
+            return True
+        if not self.ours(pane):
+            self.log(f"stopped: {self.foreign()}; the loop starts nothing in it and "
+                     f"leaves it as it is", tee=True)
+            return False
+        if not pane.dead:
+            self.log(f"stopped: tmux session {self.session} has a live pane that this "
+                     f"loop did not start", tee=True)
+            return False
+        self.open_session(pane)
+        return True
+
+    def open_session(self, pane):
+        """Start Claude Code in a new session, or, given the dead pane, in that pane."""
         self.run = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.claude_session = str(uuid.uuid4())
         try:
@@ -523,6 +616,8 @@ class Orch:
         channel = f"jig-orch-{self.session}"
         add_dirs = "".join(f"--add-dir {shlex.quote(directory)} "
                            for directory in worker.existing_dirs(self.directories))
+        # The pane waits for the channel before Claude Code runs, so that the options
+        # and the tee below are in place before it can write or exit.
         inner = (
             f"export PATH={shlex.quote(os.environ.get('PATH', ''))}:$PATH; "
             "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
@@ -532,20 +627,69 @@ class Orch:
             f"--session-id {self.claude_session} "
             f'"$(cat {shlex.quote(str(self.standing))})"'
         )
-        created = worker.tmux("new-session", "-d", "-P", "-F", "#{session_id}",
-                              "-s", self.session, "-x", "200", "-y", "50",
-                              "-c", str(self.clone), worker.session_command(inner))
-        if created.returncode != 0:
-            self.log(f"cannot start session {self.session}: {worker.last_line(created)}",
+        command = worker.session_command(inner)
+        target = f"={self.session}:"
+        if pane is None:
+            made = worker.tmux("new-session", "-d", "-s", self.session, "-x", "200",
+                               "-y", "50", "-c", str(self.clone), command)
+            how = "start"
+        else:
+            made = worker.tmux("respawn-pane", "-k", "-t", target, "-c", str(self.clone),
+                               command)
+            how = "respawn"
+        if made.returncode != 0:
+            self.log(f"cannot {how} session {self.session}: {worker.last_line(made)}",
                      tee=True)
             return
-        self.started_file.write_text(f"{created.stdout.strip()} {self.claude_session}\n",
+        # Set before the pane is released: a Claude Code that exits at once would
+        # otherwise take the session, and a person's client, with it.
+        option = worker.tmux("set-option", "-w", "-t", target, "remain-on-exit", "on")
+        if option.returncode != 0:
+            self.log(f"cannot set remain-on-exit on session {self.session}: "
+                     f"{worker.last_line(option)}", tee=True)
+        pane = self.pane()
+        if pane is not None:
+            self.ids_file.write_text(f"{pane.session_id} {self.claude_session}\n",
                                      encoding="utf-8")
-        self.tee.parent.mkdir(parents=True, exist_ok=True)
-        worker.tmux("pipe-pane", "-o", "-t", f"={self.session}:",
-                    f"cat >> {shlex.quote(str(self.tee))}")
+            # tmux keeps a pane's pipe across the death and the respawn of the pane, and
+            # pipe-pane -o closes a pipe that is open, so the tee is opened only when the
+            # pane has none; otherwise the old pipe goes on into the same file.
+            if not pane.piped:
+                self.tee.parent.mkdir(parents=True, exist_ok=True)
+                worker.tmux("pipe-pane", "-o", "-t", target,
+                            f"cat >> {shlex.quote(str(self.tee))}")
         worker.tmux("wait-for", "-S", channel)
-        self.log(f"started session {self.session}, Claude Code session {self.claude_session}")
+        self.log(f"started session {self.session}, Claude Code session {self.claude_session}"
+                 + (" in the same pane" if how == "respawn" else ""))
+
+    def end_claude(self, pane):
+        """End Claude Code in the pane: SIGTERM, then SIGKILL when it still runs.
+
+        The pane runs Claude Code itself, because its command execs down to claude; the
+        pane stays, dead, so that an attached client stays too.
+        """
+        try:
+            os.kill(pane.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + END_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            now = self.pane()
+            if now is None or now.dead or now.pid != pane.pid:
+                return
+            time.sleep(0.2)
+        try:
+            os.kill(pane.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        self.log(f"Claude Code in session {self.session} did not end on SIGTERM within "
+                 f"{END_WAIT_SECONDS:.0f} s; sent SIGKILL")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            now = self.pane()
+            if now is None or now.dead or now.pid != pane.pid:
+                return
+            time.sleep(0.1)
 
     def copy_transcript(self):
         found = sorted(pathlib.Path.home().glob(
@@ -1026,7 +1170,8 @@ class Orch:
 
     def supervise(self, poll):
         exits = []
-        self.open_session()
+        if not self.launch():
+            return REFUSED
         no_bar, reported = 0, False
         while not self.stopping:
             self.tick()
@@ -1040,11 +1185,13 @@ class Orch:
                 exits.append(moment)
                 self.log(f"session {self.session} exited ({len(exits)} in 10 minutes)")
                 if len(exits) >= QUICK_EXITS:
+                    # The dead pane stays, so the next start respawns it.
                     self.log(f"stopped: session {self.session} exited {QUICK_EXITS} times in "
                              f"10 minutes, so the loop does not start it again; see the tee, "
                              f"then jig orch {self.project} start", tee=True)
                     return REFUSED
-                self.open_session()
+                if not self.launch():
+                    return REFUSED
                 # A fork can show up after the exit, so the loop keeps looking for a while.
                 self.fork_watch[old] = time.monotonic() + self.fork_window
                 no_bar, reported = 0, False
@@ -1067,8 +1214,14 @@ class Orch:
                     self.log(f"dialog: session {self.session} shows no input bar; jig orch "
                              f"does not answer it: tmux attach -t {self.session}", tee=True)
             self.rest(poll)
-        if self.ours():
-            worker.tmux("kill-session", "-t", f"={self.session}")
+        # The session stays, with its dead pane, so that an attached client stays; a
+        # session that is not the loop's own is not touched at all.
+        pane = self.pane()
+        if pane is not None and not self.ours(pane):
+            self.log(f"{self.foreign()}; left it as it is")
+        elif pane is not None:
+            if not pane.dead:
+                self.end_claude(pane)
             self.copy_transcript()
         self.log("loop stopped by jig orch stop")
         return DONE
@@ -1089,9 +1242,12 @@ class Orch:
         if descriptor is None:
             worker.refuse("loop", f"a loop runs already, pid {self.loop_pid()}")
         try:
-            if self.alive():
-                worker.refuse("session", f"tmux session {self.session} exists, and no loop "
-                                         f"started it")
+            pane = self.pane()
+            if pane is not None and not self.ours(pane):
+                worker.refuse("session", f"{self.foreign()}; jig orch leaves it as it is")
+            if pane is not None and not pane.dead:
+                worker.refuse("session", f"tmux session {self.session} exists with a live "
+                                         f"pane, and no loop runs")
             with open(self.log_path, "a", encoding="utf-8") as log:
                 child = subprocess.Popen(
                     [sys.executable, str(pathlib.Path(__file__).resolve()), self.project,
@@ -1128,25 +1284,38 @@ class Orch:
                 descriptor = try_lock(self.lock)
         if descriptor is not None:
             os.close(descriptor)
-        if self.alive() and self.ours():
-            worker.tmux("kill-session", "-t", f"={self.session}")
-        if pid is None:
-            print(f"jig orch: no loop runs for {self.project}")
+        # The loop ends Claude Code as it stops; this is for a loop that did not get to
+        # it, one killed above or one that died.
+        pane = self.pane()
+        own = pane is not None and self.ours(pane)
+        if own and not pane.dead:
+            self.end_claude(pane)
+        if pane is None:
+            left = f"no session {self.session}"
+        elif own:
+            left = f"Claude Code has ended; session {self.session} stays with its dead pane"
         else:
-            print(f"jig orch: stopped the loop, pid {pid}, and session {self.session}")
+            left = f"{self.foreign()}; left it as it is"
+        if pid is None:
+            print(f"jig orch: no loop runs for {self.project}; {left}")
+        else:
+            print(f"jig orch: stopped the loop, pid {pid}; {left}")
         return DONE
 
     def status(self):
         self.state.mkdir(parents=True, exist_ok=True)
         descriptor = try_lock(self.lock)
         last = self.last_log_line() or "no log"
+        pane = self.pane()
+        own = "its own" if self.ours(pane) else "not its own"
+        session = (f"session {self.session}: pane {pane.state() if pane else 'none'}, "
+                   f"{own}")
         if descriptor is not None:
             os.close(descriptor)
-            print(f"jig orch: {self.project}: no loop runs; last: {last}")
+            print(f"jig orch: {self.project}: no loop runs; {session}; last: {last}")
             return NO_LOOP
-        state = "up" if self.alive() else "down"
-        print(f"jig orch: {self.project}: loop {self.loop_pid()} runs; session {self.session} "
-              f"{state}; last: {last}")
+        print(f"jig orch: {self.project}: loop {self.loop_pid()} runs; {session}; "
+              f"last: {last}")
         return DONE
 
 
