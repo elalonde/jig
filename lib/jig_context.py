@@ -16,12 +16,19 @@ DEFAULT_DIR = "/run/jig/ctx"
 
 
 class Context:
-    """One reading of a session's context: tokens used, the window, and the reading's age."""
+    """One reading of a session's context: tokens used, the window, and the reading's age.
 
-    def __init__(self, tokens, window, age):
+    written is the time the file gives for the reading, in whole seconds as the status line
+    writes it; modified is the file's modification time, which is finer. Both are aware
+    datetimes, or None when the Context was not read from a file.
+    """
+
+    def __init__(self, tokens, window, age, written=None, modified=None):
         self.tokens = tokens
         self.window = window
         self.age = age
+        self.written = written
+        self.modified = modified
 
     def readout(self):
         """Return the form a report and jig ctx print, tokens over window: 84213/200000."""
@@ -45,7 +52,11 @@ def read_context(session, directory=None, now=None):
     """
     path = pathlib.Path(directory or context_dir()) / f"{session}.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # The time of the change comes from the open file, not from the name, so that it
+        # belongs to the text read even when the writer renames a new file into place.
+        with open(path, encoding="utf-8") as stream:
+            modified = os.fstat(stream.fileno()).st_mtime
+            data = json.loads(stream.read())
     except (OSError, UnicodeDecodeError, ValueError):
         return None
     if not isinstance(data, dict) or data.get("session") != session:
@@ -62,4 +73,5 @@ def read_context(session, directory=None, now=None):
     if written.tzinfo is None:
         return None
     now = now or datetime.datetime.now().astimezone()
-    return Context(tokens, window, now - written)
+    modified = datetime.datetime.fromtimestamp(modified).astimezone()
+    return Context(tokens, window, now - written, written, modified)

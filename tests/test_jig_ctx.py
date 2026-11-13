@@ -7,6 +7,8 @@ the test's directory, and the rollover test uses the supervisor tests' own serve
 
 import datetime
 import json
+import os
+import pathlib
 import time
 
 from tests.support import CLAUDE_DOUBLE, ROOT, TempTestCase, run
@@ -22,13 +24,20 @@ def stamp(moment):
     return moment.isoformat(timespec="seconds")
 
 
-def context_file(directory, session, tokens, written):
+def context_file(directory, session, tokens, written, modified=None):
+    """Write a context file as the status line does, with written in whole seconds.
+
+    modified, when given, becomes the file's modification time, so that a test can say
+    to a fraction of a second when the figure was written.
+    """
     data = {"session": session, "total_input_tokens": tokens, "context_window_size": WINDOW,
             "used_percentage": round(100 * tokens / WINDOW, 1), "written": stamp(written)}
     # Written aside and renamed into place, as the status line does, so that a reader
     # polling for the file never sees half of it.
     part = directory / f".{session}.part"
     part.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    if modified is not None:
+        os.utime(part, (modified.timestamp(), modified.timestamp()))
     part.rename(directory / f"{session}.json")
 
 
@@ -134,6 +143,22 @@ class JigCtxTest(TempTestCase):
         self.assertEqual(created.returncode, 0, created.stderr)
         return datetime.datetime.fromtimestamp(int(created.stdout)).astimezone()
 
+    def pane_started(self):
+        """Return the earliest moment at which the process in the session's pane started.
+
+        /proc gives the start in clock ticks since boot; the wall clock read before the
+        boot clock gives a boot moment that is never late, so the result is never after
+        the true start, and at most one tick before it.
+        """
+        pid = run(["tmux", "display-message", "-p", "-t", f"={SESSION}:", "#{pane_pid}"],
+                  env=self.base_env())
+        self.assertEqual(pid.returncode, 0, pid.stderr)
+        stat = pathlib.Path(f"/proc/{int(pid.stdout)}/stat").read_text(encoding="utf-8")
+        ticks = int(stat.rsplit(")", 1)[1].split()[19])
+        booted = time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+        seconds = booted + ticks / os.sysconf("SC_CLK_TCK")
+        return datetime.datetime.fromtimestamp(seconds).astimezone()
+
     def test_with_no_argument_inside_tmux_it_reads_its_own_session(self):
         # The tool runs inside the tmux session ctx-demo on the private server, once the
         # test has written the file, and writes what it printed and its exit code to files.
@@ -155,9 +180,22 @@ class JigCtxTest(TempTestCase):
         context_file(self.ctx_dir, SESSION, 260000, created - datetime.timedelta(seconds=5))
         self.assert_reads(self.ctx(SESSION), "none (before session start)", 2)
 
-    def test_a_file_written_when_the_running_session_started_counts(self):
-        created = self.start_session()
-        context_file(self.ctx_dir, SESSION, 1000, created)
+    def test_a_file_written_in_the_second_the_pane_started_but_before_it_is_none(self):
+        # The figure carries the second in which the process in the pane started, and the
+        # file was written a millisecond before that process started: it is the figure of
+        # the session that ran in the pane before, and whole seconds cannot tell them apart.
+        self.start_session()
+        started = self.pane_started()
+        context_file(self.ctx_dir, SESSION, 260000, started.replace(microsecond=0),
+                     modified=started - datetime.timedelta(milliseconds=1))
+        self.assert_reads(self.ctx(SESSION), "none (before session start)", 2)
+
+    def test_a_file_written_just_after_the_pane_started_counts(self):
+        # The figure was written 50 ms after the process in the pane started, so it is
+        # that session's own, also when both fall in the same second.
+        self.start_session()
+        moment = self.pane_started() + datetime.timedelta(milliseconds=50)
+        context_file(self.ctx_dir, SESSION, 1000, moment, modified=moment)
         self.assert_reads(self.ctx(SESSION), f"1000/{WINDOW}", 0)
 
     def test_a_file_written_before_a_session_that_does_not_run_counts(self):
@@ -169,9 +207,10 @@ class JigCtxTest(TempTestCase):
 
 # A claude double for the supervisor that first acts as an orchestrator does after each
 # step: it runs jig ctx on its own session, and exits when the answer is 3. The first
-# session sees no file until the test writes one, then exits; the second sees the same
-# file as written before it started, and goes on as the usual double with an input bar.
-# The supervisor passes only PATH into the session, so the paths are written in.
+# session sees no file until the test writes one, then exits at once; the second sees the
+# same file as written before it started, often in the same second, and goes on as the
+# usual double with an input bar. The supervisor passes only PATH into the session, so
+# the paths are written in.
 ROLLOVER_DOUBLE = '''#!/bin/bash
 echo start >> "$HOME/ctx-starts"
 export JIG_CTX_DIR=@CTX_DIR@
@@ -179,12 +218,7 @@ for attempt in $(seq 150); do
     reading=$(@TOOL@ 2>/dev/null)
     code=$?
     echo "$code $reading" >> "$HOME/ctx-readings"
-    if [ "$code" = 3 ]; then
-        # The figure carries the creation second of this session; waiting past that
-        # second makes sure the next session is created in a later one.
-        sleep 1.1
-        exit 0
-    fi
+    [ "$code" = 3 ] && exit 0
     [ "$reading" = "none (no file)" ] || break
     sleep 0.2
 done
@@ -202,13 +236,9 @@ class RolloverTest(OrchTestCase):
         self.assertEqual(self.orch("start").returncode, 0, self.log())
         self.until(lambda: "none (no file)" in self.read(self.home / "ctx-readings"),
                    what="the first session's reading")
-        created = self.tmux("display-message", "-p", "-t", f"={ORCH_SESSION}:",
-                            "#{session_created}")
-        self.assertEqual(created.returncode, 0, created.stderr)
         # The status line of the first session writes 260000 tokens, over the default
         # soft limit of 250000 and under the hard one.
-        moment = datetime.datetime.fromtimestamp(int(created.stdout)).astimezone()
-        context_file(ctx_dir, ORCH_SESSION, 260000, moment)
+        context_file(ctx_dir, ORCH_SESSION, 260000, datetime.datetime.now().astimezone())
         self.until(lambda: "none (before session start)" in
                    self.read(self.home / "ctx-readings"), what="the second session's reading")
         self.until(self.ready, what="the second session's input bar")

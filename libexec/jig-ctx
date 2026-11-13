@@ -21,7 +21,10 @@ It prints "none (...)" instead of a reading it cannot trust:
 The last case matters because a session that ends and is started again keeps its tmux
 name, and a supervisor can start the next Claude Code in the same pane of the same
 tmux session: without it, a fresh session would read the full context of the one
-before it and stop at once.
+before it and stop at once. The start of the pane's process and the time of the
+reading are compared to a fraction of a second, so this holds also when the reading
+and the fresh start fall in the same second. tmux gives the creation of a session only
+in whole seconds, so a reading written in that second still counts.
 
 Exit codes:
   0  a reading below the soft limit
@@ -38,6 +41,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
@@ -46,6 +50,7 @@ import jig_context  # noqa: E402
 SOFT_LIMIT = 250000
 HARD_LIMIT = 280000
 MAX_AGE = datetime.timedelta(minutes=3)
+ONE_SECOND = datetime.timedelta(seconds=1)
 TMUX_TIMEOUT = 10
 
 
@@ -84,20 +89,42 @@ def own_session():
 
 
 def process_started(pid):
-    """Return when a process started, from /proc, or None when that cannot be read."""
+    """Return when a process started, to one tick of the kernel's clock, or None when /proc
+    cannot tell."""
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
             # The command name in parentheses can hold blanks, so the fields after it
             # are counted from its closing parenthesis; the start time is the 20th.
             ticks = int(stream.read().rsplit(")", 1)[1].split()[19])
-        with open("/proc/stat", encoding="utf-8") as stream:
-            booted = next(int(line.split()[1]) for line in stream if line.startswith("btime "))
-    except (OSError, ValueError, IndexError, StopIteration):
+    except (OSError, ValueError, IndexError):
         return None
-    # Whole seconds, as tmux gives the creation of a session, so that a reading written
-    # in the second its session was made still counts.
-    seconds = booted + ticks // os.sysconf("SC_CLK_TCK")
+    # /proc counts the start in clock ticks since boot. The boot time in /proc/stat is cut
+    # to whole seconds; added to whole seconds of ticks, it can put the start up to two
+    # seconds early, and the figure that the session before wrote just before its pane
+    # was started again would then pass as the fresh session's own, so the fresh session
+    # would stop at once. The boot moment comes from the two clocks instead, the boot clock
+    # read first so that any delay between the reads makes the start later, not earlier.
+    # The start is also rounded up to the next tick, so that it is never before the true
+    # one; a figure written in that last tick reads as none until the next write.
+    since_boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+    now = time.time()
+    seconds = now - since_boot + (ticks + 1) / os.sysconf("SC_CLK_TCK")
     return datetime.datetime.fromtimestamp(seconds).astimezone()
+
+
+def figure_time(context):
+    """Return the moment the figure in the file was written, as finely as the file tells.
+
+    The status line gives that moment in whole seconds, cut down, so the true moment lies
+    in the second that starts at "written". It writes a new file and renames it into
+    place, so the file's modification time is the same moment to a fraction of a second,
+    and is taken when it falls in that second. A file copied or touched later keeps only
+    "written", which is never after the true moment.
+    """
+    written, modified = context.written, context.modified
+    if modified is not None and written <= modified < written + ONE_SECOND:
+        return modified
+    return written
 
 
 def session_created(session):
@@ -127,9 +154,8 @@ def reading(session, now):
     context = jig_context.read_context(session, now=now)
     if context is None:
         return "none (bad file)", None
-    written = now - context.age
     created = session_created(session)
-    if created is not None and written < created:
+    if created is not None and figure_time(context) < created:
         return "none (before session start)", None
     if context.age > MAX_AGE:
         return f"none ({int(context.age.total_seconds())} s old)", None
