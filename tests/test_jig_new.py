@@ -293,6 +293,22 @@ class JigNewTest(TempTestCase):
         self.assertNotIn("Start no second one", text)
         self.assertNotIn("minutes", first)
 
+    def test_standing_prompt_celebrates_every_release_by_its_size(self):
+        # An orchestrator learns from the standing prompt alone that a release, a patch
+        # too, gets its own celebration. The made prompt must say this in the part on
+        # updates and celebrations, with the line limit and the content for a patch, a
+        # minor and a major release.
+        text = self.made_text("impl/orch/ORCHESTRATOR.md")
+        part = text.split("Updates and celebrations:", 1)[1].split("## Blocks", 1)[0]
+        for line in ("every release of every project, a patch too, gets a text celebration "
+                     "in the console and in `updates.log`.",
+                     "A bigger version change gets a bigger celebration.",
+                     "A patch release gets at most 5 lines: what it fixes.",
+                     "A minor release gets at most 12 lines: what it adds, with the numbers.",
+                     "A major release gets the longest, at most 30 lines, with the story of "
+                     "the version."):
+            self.assertIn(line, part)
+
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
         # form of the table that jig tag reads, or the first revision tag is refused.

@@ -273,6 +273,12 @@ Updates and celebrations:
   mentioned carries a one-sentence meaning. Append it to `updates.log`.
 - Celebrations: at every phase close, a short text block in the console and
   in `updates.log`: what was achieved, with the numbers.
+- Release celebrations: every release of every project, a patch too, gets a
+  text celebration in the console and in `updates.log`. A bigger version
+  change gets a bigger celebration. A patch release gets at most 5 lines:
+  what it fixes. A minor release gets at most 12 lines: what it adds, with
+  the numbers. A major release gets the longest, at most 30 lines, with the
+  story of the version.
 
 ## Blocks
 
