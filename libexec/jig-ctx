@@ -15,11 +15,13 @@ It prints "none (...)" instead of a reading it cannot trust:
   none (bad file)              the file does not hold one reading of this session
   none (<n> s old)             the reading is older than 3 minutes
   none (before session start)  the tmux session runs and the reading was written
-                               before that session was created
+                               before that session was created, or before the
+                               process now in its pane started
 
 The last case matters because a session that ends and is started again keeps its tmux
-name: without it, a fresh session would read the full context of the one before it and
-stop at once.
+name, and a supervisor can start the next Claude Code in the same pane of the same
+tmux session: without it, a fresh session would read the full context of the one
+before it and stop at once.
 
 Exit codes:
   0  a reading below the soft limit
@@ -81,14 +83,41 @@ def own_session():
     return name
 
 
+def process_started(pid):
+    """Return when a process started, from /proc, or None when that cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            # The command name in parentheses can hold blanks, so the fields after it
+            # are counted from its closing parenthesis; the start time is the 20th.
+            ticks = int(stream.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat", encoding="utf-8") as stream:
+            booted = next(int(line.split()[1]) for line in stream if line.startswith("btime "))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    # Whole seconds, as tmux gives the creation of a session, so that a reading written
+    # in the second its session was made still counts.
+    seconds = booted + ticks // os.sysconf("SC_CLK_TCK")
+    return datetime.datetime.fromtimestamp(seconds).astimezone()
+
+
 def session_created(session):
-    """Return the creation time of a running tmux session, or None when it does not run."""
+    """Return when the running session started, or None when it does not run.
+
+    That is the later of the tmux session's creation and the start of the process in its
+    pane. A pane started again in the same session (tmux respawn-pane) runs a fresh
+    Claude Code whose figure starts anew, so a reading from before it is not its own.
+    """
     # The "=" asks for this exact name, so a session whose name only starts with it
     # is not taken instead.
-    value = tmux("display-message", "-p", "-t", f"={session}:", "#{session_created}")
-    if not value or not value.isdigit():
+    value = tmux("display-message", "-p", "-t", f"={session}:",
+                 "#{session_created} #{pane_pid}")
+    parts = (value or "").split()
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
         return None
-    return datetime.datetime.fromtimestamp(int(value)).astimezone()
+    created = datetime.datetime.fromtimestamp(int(parts[0])).astimezone()
+    # A dead pane has no process; the creation of the session is then all there is.
+    started = process_started(int(parts[1]))
+    return max(created, started) if started else created
 
 
 def reading(session, now):
