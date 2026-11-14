@@ -26,6 +26,7 @@ import tokenize
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import jig_clones  # noqa: E402
 import jig_ids  # noqa: E402
 
 DEFAULT_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -95,13 +96,28 @@ def read_terms(path):
     return terms
 
 
+def terms_place(root):
+    """Return the path of terms.txt in the -dev clone of the product at root.
+
+    With no -dev clone, the path is the one beside root where that clone would be,
+    so that the message about the missing file names a real place to put it.
+    """
+    product = pathlib.Path(root).resolve()
+    dev = jig_clones.other_clone(product)
+    if dev is None:
+        dev = product.parent / (product.name + jig_clones.SUFFIX)
+    return dev / "terms.txt"
+
+
 def load_terms(root, tree=False):
     """Return the term pattern, or None when CI runs without the private file.
 
     tree is true when a whole tree is linted, which may be an unpacked source
     archive rather than a clone; a commit message is always checked in a clone.
+    The terms file is terms.txt of the project's -dev clone, which jig_clones finds
+    for the product at root, unless LINT_TERMS names another file.
     """
-    path = os.environ.get("LINT_TERMS") or str(pathlib.Path(root) / ".." / "terms.txt")
+    path = os.environ.get("LINT_TERMS") or str(terms_place(root))
     try:
         terms = read_terms(path)
     except FileNotFoundError:

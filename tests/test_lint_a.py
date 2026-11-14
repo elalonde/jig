@@ -471,9 +471,12 @@ class LintATest(TempTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("no terms", result.stderr)
 
-    def test_lint_a_default_terms_file_is_beside_the_product(self):
+    def test_lint_a_default_terms_file_is_in_the_dev_clone_beside_the_product(self):
+        # With no LINT_TERMS, the terms come from terms.txt of the -dev clone beside
+        # the product, product-dev, and the planted term is refused.
         self.write("notes.md", f"Built on {TERM} last week.\n")
-        (self.tmp / "terms.txt").write_text(f"{TERM}\n")
+        (self.tmp / "product-dev").mkdir()
+        (self.tmp / "product-dev" / "terms.txt").write_text(f"{TERM}\n")
         result = run([LINT, self.product], env=self.env())
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(TERM, result.stderr)
