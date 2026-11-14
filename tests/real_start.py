@@ -348,7 +348,7 @@ class FixtureProjectCase(unittest.TestCase):
         stopped = result.returncode == 1 and "refused: dialog:" in result.stderr
         self.assertTrue(result.returncode == 0 or stopped, result.stderr)
         print(f"worker: {'stopped at the folder-trust dialog' if stopped else 'started'}")
-        command = capture("tmux", "display-message", "-p", "-t", f"={HOOK_SESSION}",
+        command = capture("tmux", "display-message", "-p", "-t", f"={HOOK_SESSION}:",
                           "#{pane_start_command}").stdout
         self.stop_session()
         self.assertFalse(session_alive(HOOK_SESSION))
