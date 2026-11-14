@@ -4,9 +4,9 @@
 #
 # The pin is JIG_VERSION in ~/.config/jig/<project>.conf. The project is the
 # argument when there is one, else the -dev directory holding the working
-# directory. With no pin, the current version runs, and changelog and upgrade
-# always run from current. Before any version is installed, a source tree runs
-# its own subcommands.
+# directory, else the project of the product clone holding it. With no pin, the
+# current version runs, and changelog and upgrade always run from current. Before
+# any version is installed, a source tree runs its own subcommands.
 set -euo pipefail
 
 root=${JIG_ROOT:-/opt/jig}
@@ -31,7 +31,7 @@ project_argument() {
 }
 
 # Print the project of the nearest -dev directory around the working directory.
-project_from_cwd() {
+project_from_dev() {
     local dir base
     dir=$(pwd -P 2>/dev/null) || return 0
     while [ -n "$dir" ]; do
@@ -42,6 +42,35 @@ project_from_cwd() {
         fi
         dir=${dir%/*}
     done
+}
+
+# Print the project of the nearest product clone around the working directory:
+# the nearest directory that has a -dev clone. The product clone of demo has the
+# -dev clone demo-dev beside it. Releases before 0.6 kept the product clone inside
+# its -dev clone instead, as demo-dev/demo; that place counts only when nothing
+# sits beside it. This is the rule of lib/jig_clones.py, written again here
+# because this script picks the tree that holds that module.
+project_from_product() {
+    local dir base parent
+    dir=$(pwd -P 2>/dev/null) || return 0
+    while [ -n "$dir" ]; do
+        base=${dir##*/}
+        parent=${dir%/*}
+        if is_project "$base" && [[ "$base" != *-dev ]]; then
+            if [ -d "$parent/$base-dev" ] || [ "${parent##*/}" = "$base-dev" ]; then
+                printf '%s' "$base"
+                return 0
+            fi
+        fi
+        dir=$parent
+    done
+}
+
+project_from_cwd() {
+    local found
+    found=$(project_from_dev)
+    [ -n "$found" ] || found=$(project_from_product)
+    printf '%s' "$found"
 }
 
 # Print the version a project is pinned to. The conf file is read, not sourced,

@@ -1,5 +1,6 @@
 import unittest
 
+from tests import clone_cases
 from tests.support import ROOT, TempTestCase, run
 
 JIG = ROOT / "bin" / "jig"
@@ -74,6 +75,21 @@ class DispatcherTest(TempTestCase):
         inside = self.tmp / "ws" / "demo-dev" / "demo" / "deep"
         inside.mkdir(parents=True)
         self.assert_runs(self.jig("probe", cwd=inside), "0.1.0")
+
+    def test_dispatcher_takes_the_project_of_each_shared_layout(self):
+        # demo is pinned to the older version. From a product clone, or from deep in
+        # one, the dispatcher takes the project of the -dev clone that the rule finds,
+        # and runs the pin; with no -dev clone it runs current.
+        self.two_versions()
+        self.pin(clone_cases.PROJECT, "JIG_VERSION=0.1.0\n")
+        cases = (*clone_cases.FROM_PRODUCT, *clone_cases.DEEP_CASES)
+        for number, case in enumerate(cases):
+            with self.subTest(case=case.name):
+                base = clone_cases.build(self.tmp / "cases" / f"case{number}", case.layout)
+                inside = base / case.start
+                inside.mkdir(parents=True, exist_ok=True)
+                expected = "0.2.0" if case.expected is None else "0.1.0"
+                self.assert_runs(self.jig("probe", cwd=inside), expected)
 
     def test_dispatcher_argument_wins_over_the_dev_directory(self):
         self.two_versions()
