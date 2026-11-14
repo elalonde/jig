@@ -58,6 +58,10 @@ HOOK_TAG = "spec-p0"
 LINE_TAG = "spec-1.2"
 HOOK_CONF = HOME / ".config" / "jig" / f"{HOOK_PROJECT}.conf"
 HOOK_PROMPTS = HOME / "ws" / "prompts" / HOOK_PROJECT
+# Where a fixture case with clones in this account's ~/ws/src puts them: the -dev
+# clone, the product clone beside it, and the approved worktree that the start makes.
+HOOK_HOME_CLONES = tuple(HOME / "ws" / "src" / name for name in
+                         (f"{HOOK_PROJECT}-dev", HOOK_PROJECT, f"{HOOK_PROJECT}-dev-approved"))
 HOOK_REVIEWS = HOME / "ws" / "reviews" / HOOK_PROJECT
 
 
@@ -86,6 +90,13 @@ def lock_holder(lock):
 
 def capture(*command, env=None):
     return subprocess.run(command, capture_output=True, text=True, check=False, env=env)
+
+
+def remove_tree(path):
+    """Remove a fixture tree; an approved worktree in it is read-only, so it opens first."""
+    if path.exists():
+        capture("chmod", "-R", "u+w", str(path))
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def session_alive(session=SESSION):
@@ -235,14 +246,26 @@ class FixtureProjectCase(unittest.TestCase):
     ~/.config/jig, and puts the prompt and the tee under ~/ws; the test removes all of
     them. The session waits at the folder-trust dialog in the new folder, so the worker
     stops there after the install, and the test ends that session and frees its lock.
+
+    The product clone is inside the -dev clone, the place of the releases before 0.6.
+    A case with IN_HOME true puts the two clones side by side in ~/ws/src instead, where
+    the role's list of directories names the product clone; it refuses to start when
+    one of those places exists, and removes them at its end.
     """
 
+    IN_HOME = False
+
     def setUp(self):
-        for path in (HOOK_CONF, HOOK_PROMPTS, HOOK_REVIEWS):
-            self.assertFalse(path.exists(), f"{path} is not this test's")
+        places = (HOOK_CONF, HOOK_PROMPTS, HOOK_REVIEWS,
+                  *(HOOK_HOME_CLONES if self.IN_HOME else ()))
+        for path in places:
+            self.assertFalse(path.exists() or path.is_symlink(), f"{path} is not this test's")
         self.assertFalse(session_alive(HOOK_SESSION), f"{HOOK_SESSION} is running")
         self.base = pathlib.Path(tempfile.mkdtemp(prefix="jig-test."))
         self.addCleanup(self.remove_base)
+        if self.IN_HOME:
+            for path in HOOK_HOME_CLONES:
+                self.addCleanup(remove_tree, path)
         self.addCleanup(shutil.rmtree, HOOK_PROMPTS, ignore_errors=True)
         self.addCleanup(shutil.rmtree, HOOK_REVIEWS, ignore_errors=True)
         self.addCleanup(HOOK_CONF.unlink, missing_ok=True)
@@ -256,8 +279,11 @@ class FixtureProjectCase(unittest.TestCase):
         self.dev_origin = dev_origin = self.base / f"{HOOK_PROJECT}-dev.git"
         product_origin = self.base / f"{HOOK_PROJECT}.git"
         self.seed = self.base / "seed"
-        self.dev = self.base / f"{HOOK_PROJECT}-dev"
-        self.product = self.dev / HOOK_PROJECT
+        if self.IN_HOME:
+            self.dev, self.product = HOOK_HOME_CLONES[0], HOOK_HOME_CLONES[1]
+        else:
+            self.dev = self.base / f"{HOOK_PROJECT}-dev"
+            self.product = self.dev / HOOK_PROJECT
         for origin in (dev_origin, product_origin):
             self.git("init", "-q", "--bare", "-b", "master", str(origin))
         self.git("init", "-q", "-b", "master", str(self.seed))
@@ -300,9 +326,7 @@ class FixtureProjectCase(unittest.TestCase):
         self.git("-C", str(self.seed), "push", "-q", "origin", "master")
 
     def remove_base(self):
-        # The approved worktree is read-only, so the tree opens before it goes.
-        capture("chmod", "-R", "u+w", str(self.base))
-        shutil.rmtree(self.base, ignore_errors=True)
+        remove_tree(self.base)
 
     def stop_session(self):
         capture("tmux", "kill-session", "-t", f"={HOOK_SESSION}")
@@ -310,20 +334,25 @@ class FixtureProjectCase(unittest.TestCase):
         lock.unlink(missing_ok=True)
         lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
 
-    def run_worker(self, *tag_args):
+    def run_worker(self, *tag_args, add_dirs=()):
         """Run the worker part alone; accept its stop at the folder-trust dialog.
 
         tag_args are the --tag and --approved-tag options; without them, the phase tag
-        that the fixture holds is both.
+        that the fixture holds is both. add_dirs are the --add-dir words. Returns the
+        command of the session's pane, read before the session ends.
         """
         tag_args = tag_args or ("--approved-tag", HOOK_TAG, "--tag", HOOK_TAG)
         result = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
-                         "--expected", EXPECTED, "--model", MODEL, *tag_args, env=self.env)
+                         "--expected", EXPECTED, "--model", MODEL, *tag_args, *add_dirs,
+                         env=self.env)
         stopped = result.returncode == 1 and "refused: dialog:" in result.stderr
         self.assertTrue(result.returncode == 0 or stopped, result.stderr)
         print(f"worker: {'stopped at the folder-trust dialog' if stopped else 'started'}")
+        command = capture("tmux", "display-message", "-p", "-t", f"={HOOK_SESSION}",
+                          "#{pane_start_command}").stdout
         self.stop_session()
         self.assertFalse(session_alive(HOOK_SESSION))
+        return command
 
     def hook_path(self):
         named = self.git("-C", str(self.product), "rev-parse", "--git-path", "hooks/pre-commit")
@@ -359,6 +388,30 @@ class RealHookTest(FixtureProjectCase):
         print(f"hook after the start without the row: {'present' if hook.exists() else 'absent'}")
         self.assertFalse(hook.exists())
         self.assertIn("/hooks/pre-commit", self.excluded())
+
+
+class RealSiblingStartTest(FixtureProjectCase):
+    """jig start of a fixture project whose two clones are siblings in ~/ws/src."""
+
+    IN_HOME = True
+
+    def test_real_start_gives_the_product_clone_beside_and_installs_the_hook_there(self):
+        # The list of directories comes from jig start itself, as it builds the --add-dir
+        # words for an implementer unit; the worker expands it in this account. The
+        # product clone ~/ws/src/hookfx exists, so the session gets it, and the hook goes
+        # into that clone.
+        start = load_script("jig_start", START)
+        directories = start.jig_dirs.of_role("impl", HOOK_PROJECT)
+        print(f"jig start lists for impl: {' '.join(directories)}")
+        self.assertIn(f"~/ws/src/{HOOK_PROJECT}", directories)
+        command = self.run_worker(add_dirs=[word for directory in directories
+                                            for word in ("--add-dir", directory)])
+        print(f"the pane's command names the product clone: "
+              f"{str(self.product) in command}")
+        self.assertIn(f"--add-dir {shlex.quote(str(self.product))} ", command)
+        hook = self.hook_path()
+        self.assertEqual(hook.read_bytes(), (ROOT / "hooks" / "pre-commit").read_bytes())
+        self.assertEqual(self.git("-C", str(self.product), "status", "--porcelain"), "")
 
 
 class RealVersionLineTagTest(FixtureProjectCase):
