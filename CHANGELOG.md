@@ -5,6 +5,116 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.6.0
+
+What changed: the two clones of a project in an account, the product clone and
+the `-dev` clone, are now siblings: they sit side by side in one directory, the
+product clone named after the project and the `-dev` clone with the same name
+and `-dev` added. No clone is inside the other. Releases before 0.6 kept the
+product clone inside the `-dev` clone; that place still works, so a project
+whose clones have not moved yet keeps running, but only when no product clone
+sits beside the `-dev` clone. Once the clone beside it exists, a leftover copy
+inside the `-dev` clone is never used.
+
+One function, `other_clone` in the new module `lib/jig_clones.py`, finds the
+other clone of a project: the product clone of a `-dev` clone, and the `-dev`
+clone of a product clone. It looks beside the clone first and at the old
+nested place only when nothing is beside it. `jig trace`, `jig terms`,
+`jig privacy`, `jig recompute`, `jig report`, `jig release`, `jig upgrade`,
+the hook install of `jig start` and lint A all use it, and a missing clone is
+one line on stderr. `jig start` passes the text of the module to the worker
+side of the start as an option, because that side runs from standard input and
+imports only the standard library. Lint A finds
+`terms.txt` in the `-dev` clone that `other_clone` names, unless `LINT_TERMS`
+names another file.
+
+jig's pre-commit hook and the dispatcher `jig` have their own copy of the same
+rule, because the hook is copied into clones of accounts that cannot read jig's
+tree, and the dispatcher must find the project before it knows which installed
+tree to load. The hook finds the `-dev` clone beside the product clone, and its
+`checks.tsv`; the dispatcher takes the project from a product clone beside its
+`-dev` clone, as it already did from a `-dev` clone. One table of layouts in
+the tests runs on the function, the hook and the dispatcher, so the three
+copies stay equal.
+
+The `--add-dir` list that `jig start` gives a session holds the product clone
+for the spec writer, the implementer and the reviewer, because the product clone
+now sits outside the repo the session works in; an account without a product
+clone gets no entry for it. The orchestrator's list does not hold it.
+
+`jig new` makes the two seed clones as siblings, both built in one scratch
+directory and moved into place with the product clone first, so that an
+existing `-dev` clone always means that both are there and a rerun keeps them.
+When a directory already sits at the place of the product clone with no `-dev`
+clone beside it, `jig new` refuses with one line that names the directory and
+writes nothing, rather than overwrite or adopt a tree it did not make. Its
+templates follow the new layout: the `-dev` clone ignores no product
+directory, the rows of `checks.tsv` and the `Makefile` name the product clone
+beside the `-dev` clone, the `CLAUDE.md` of a new project states the path rule
+of the two clones, and the block, the prompt template and the README do the
+same. `jig new` copies `lib/jig_clones.py` into the product with the other
+files of lint A.
+
+Files and formats: new: `lib/jig_clones.py`, which the product of a new
+project also gets with lint A. Changed: the layout of the clones in every
+account, as above; `bin/jig`, `hooks/pre-commit`, `lib/lint_a.py`,
+`lib/jig_dirs.py` (the `--add-dir` list), `lib/jig_trace.py`, `jig-new`,
+`jig-privacy`, `jig-recompute`, `jig-release`, `jig-report`, `jig-start`,
+`jig-start-worker`, `jig-terms`, `jig-trace` and `jig-upgrade`; the templates
+of `jig new` (`README.md`, `block.sh.in`, and in the `-dev` clone `CLAUDE.md`,
+`Makefile`, `checks.tsv` and `gitignore`) and the prompt template
+`templates/prompt.md`. The formats of the conf files, `checks.tsv`, reports
+and the trace are unchanged.
+
+Migration: a host and its projects move from 0.5.1 to 0.6.0 in this order, with
+no unit running other than the one of step 3. A project still on 0.5.0 first takes the steps of the 0.5.1
+entry, among them the rename of the session file under
+`~/ws/reviews/<project>/orch/` to `session-ids`.
+
+1. As the orchestrator account, run `jig upgrade 0.6.0`. It installs 0.6.0
+   under `/opt/jig/0.6.0/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.6.0` as the orchestrator
+   account. It sets `JIG_VERSION=0.6.0` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.6.0`. 0.6.0 still
+   finds the nested product clone, so the projects run as before until the
+   move below.
+3. For each project whose product holds a copy of jig's lint A, which `jig new`
+   put there, copy `lib/lint_a.py` and the new `lib/jig_clones.py` from
+   `/opt/jig/0.6.0/` into the product's `lib/`, in one product commit with its
+   ledger entry, made in a unit of the implementer account and pushed.
+   The lint A of 0.5.1 reads `terms.txt` only from the directory that holds the
+   product clone, which is no longer the `-dev` clone after the move. jig's own
+   product has these files from 0.6.0 on.
+4. Move each project's clones to siblings, one account at a time, in this
+   order: the orchestrator account, then the spec writer account when it holds
+   a product clone, then the implementer account last. In each account, pull
+   both clones, then, in the directory that holds the `-dev` clone, move the
+   product clone `<project>` out of the `-dev` clone into that directory under
+   the same name, so that it sits beside `<project>-dev`. Check that git
+   status is clean in both clones. A moved clone keeps its git config, with
+   `core.hooksPath` where it is set; in a worker account the next `jig start`
+   writes the 0.6.0 hook into the product clone.
+5. In each project's `-dev` clone, make one commit, pushed, that changes every
+   path that names the product clone inside the `-dev` clone to the clone
+   beside it: the line of the product directory in `.gitignore` goes; the
+   commands of the rows of `checks.tsv` and the `Makefile` that run in the
+   product clone name it with `../` before its name; the comments and the
+   `CLAUDE.md` rules that state the old place follow. For jig these are the
+   `.gitignore` line of the product, the rows `make-check`, `mutants`,
+   `ci-green`, `real-start` and `privacy` of `checks.tsv`, and the
+   `jig trace check` line of the `Makefile` with its comment. Then pull that
+   commit in each account. Between the move and this commit, a row that runs
+   in the product clone fails, so no unit runs between them.
+6. Take into each project's `CLAUDE.md` the path rule of the two clones from
+   the template of `jig new`, when the project wants it, and name each path in
+   a prompt from its repo name: `<project>-dev/...` in the `-dev` clone and
+   `<project>/...` in the product clone beside it.
+
+Requested by: Eric.
+
+Units: 1 minor, 0 patch, 4 none
+
 ## 0.5.1
 
 What changed: the supervisor `jig orch` now keeps the orchestrator's tmux
