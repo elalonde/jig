@@ -11,7 +11,9 @@ ROLE: <role>. Rules: CLAUDE.md, the sections <names>; when the
 STATE: <the expected state when this unit starts: the previous unit, the
   path of its report, what should be on origin>; the premise check
   verifies it.
-READ: <files and sections; inbox files beside this prompt>.
+READ: <files and sections, each path from its repo name:
+  <project>-dev/... in the -dev clone, <project>/... in the product
+  clone beside it; inbox files beside this prompt>.
   DO NOT READ: impl/log/ except the previous report; transcripts;
   full logs; <project items>.
 AUTHORITY: <edits outside the normal rules that this prompt allows;

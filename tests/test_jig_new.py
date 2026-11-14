@@ -138,18 +138,24 @@ class JigNewTest(TempTestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o2775)
         self.assertTrue((self.srv / "blocks/demo/new.sh").is_file())
 
+        # The two clones are siblings: the product clone is beside the -dev clone and
+        # not inside it.
         dev = orch / "ws/src/demo-dev"
-        for name in ("CLAUDE.md", "impl/orch/ORCHESTRATOR.md", "impl/orch/state.md",
-                     "impl/orch/handoff.md",
-                     "checks.tsv", "Makefile", ".gitignore", "terms.txt",
+        product = orch / "ws/src/demo"
+        self.assertFalse((dev / "demo").exists())
+        for name in ("demo-dev/CLAUDE.md", "demo-dev/impl/orch/ORCHESTRATOR.md",
+                     "demo-dev/impl/orch/state.md", "demo-dev/impl/orch/handoff.md",
+                     "demo-dev/checks.tsv", "demo-dev/Makefile", "demo-dev/.gitignore",
+                     "demo-dev/terms.txt",
                      "demo/Makefile", "demo/tools/lint-a.sh", "demo/lib/lint_a.py",
-                     "demo/lib/jig_ids.py", "demo/hooks/commit-msg", "demo/.gitignore",
-                     "demo/tools/lint-a-patterns.txt", "demo/.github/workflows/ci.yml"):
-            path = dev / name
+                     "demo/lib/jig_ids.py", "demo/lib/jig_clones.py", "demo/hooks/commit-msg",
+                     "demo/.gitignore", "demo/tools/lint-a-patterns.txt",
+                     "demo/.github/workflows/ci.yml"):
+            path = orch / "ws/src" / name
             self.assertTrue(path.is_file(), name)
             self.assertIsNone(re.search(r"@[A-Z_]+@", path.read_text(encoding="utf-8")), name)
-        self.assertTrue(os.access(dev / "demo/hooks/commit-msg", os.X_OK))
-        self.assertEqual(pattern_file_differences(dev / "demo/tools/lint-a-patterns.txt"), [])
+        self.assertTrue(os.access(product / "hooks/commit-msg", os.X_OK))
+        self.assertEqual(pattern_file_differences(product / "tools/lint-a-patterns.txt"), [])
         terms = (dev / "terms.txt").read_text(encoding="utf-8").split()
         for term in (OWNER, HOST, GITHUB):
             self.assertIn(term, terms)
@@ -158,9 +164,9 @@ class JigNewTest(TempTestCase):
         self.assertIn("jig wait demo <ID>", orchestrator)
         self.assertIn("every 10 minutes", orchestrator)
         self.assertIn("prefs.md", orchestrator)
-        self.assertIn("/demo/\n", (dev / ".gitignore").read_text(encoding="utf-8"))
+        self.assertNotIn("demo", (dev / ".gitignore").read_text(encoding="utf-8"))
         for repo, origin in ((dev, f"github-demo-dev:{GITHUB}/demo-dev.git"),
-                             (dev / "demo", f"github-demo:{GITHUB}/demo.git")):
+                             (product, f"github-demo:{GITHUB}/demo.git")):
             log = run(["git", "-C", repo, "log", "--format=%B", "0.1"], env=self.env())
             self.assertEqual(log.returncode, 0, log.stderr)
             self.assertIn("Co-Authored-By: Claude", log.stdout)
@@ -188,6 +194,32 @@ class JigNewTest(TempTestCase):
         """Make a project and return one of its files with every run of blanks as one space."""
         self.made()
         return " ".join((self.home / "ws/src/demo-dev" / name).read_text(encoding="utf-8").split())
+
+    def test_made_claude_md_states_the_path_rule_of_the_sibling_clones(self):
+        # The common part says where the two clones are, that a path starts at the repo
+        # name, and that a command in the -dev clone names the product as ../demo/.
+        text = self.made_text("CLAUDE.md")
+        self.assertIn("The product clone is its sibling, `~/ws/src/demo`; no clone is "
+                      "inside another.", text)
+        self.assertIn("starts at the repo name", text)
+        self.assertIn("`demo-dev/specs/...` is a file of the -dev clone, and `demo/...` is "
+                      "a file of the product clone.", text)
+        self.assertIn("names the product clone as `../demo/`, for example "
+                      "`make -C ../demo check`.", text)
+        common = text[:text.index("## Project part")]
+        self.assertNotIn("demo-dev/demo", common)
+
+    def test_made_check_rows_reach_the_product_clone_beside_the_dev_clone(self):
+        # The make-check row runs in the root of the -dev clone, as jig run-check runs
+        # it, and reaches the product's make check through ../demo.
+        self.made()
+        dev = self.home / "ws/src/demo-dev"
+        rows = (dev / "checks.tsv").read_text(encoding="utf-8").splitlines()
+        command = next(row.split("\t")[1] for row in rows if row.startswith("make-check\t"))
+        self.assertEqual(command, "make -C ../demo check")
+        result = run(["sh", "-c", command], env=self.env(), cwd=dev)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("lint-a: clean", result.stdout)
 
     def test_made_claude_md_ties_the_clean_room_rules_to_the_profile(self):
         # The tools read the clean room from the project profile, and the default is off,
@@ -388,7 +420,7 @@ class JigNewTest(TempTestCase):
         # The product's first commit holds a GitHub Actions workflow whose trigger is
         # every push and whose last step runs make check at the root of the checkout.
         self.made()
-        product = self.home / "ws/src/demo-dev/demo"
+        product = self.home / "ws/src/demo"
         workflow = product / ".github/workflows/ci.yml"
         lines = workflow.read_text(encoding="utf-8").splitlines()
         self.assertIn("on: push", lines)
@@ -498,18 +530,19 @@ class JigNewTest(TempTestCase):
         no_install = self.tmp / "no-install"
         no_install.mkdir()
         env = self.env(PATH=f"{ROOT / 'bin'}:{os.environ['PATH']}", JIG_ROOT=str(no_install))
-        for repo in (dev, dev / "demo"):
+        product = self.home / "ws/src/demo"
+        for repo in (dev, product):
             result = run(["make", "-C", repo, "check"], env=env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             if repo == dev:
                 self.assertIn("jig trace check\n", result.stdout)
             else:
                 self.assertIn("lint-a: clean", result.stdout)
-        hooks = run(["git", "-C", dev / "demo", "config", "core.hooksPath"], env=self.env())
+        hooks = run(["git", "-C", product, "config", "core.hooksPath"], env=self.env())
         self.assertEqual(hooks.stdout.strip(), "hooks")
         # The hooks are live. The term check of the pre-commit hook finds nothing in the
         # new product, and the commit-msg hook then refuses a message with a private term.
-        bad = run(["git", "-C", dev / "demo", "commit", "--allow-empty", "-q", "-m",
+        bad = run(["git", "-C", product, "commit", "--allow-empty", "-q", "-m",
                    f"Talk about {HOST}"], env=env)
         self.assertNotEqual(bad.returncode, 0)
         self.assertNotIn("jig pre-commit hook", bad.stderr)
@@ -520,7 +553,7 @@ class JigNewTest(TempTestCase):
         # tree. The first commit does not hold it, the exclude file keeps it out of the
         # product, and the clone stays clean.
         self.made()
-        product = self.home / "ws/src/demo-dev/demo"
+        product = self.home / "ws/src/demo"
         hook = product / "hooks/pre-commit"
         self.assertEqual(hook.read_bytes(), (ROOT / "hooks" / "pre-commit").read_bytes())
         self.assertTrue(os.access(hook, os.X_OK))
@@ -646,7 +679,7 @@ class JigNewTest(TempTestCase):
             result = run(["bash", "-c", prelude + self.block_step(4)], env=env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(f"push demo-dev {word}\npush demo {word}\n", result.stdout)
-        for repo, source in (("demo-dev", dev), ("demo", dev / "demo")):
+        for repo, source in (("demo-dev", dev), ("demo", self.home / "ws/src/demo")):
             bare = remote / f"{repo}.git"
             heads = run(["git", "-C", bare, "for-each-ref", "--format=%(refname:short)",
                          "refs/heads"], env=self.env())
@@ -690,11 +723,11 @@ class JigNewTest(TempTestCase):
         self.made()
         text = (self.srv / "blocks/demo/new.sh").read_text(encoding="utf-8")
         step = text.split('echo "step 5: clones"', 1)[1].split('echo "step 5 ok"', 1)[0]
-        self.assertIn('hp="[ ! -d ~/$d/$P/hooks ] || '
-                      'git -C ~/$d/$P config core.hooksPath hooks"', step)
+        self.assertIn('hp="[ ! -d ~/$p/hooks ] || '
+                      'git -C ~/$p config core.hooksPath hooks"', step)
         self.assertIn('on "$ORCH" "$hp"\n', step)
         self.assertIn('on "$IMPL" "$hp"\n', step)
-        self.assertLess(step.index("$c github-$P:$GH/$P ~/$d/$P"),
+        self.assertLess(step.index("$c github-$P:$GH/$P ~/$p"),
                         step.index('on "$IMPL" "$hp"'))
 
     def test_block_settings_step_writes_jig_status_line_and_no_other_hook(self):

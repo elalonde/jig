@@ -98,23 +98,26 @@ push() { # repo path-in-orchestrator
   echo "push $1 made"
 }
 push "$P-dev" "ws/src/$P-dev"
-push "$P" "ws/src/$P-dev/$P"
+push "$P" "ws/src/$P"
 
 echo "step 5: clones"
+# The two clones of an account are siblings: ~/ws/src/$P-dev and
+# ~/ws/src/$P, never one inside the other.
 up="git fetch -q origin && git branch -q -u origin/master master"
 up="$up && git branch -q -u origin/0.1 0.1"
-on "$ORCH" "cd ~/ws/src/$P-dev && $up && cd $P && $up"
+on "$ORCH" "cd ~/ws/src/$P-dev && $up && cd ../$P && $up"
 d=ws/src/$P-dev
+p=ws/src/$P
 c="git clone -q -b 0.1"
 on "$SPEC" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
 on "$IMPL" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
-on "$IMPL" "[ -d ~/$d/$P ] || $c github-$P:$GH/$P ~/$d/$P"
+on "$IMPL" "[ -d ~/$p ] || $c github-$P:$GH/$P ~/$p"
 # A product that tracks its hooks directory gets git to read it in every
 # product clone, as in the seed clone. Otherwise jig start puts the
 # pre-commit hook in .git/hooks, and once the product's make check sets
 # the hooks path, git skips that hook for the rest of the first unit.
 # Setting the same value again is harmless, so the step can run twice.
-hp="[ ! -d ~/$d/$P/hooks ] || git -C ~/$d/$P config core.hooksPath hooks"
+hp="[ ! -d ~/$p/hooks ] || git -C ~/$p config core.hooksPath hooks"
 on "$ORCH" "$hp"
 on "$IMPL" "$hp"
 echo "step 5 ok"

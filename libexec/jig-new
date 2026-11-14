@@ -8,8 +8,10 @@ Run as the orchestrator account. In each role account it makes ~/ws/src,
 keys (the spec writer also gets ~/ws/ref/<project>, mode 700); the other
 accounts are reached by ssh, with the command in JIG_SSH, as jig start does.
 It makes blocks/, in/, out/ and checks/ for the project under JIG_SRV
-(default /srv/jig), and the seed repos in ~/ws/src/<project>-dev, with the
-product nested in it, from the templates in templates/new/; the product gets
+(default /srv/jig), and the seed repos ~/ws/src/<project>-dev and, beside it,
+the product clone ~/ws/src/<project>, from the templates in templates/new/; no
+clone is inside the other, and the -dev clone ignores no product directory. The
+product gets
 the CI workflow .github/workflows/ci.yml, which runs make check on every push.
 After the product's first commit, jig's pre-commit hook goes into the seed product
 clone, at the path git names for it, with that path in .git/info/exclude.
@@ -80,7 +82,8 @@ DEFAULTS = {
 }
 
 # Lint A and the hook of the product are jig's own, so a fix reaches every project.
-LINT_FILES = ("tools/lint-a.sh", "lib/lint_a.py", "lib/jig_ids.py", "hooks/commit-msg")
+LINT_FILES = ("tools/lint-a.sh", "lib/lint_a.py", "lib/jig_ids.py", "lib/jig_clones.py",
+              "hooks/commit-msg")
 CO_AUTHOR = "Co-Authored-By: Claude <noreply@anthropic.com>"
 
 
@@ -149,7 +152,8 @@ def check_not_foreign(srv, project, home):
         return
     found = [path for path in (*project_paths(srv, project),
                                home / ".config" / "jig" / f"{project}.conf",
-                               home / "ws" / "src" / f"{project}-dev")
+                               home / "ws" / "src" / f"{project}-dev",
+                               home / "ws" / "src" / project)
              if path.exists() or path.is_symlink()]
     if found:
         raise Refusal(f"project {project} exists ({found[0]}) and jig new did not make "
@@ -311,18 +315,28 @@ def install_pre_commit(product):
 
 
 def seed_repos(project, host, values, home):
-    """Make the sidecar with the product nested in it, in a new directory moved in place last."""
+    """Make the sidecar and the product clone beside it, both moved in place last.
+
+    Both are built in one scratch directory next to their places. The product moves
+    first, so that an existing sidecar always means that both are there; a product
+    clone with no sidecar beside it is refused rather than overwritten.
+    """
     target = home / "ws" / "src" / f"{project}-dev"
+    product_target = home / "ws" / "src" / project
     if target.exists():
         say(f"kept {target}")
         return
-    work = pathlib.Path(tempfile.mkdtemp(prefix=f".{project}-dev.", dir=target.parent))
+    if product_target.exists() or product_target.is_symlink():
+        raise Refusal(f"{product_target} exists with no {target.name} beside it; "
+                      "nothing is overwritten")
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix=f".{project}-dev.", dir=target.parent))
     try:
+        work = scratch / target.name
+        product = scratch / project
         write_tree(TEMPLATES / "dev", work, values)
         terms = sorted({host["OWNER"], host["HOST"], host["GITHUB_OWNER"]})
         with open(work / "terms.txt", "a", encoding="utf-8") as stream:
             stream.write("".join(f"{term}\n" for term in terms))
-        product = work / project
         write_tree(TEMPLATES / "product", product, values)
         for name in LINT_FILES:
             (product / name).parent.mkdir(parents=True, exist_ok=True)
@@ -334,12 +348,14 @@ def seed_repos(project, host, values, home):
         first_commit(product, env, "Start the project with its checks",
                      f"github-{project}:{github}/{project}.git")
         install_pre_commit(product)
-        work.chmod(0o755)
+        for path in (work, product):
+            path.chmod(0o755)
+        product.rename(product_target)
         work.rename(target)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
     say(f"made {target}")
-    say(f"made {target / project}")
+    say(f"made {product_target}")
 
 
 def write_block(srv, project, values):

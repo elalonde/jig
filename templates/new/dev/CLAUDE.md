@@ -49,8 +49,14 @@ can read no value for `clean room`, `jig wait`, `jig cat` and
 - A unit is one fresh session with one prompt, one ID and one committed
   report. Never `--resume`, never compact. A stopped unit restarts as a fresh
   session with the same prompt and ID.
-- Work from the repo directory. Paths in prompts and reports start at the
-  repo name (`@PROJECT@-dev/specs/...`).
+- Work from the repo directory, the -dev clone `~/ws/src/@PROJECT@-dev`. The
+  product clone is its sibling, `~/ws/src/@PROJECT@`; no clone is inside
+  another.
+- A path in a prompt, a report or this file starts at the repo name, because
+  several repos are open at once: `@PROJECT@-dev/specs/...` is a file of the
+  -dev clone, and `@PROJECT@/...` is a file of the product clone.
+- A command run in the root of the -dev clone names the product clone as
+  `../@PROJECT@/`, for example `make -C ../@PROJECT@ check`.
 - Read by section: grep first, then read around the match. Never read a full
   log, build output or test output: write it to
   `~/ws/reviews/@PROJECT@/<ID>-*.txt`, decide from the exit code, and read

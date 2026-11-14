@@ -1,10 +1,12 @@
 # Templates of jig new
 
 `jig new <project>` copies `dev/` into the sidecar `<project>-dev` and
-`product/` into the product, and writes `block.sh.in` as the block for the
-steps that need the owner. Lint A and the commit-msg hook of the product are
-copies of jig's own (`tools/lint-a.sh`, `lib/lint_a.py`, `lib/jig_ids.py`,
-`hooks/commit-msg`), so a fix to jig's lint A reaches every new project.
+`product/` into the product clone `<project>` beside it, and writes
+`block.sh.in` as the block for the steps that need the owner. Lint A and the
+commit-msg hook of the product are copies of jig's own (`tools/lint-a.sh`,
+`lib/lint_a.py`, `lib/jig_ids.py`, `lib/jig_clones.py`, `hooks/commit-msg`),
+so a fix to jig's lint A reaches every new project. `lib/jig_clones.py` is how
+lint A finds the sidecar beside the product, and `terms.txt` in it.
 
 `product/.github/workflows/ci.yml` is the CI skeleton of the product: a GitHub
 Actions workflow that runs `make check` on every push. The first unit after the
