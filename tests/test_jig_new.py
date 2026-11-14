@@ -621,6 +621,20 @@ class JigNewTest(TempTestCase):
         self.assertIn("jig new did not make it", result.stderr)
         self.assertEqual(self.snapshot(), before)
 
+    def test_a_directory_at_the_place_of_the_product_clone_is_not_overwritten(self):
+        # ~/ws/src/demo exists on its own, with no -dev clone beside it: jig new refuses
+        # with one line that names it, and changes nothing.
+        kept = self.home / "ws" / "src" / PROJECT / "notes.txt"
+        kept.parent.mkdir(parents=True)
+        kept.write_text("keep\n", encoding="utf-8")
+        before = self.snapshot()
+        result = self.new(PROJECT)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.splitlines(),
+                         [f"jig new: project {PROJECT} exists ({kept.parent}) and jig new "
+                          "did not make it; nothing is overwritten"])
+        self.assertEqual(self.snapshot(), before)
+
     def test_project_name_that_is_a_file_is_not_overwritten(self):
         (self.srv / "in" / PROJECT).write_text("a file\n", encoding="utf-8")
         before = self.snapshot()
