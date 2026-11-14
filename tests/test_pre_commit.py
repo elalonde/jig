@@ -3,24 +3,24 @@ import pathlib
 import shutil
 import unittest
 
+from tests import clone_cases
 from tests.support import ROOT, TempTestCase, run
 
 HOOK = ROOT / "hooks" / "pre-commit"
 HEADER = "name\tcommand\taccount\tcap_seconds"
 # What the real term check prints for a match: the place, and never the term.
-PLACE = "prod/notes.txt:3: terms.txt line 1"
+PLACE = "demo/notes.txt:3: terms.txt line 1"
 
 
 class PreCommitCase(TempTestCase):
-    """A -dev clone with a product clone nested in it, and jig's hook in the product."""
+    """A -dev clone with the product clone beside it, and jig's hook in the product."""
 
     def setUp(self):
         super().setUp()
-        self.dev = self.git_init(self.tmp / "dev")
-        (self.dev / ".gitignore").write_text("/prod/\n", encoding="utf-8")
+        self.dev = self.git_init(self.tmp / "demo-dev")
         self.write_rows()
         self.git_commit_all(self.dev)
-        self.product = self.git_init(self.dev / "prod")
+        self.product = self.git_init(self.tmp / "demo")
         (self.product / "notes.txt").write_text("first\n", encoding="utf-8")
 
     def write_rows(self, *rows):
@@ -100,8 +100,9 @@ class PreCommitTest(PreCommitCase):
         self.assertIn("cannot read", result.stderr)
         self.assertEqual(self.commits(), 0)
 
-    def test_hook_refuses_a_product_clone_that_no_dev_clone_holds(self):
-        # A clone on its own has no checks.tsv above it, so the commit is refused.
+    def test_hook_refuses_a_product_clone_with_no_dev_clone(self):
+        # A clone on its own has no -dev clone beside it or around it, so there is no
+        # checks.tsv to read, and the commit is refused.
         alone = self.git_init(self.tmp / "alone")
         (alone / "notes.txt").write_text("first\n", encoding="utf-8")
         named = self.git("rev-parse", "--git-path", "hooks/pre-commit", cwd=alone).stdout
@@ -111,7 +112,7 @@ class PreCommitTest(PreCommitCase):
         self.git("add", "-A", cwd=alone)
         result = self.git("commit", "-q", "-m", "Change the notes", cwd=alone)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no -dev clone holds", result.stderr)
+        self.assertIn("no -dev clone beside", result.stderr)
 
     def test_hook_stops_a_term_check_past_its_cap(self):
         # The row's cap is one second and the command sleeps longer: the commit is
@@ -134,7 +135,45 @@ class PreCommitTest(PreCommitCase):
         result = self.git("commit", "-a", "-q", "-m", "Change the notes")
         self.assertEqual(result.returncode, 0, result.stderr)
         listed = (self.dev / "listed.txt").read_text(encoding="utf-8").split()
-        self.assertEqual(listed, [".gitignore", "checks.tsv"])
+        self.assertEqual(listed, ["checks.tsv"])
+
+
+class PreCommitSharedLayoutTest(TempTestCase):
+    """The hook finds the -dev clone by the rule that lib/jig_clones.py holds."""
+
+    def test_hook_runs_the_term_check_of_the_dev_clone_of_each_shared_layout(self):
+        # Each -dev clone of the layout has a row terms that writes where it ran. A
+        # commit in the start clone runs the row of the -dev clone that the case
+        # expects; with no -dev clone, the commit is refused with one line.
+        for number, case in enumerate(clone_cases.FROM_PRODUCT):
+            with self.subTest(case=case.name):
+                base = clone_cases.build(self.tmp / f"case{number}", case.layout)
+                for relative in clone_cases.LAYOUTS[case.layout]:
+                    if relative.endswith("-dev"):
+                        rows = [HEADER, "terms\tpwd > ran-in.txt\timplementer\t60"]
+                        (base / relative / "checks.tsv").write_text("\n".join(rows) + "\n",
+                                                                   encoding="utf-8")
+                product = self.git_init(base / case.start)
+                (product / "notes.txt").write_text("first\n", encoding="utf-8")
+                hook = product / ".git" / "hooks" / "pre-commit"
+                hook.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(HOOK, hook)
+                git = ["git", "-C", product]
+                run([*git, "add", "-A"], env=self.env())
+                result = run([*git, "commit", "-q", "-m", "Change the notes"], env=self.env())
+                if case.expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    refusals = [line for line in result.stderr.splitlines()
+                                if line.startswith("jig pre-commit hook:")]
+                    self.assertEqual(len(refusals), 1, result.stderr)
+                    self.assertIn("no -dev clone beside", refusals[0])
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                ran = sorted(path.parent for path in base.rglob("ran-in.txt"))
+                self.assertEqual(ran, [base / case.expected])
+                ran_in = (base / case.expected / "ran-in.txt").read_text(encoding="utf-8")
+                self.assertEqual(os.path.realpath(ran_in.strip()),
+                                 os.path.realpath(base / case.expected))
 
 
 class PreCommitHooksPathTest(PreCommitCase):
