@@ -46,6 +46,15 @@ class ReadPathTest(ReadCheckCase):
             for path in paths:
                 self.assert_passes(path, role)
 
+    def test_read_path_in_the_product_clone_passes_for_each_worker_role_only(self):
+        # The product clone sits beside the -dev clone, so a path in it is outside the
+        # repo; it is in the list of every worker role, written from the home or from
+        # the working directory, and the orchestrator, who reads no product, is refused.
+        for role in ROLES:
+            for path in ("~/ws/src/jig", "~/ws/src/jig/lib/jig_clones.py", "../jig/lib/x"):
+                self.assert_passes(path, role)
+        self.assert_refused("~/ws/src/jig/lib/jig_clones.py", "orch", account="orchestrator")
+
     def test_read_path_of_the_approved_worktree_fails_for_the_spec_writer(self):
         self.assert_refused("~/ws/src/jig-dev-approved/specs/x", "spec")
 
@@ -69,7 +78,7 @@ class ReadPathTest(ReadCheckCase):
         self.assert_refused("~/ws/src/jig-dev/x", project="my-app")
 
     def test_read_path_of_the_working_directory_of_another_name_fails(self):
-        for path in ("~/ws/src/jig-dev2/x", "~/ws/src/jig/x", "~/ws/prompts/jig2/x",
+        for path in ("~/ws/src/jig-dev2/x", "~/ws/src/jig2/x", "~/ws/prompts/jig2/x",
                      "~/ws/reviews/jig-other", "~/ws/src/jig-dev-approved2/x"):
             self.assert_refused(path)
 

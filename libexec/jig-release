@@ -8,7 +8,9 @@ usage: jig release <project> prepare --entry <file> --trailer <line>
 Runs as the implementer, inside the tmux session of the unit that makes the release,
 because the checks that the implementer runs go through jig run-check, which records
 their exit codes for that unit. The -dev clone is REPO of ~/.config/jig/<project>.conf,
-the product clone is <REPO>/<project>, and the version line is BRANCH, of the form
+the product clone is the directory <project> beside it (or <REPO>/<project>, where a
+release before 0.6 put it, when nothing is beside <REPO>), and the version line is
+BRANCH, of the form
 <X>.<Y>. The version is <X>.<Y>.0 when the product has no tag v<X>.<Y>.<n> on the line,
 else the newest such tag with its last number plus 1.
 
@@ -44,7 +46,7 @@ and prepare exits 1, so that publish never finds a partial set of files.
   the clean-clone proof: in a new clone of that commit, make check, make package
     package-check source-archive, and make in the unpacked source archive under
     unshare -rn, which leaves it no network. The commands in the clone run with
-    LINT_TERMS=<REPO>/terms.txt, because the clone is not nested in the -dev clone,
+    LINT_TERMS=<REPO>/terms.txt, because the clone has no -dev clone beside it,
     where lint A looks for the private terms by default, and a check without them
     fails. The offline build runs without LINT_TERMS, to prove that the archive
     builds without the private file. The files that package and source-archive
@@ -135,6 +137,7 @@ sys.dont_write_bytecode = True
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 
+import jig_clones  # noqa: E402
 import jig_units  # noqa: E402
 
 USAGE = ("usage: jig release <project> prepare --entry <file> --trailer <line>\n"
@@ -165,6 +168,14 @@ STEPS = (
     "the rows of checks.tsv",
     "SHA256SUMS",
 )
+
+
+def product_clone(dev):
+    """Return the product clone of the -dev clone dev, or refuse with one line."""
+    product = jig_clones.other_clone(dev)
+    if product is None or not (product / ".git").exists():
+        jig_units.refuse("product", f"no product clone beside {dev}")
+    return product
 
 
 class StepFailed(Exception):
@@ -346,7 +357,7 @@ class Prepare:
         self.trailer = trailer
         conf = jig_units.read_conf(project)
         self.dev = pathlib.Path(conf["REPO"])
-        self.product = self.dev / project
+        self.product = product_clone(self.dev)
         self.line = conf["BRANCH"]
         self.impl_account = conf.get("IMPL_ACCOUNT") or DEFAULT_IMPL_ACCOUNT
         self.releases = pathlib.Path(os.path.expanduser(f"~/ws/reviews/{project}/release"))
@@ -510,8 +521,8 @@ class Prepare:
             if code != 0:
                 raise StepFailed(f"git clone failed: {last_line(output)}")
             git_out(clone, "checkout", "-q", "--detach", self.commit)
-            # Lint A of a clone looks for the private terms beside it, as in the -dev
-            # clone, and fails without them; this clone stands alone in /tmp.
+            # Lint A of a clone looks for the private terms in the -dev clone beside
+            # it, and fails without them; this clone stands alone in /tmp.
             terms = dict(os.environ, LINT_TERMS=str(self.dev / "terms.txt"))
             self.make(clone, "check", env=terms)
             self.make(clone, "package", "package-check", env=terms)
@@ -763,7 +774,7 @@ class Published:
         self.project = project
         conf = jig_units.read_conf(project)
         self.dev = pathlib.Path(conf["REPO"])
-        self.product = self.dev / project
+        self.product = product_clone(self.dev)
         self.line = conf["BRANCH"]
         self.releases = pathlib.Path(os.path.expanduser(f"~/ws/reviews/{project}/release"))
         self.api = (os.environ.get("JIG_GITHUB_API") or GITHUB_API).rstrip("/")

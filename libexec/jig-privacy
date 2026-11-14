@@ -4,7 +4,9 @@
 usage: jig privacy scan <project>
 
 The project's -dev clone is the clone that REPO names in ~/.config/jig/<project>.conf,
-and its product clone is <REPO>/<project>. The scan reads the path and the contents
+and its product clone is the directory <project> beside it (or <REPO>/<project>,
+where a release before 0.6 put it, when nothing is beside <REPO>), the clone that
+jig terms check reads too. The scan reads the path and the contents
 of these files:
   every regular file under captures/ and vectors/ of the -dev clone, at any depth;
   every regular file under the product's vector directory. That directory is the
@@ -38,8 +40,9 @@ and never the value:
   <path>: <kind> in the path
 where <kind> is "terms.txt line <n>" for a serial, "host name of host <k> in the
 host list" or "host address of host <k> in the host list", with hosts counted in
-the order of the file, "UUID", "MAC address" or "e-mail address". Paths read from
-the top of the -dev clone, so a product path starts with <project>/. A private value
+the order of the file, "UUID", "MAC address" or "e-mail address". A path in the
+-dev clone reads from its top, and a product path starts with <project>/, the name
+of the product's repo. A private value
 in a printed path is replaced by "***". A line that holds one kind twice prints one
 line for it.
 

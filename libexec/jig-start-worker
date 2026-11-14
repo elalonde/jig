@@ -29,8 +29,12 @@ leaves out a directory that does not exist. For the same reason jig start passes
 text of jig's pre-commit hook, hooks/pre-commit of its own tree, as --hook; run
 alone from a jig tree, the script reads that file beside it.
 
-The product clone is the clone of the product nested in the -dev clone, at
-REPO/<project>. jig's pre-commit hook is the file that git rev-parse --git-path
+The product clone is the one lib/jig_clones.py finds for the -dev clone REPO: the
+clone beside it, ~/ws/src/<project>, or, for a project that a release before 0.6
+set up and that has nothing beside its -dev clone, REPO/<project>. For the same
+reason as the hook, jig start passes the text of that module as --clones, and the
+script runs it; run alone from a jig tree, the script reads the module beside it.
+jig's pre-commit hook is the file that git rev-parse --git-path
 hooks/pre-commit names there, so a clone with core.hooksPath gets it at the right
 place too. Its second line is a marker, and only a file with that marker is jig's:
 another hook at the path stops the start before anything changes, so a project's
@@ -312,8 +316,39 @@ def refresh_approved(clone, tag):
     set_writable(worktree, False)
 
 
-def product_clone(conf, project):
-    return pathlib.Path(conf["REPO"]) / project
+# The functions of lib/jig_clones.py, once they are loaded.
+_clones = {}
+
+
+def use_clones(text):
+    """Run the text of lib/jig_clones.py and keep its function that finds a clone."""
+    namespace = {"__name__": "jig_clones"}
+    exec(compile(text, "jig_clones.py", "exec"), namespace)
+    _clones["other_clone"] = namespace["other_clone"]
+
+
+def clones_beside_script():
+    """Return lib/jig_clones.py of the jig tree this script is in, or None from stdin."""
+    for start in (globals().get("__file__"), sys.argv[0]):
+        if not start or start in ("-", "<stdin>"):
+            continue
+        path = pathlib.Path(start).resolve().parent.parent / "lib" / "jig_clones.py"
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return None
+
+
+def product_clone(conf):
+    """Return the product clone of the -dev clone REPO, or None when it has none."""
+    if "other_clone" not in _clones:
+        text = clones_beside_script()
+        if text is None:
+            refuse("clones", "no way to find the product clone: jig start passes "
+                   "lib/jig_clones.py as --clones")
+        use_clones(text)
+    return _clones["other_clone"](conf["REPO"])
 
 
 def is_clone(path):
@@ -376,7 +411,7 @@ def foreign_hook(product):
 
 
 def check_hook(product):
-    if is_clone(product):
+    if product is not None and is_clone(product):
         foreign_hook(product)
 
 
@@ -441,8 +476,8 @@ def remove_hook(product):
 
 def place_hook(conf, project, text):
     """Install or remove the hook by the row terms at the origin head the clone is now at."""
-    product = product_clone(conf, project)
-    if not is_clone(product):
+    product = product_clone(conf)
+    if product is None or not is_clone(product):
         return
     if has_terms_row(conf["REPO"], conf["BRANCH"]):
         install_hook(product, text)
@@ -455,6 +490,13 @@ def decode_hook(value):
         return base64.b64decode(value, validate=True).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         raise argparse.ArgumentTypeError("not the base64 text of a hook") from None
+
+
+def decode_clones(value):
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        raise argparse.ArgumentTypeError("not the base64 text of a module") from None
 
 
 def hook_beside_script():
@@ -568,7 +610,7 @@ def check(args, conf, session):
     check_session(session)
     check_account(conf, args.role, args.account)
     check_clone(conf, [*args.tag, *([args.approved_tag] if args.approved_tag else [])])
-    check_hook(product_clone(conf, args.project))
+    check_hook(product_clone(conf))
     if args.role == "impl" and not args.approved_tag:
         refuse("tag", "an implementer unit needs a spec tag for its approved worktree")
 
@@ -619,6 +661,7 @@ def parse_args(argv):
     parser.add_argument("--stage", default="all", choices=("all", "check", "launch"))
     parser.add_argument("--add-dir", action="append", default=[])
     parser.add_argument("--hook", type=decode_hook, default=None)
+    parser.add_argument("--clones", type=decode_clones, default=None)
     args = parser.parse_args(argv)
     if not PROJECT.fullmatch(args.project):
         parser.error(f"bad project: {args.project}")
@@ -628,6 +671,8 @@ def parse_args(argv):
         parser.error("--model and a positive --expected are needed to start a session")
     if args.hook is None:
         args.hook = hook_beside_script()
+    if args.clones is not None:
+        use_clones(args.clones)
     return args
 
 

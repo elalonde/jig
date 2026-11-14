@@ -42,8 +42,9 @@ lint A reads the generic patterns only, because the private terms file is not
 part of the source.
 
 The hooks path that `make check` sets also runs the tracked `hooks/pre-commit`,
-which runs the term check of the `-dev` clone that holds this clone, so a clone
-of jig outside a `-dev` clone cannot commit after `make hook`.
+which runs the term check of the `-dev` clone beside this clone, `../jig-dev`
+(or of the `-dev` clone that holds it, where a release before 0.6 put it), so a
+clone of jig with no `-dev` clone cannot commit after `make hook`.
 
 ## Release files
 

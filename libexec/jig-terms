@@ -11,8 +11,10 @@ case, also inside a longer word: a private name joined to another word is still
 published.
 
 Three places are read:
-  the product clone nested in the -dev clone, <REPO>/<project>: every file that git
-    lists, tracked or new and not ignored, by its path and by its contents;
+  the product clone beside the -dev clone, the directory <project> next to <REPO>
+    (or <REPO>/<project>, where a release before 0.6 put it, when nothing is
+    beside <REPO>): every file that git lists, tracked or new and not ignored, by
+    its path and by its contents;
   the messages of the product commits since the last release on the line that
     BRANCH names: the commits reachable from the clone's HEAD and not from the
     newest tag v<BRANCH>.<n> reachable from it, or every commit reachable from HEAD
@@ -27,8 +29,9 @@ terms.txt that holds the term, and never the term itself:
   <path>:<line>: terms.txt line <n>
   <path>: terms.txt line <n> in the path
   commit <hash>: terms.txt line <n>
-Paths in the product start with <project>/, so that they read from the top of the
--dev clone, and paths under <directory> start with <directory>. A printed path
+Paths in the product start with <project>/, the name of the product's repo, so
+that they read the same wherever the clone is, and paths under <directory> start
+with <directory>. A printed path
 has each term in it replaced by "***", also in the part of <directory>, where a
 term is not a match. A line or a message that holds one term twice prints one line
 for it.
@@ -50,6 +53,7 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
+import jig_clones  # noqa: E402
 import jig_units  # noqa: E402
 import lint_a  # noqa: E402
 
@@ -253,9 +257,10 @@ def scan_directory(directory, shown_root, finders):
 
 
 def product_clone(repo, project):
-    product = pathlib.Path(repo) / project
-    if not (product / ".git").exists():
-        raise Failed(f"no product clone at {product}")
+    """Return the product clone of the -dev clone repo, found by jig_clones."""
+    product = jig_clones.other_clone(repo)
+    if product is None or not (product / ".git").exists():
+        raise Failed(f"no product clone at {product or pathlib.Path(repo).parent / project}")
     return product
 
 

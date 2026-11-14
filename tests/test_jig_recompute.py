@@ -23,7 +23,7 @@ done
 
 
 class RecomputeCase(TempTestCase):
-    """A -dev clone with inputs, vectors and a recompute script, and a nested product clone.
+    """A -dev clone with inputs, vectors and a recompute script, and a product clone beside it.
 
     The product clone has its own origin, which also holds a copy of the vectors. The
     script appends a line to ran.log in the test directory each time it runs.
@@ -32,8 +32,8 @@ class RecomputeCase(TempTestCase):
     def setUp(self):
         super().setUp()
         self.log = self.tmp / "ran.log"
-        self.dev = self.git_init(self.tmp / "dev")
-        self.write(self.dev, {".gitignore": "demo/\n", **VECTORS,
+        self.dev = self.git_init(self.tmp / "demo-dev")
+        self.write(self.dev, {**VECTORS,
                               **{f"inputs/{name}": text for name, text in INPUTS.items()}})
         self.add_script("10-build", BUILD_SCRIPT.format(log=self.log))
         self.git_commit_all(self.dev)
@@ -46,7 +46,7 @@ class RecomputeCase(TempTestCase):
         self.product_seed = self.git_init(self.tmp / "product-seed")
         self.ok("-C", self.product_seed, "remote", "add", "origin", self.product_origin)
         self.push_product({"src/tool.py": "print('a tool')\n", **PRODUCT_COPY})
-        self.product = self.dev / "demo"
+        self.product = self.tmp / "demo"
         self.ok("clone", "-q", "-b", "master", self.product_origin, self.product)
 
     def ok(self, *args):

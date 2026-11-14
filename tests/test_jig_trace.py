@@ -1,4 +1,4 @@
-"""jig trace check on fixture projects: a -dev clone with a product clone nested in it."""
+"""jig trace on fixture projects: a -dev clone with the product clone beside it."""
 
 import json
 import shutil
@@ -44,7 +44,7 @@ class TraceCase(TempTestCase):
     def setUp(self):
         super().setUp()
         self.dev = self.tmp / "demo-dev"
-        self.product = self.git_init(self.dev / "demo")
+        self.product = self.git_init(self.tmp / "demo")
         self.write(self.product / "src/tool.py", TOOL_TEXT)
         self.write(self.product / "tests/test_tool.py", TEST_TEXT)
         self.git_commit_all(self.product)
@@ -104,7 +104,8 @@ class PassingTest(TraceCase):
         # A -dev clone with no specs and no trace, and its product clone, has nothing
         # that can fail.
         dev = self.tmp / "empty-dev"
-        self.git_init(dev / "empty")
+        dev.mkdir()
+        self.git_init(self.tmp / "empty")
         result = run([TRACE, "check"], env=self.env(), cwd=dev)
         self.assertEqual((result.returncode, result.stderr), (0, ""))
 
@@ -263,7 +264,8 @@ class MirrorTest(TraceCase):
         self.assert_fails_with("trace/src/tool.py.json: the product has no file src/tool.py")
 
     def test_no_product_clone_fails_with_one_line(self):
-        # The -dev clone holds a trace but no product clone to check it against.
+        # The -dev clone holds a trace but no product clone, beside it or inside it, to
+        # check it against; the one line names the place beside it.
         dev = self.tmp / "lone-dev"
         self.write(dev / "specs/ids.tsv", ID_CLASSES)
         self.write(dev / "specs/jig-spec.md", SPEC_TEXT)
@@ -272,7 +274,33 @@ class MirrorTest(TraceCase):
         result = run([TRACE, "check"], env=self.env(), cwd=dev)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr.splitlines(),
-                         [f"{PREFIX}lone-dev: no product clone at {dev.resolve() / 'lone'}"])
+                         [f"{PREFIX}lone-dev: no product clone at {dev.resolve().parent / 'lone'}"])
+
+
+class ProductPlaceTest(TraceCase):
+    """Where jig trace looks for the product clone of the -dev clone it runs in."""
+
+    def move_inside(self):
+        inside = self.dev / "demo"
+        self.product.rename(inside)
+        self.product = inside
+
+    def test_a_product_clone_inside_the_dev_clone_is_checked_when_none_is_beside_it(self):
+        # The place of the releases before 0.6: with nothing beside the -dev clone, the
+        # clone inside it is the product, and its trace passes.
+        self.move_inside()
+        self.assert_passes()
+
+    def test_gen_reads_the_clone_beside_when_one_is_inside_too(self):
+        # Both places hold a clone, and only the file of the clone beside it has a
+        # comment that cites a second requirement: gen writes the entry of that comment.
+        leftover = self.git_init(self.dev / "demo")
+        self.write(leftover / "src/tool.py", TOOL_TEXT)
+        self.write(self.product / "src/tool.py", TOOL_TEXT + "\n\n# Proves R-2.\nX = 1\n")
+        result = run([TRACE, "gen", "src/tool.py"], env=self.env(), cwd=self.dev)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = json.loads((self.dev / "trace/src/tool.py.json").read_text(encoding="utf-8"))
+        self.assertIn(["R-2"], [item["ids"] for item in entries])
 
 
 class LedgerTest(TraceCase):
@@ -869,7 +897,7 @@ class CoverageTest(TraceCase):
         self.assert_covered()
 
     def test_no_product_clone_is_not_a_failure(self):
-        # Coverage reads the records only, so the nested clone may be missing.
+        # Coverage reads the records only, so the product clone may be missing.
         shutil.rmtree(self.product)
         self.assert_covered()
 

@@ -149,7 +149,7 @@ class ReleaseCase(TempTestCase):
 
     def make_dev(self):
         self.dev_origin = self.tmp / "dev-origin.git"
-        self.dev = self.tmp / "dev"
+        self.dev = self.tmp / f"{PROJECT}-dev"
         self.git("init", "-q", "--bare", "-b", "master", self.dev_origin)
         self.git("init", "-q", "-b", "master", self.dev)
         self.git("-C", self.dev, "remote", "add", "origin", self.dev_origin)
@@ -157,7 +157,6 @@ class ReleaseCase(TempTestCase):
                 f"recompute\tjig recompute {PROJECT} testdata\t{OTHER_ACCOUNT}\t600"]
         self.write(self.dev, {"checks.tsv": "\n".join(rows) + "\n",
                               "terms.txt": f"# private terms\n{TERM}\n",
-                              ".gitignore": f"/{PROJECT}/\n",
                               "impl/log/old1-report.md": report("old1", "minor")})
         self.commit(self.dev)
         self.git("-C", self.dev, "push", "-q", "origin", "master")
@@ -178,7 +177,7 @@ class ReleaseCase(TempTestCase):
                           ".gitignore": "dist/\n"})
         self.commit(seed)
         self.git("-C", seed, "push", "-q", self.origin, LINE)
-        self.product = self.dev / PROJECT
+        self.product = self.tmp / PROJECT
         self.git("clone", "-q", "-b", LINE, self.origin, self.product)
         self.git("-C", self.product, "config", "remote.origin.pushurl", str(self.origin))
 

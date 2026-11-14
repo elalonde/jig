@@ -17,8 +17,9 @@ deps:
 # Setting the hooks path in this clone only also overrides any global one. An
 # unpacked source archive is not a clone and makes no commits, so it skips this.
 # The same path also runs the tracked pre-commit hook, which runs the term check
-# of the -dev clone that holds this clone, so a clone of jig outside a -dev
-# clone cannot commit after make hook.
+# of the -dev clone beside this clone, ../jig-dev (or of the -dev clone that holds
+# it, where a release before 0.6 put it), so a clone of jig with no -dev clone
+# cannot commit after make hook.
 hook:
 	@if [ -e .git ]; then \
 		git config --local core.hooksPath hooks; \

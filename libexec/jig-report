@@ -13,8 +13,9 @@ The unit's account and tmux session come from the first line of its prompt,
 one ID: the newest "status: <ID> start" commit on origin begins the current run, and
 that run needs its "log: <ID>" commit. The report, impl/log/<ID>-report.md on origin,
 must pass jig validate report, and every hash of its commits: line must name a commit
-reachable from origin in the -dev clone or in the product clone nested in it. When the
-prompt names the implementer account, no such product commit may add, change or remove
+reachable from origin in the -dev clone or in its product clone, the directory
+<project> beside it (or <project> inside it, where a release before 0.6 put it, when
+nothing is beside it). When the prompt names the implementer account, no such product commit may add, change or remove
 a file in the product's vector directory: the last word of the command of the row
 recompute in checks.tsv on origin. A project without that row has no such directory.
 Nor may any other product commit on origin touch that directory when the report does
@@ -48,6 +49,7 @@ WORKER_SCRIPT = ROOT / "libexec" / "jig-report-worker"
 
 sys.path.insert(0, str(ROOT / "lib"))
 
+import jig_clones  # noqa: E402
 import jig_context  # noqa: E402
 
 
@@ -85,7 +87,9 @@ def report_path(unit):
     return f"impl/log/{unit}-report.md"
 
 
-def fetch_product(product):
+def fetch_product(clone, product):
+    if product is None:
+        refuse("product", f"no product clone beside {clone}")
     if not (pathlib.Path(product) / ".git").exists():
         refuse("product", f"no product clone at {product}")
     fetched = helpers.git(product, "fetch", "-q", "origin")
@@ -351,9 +355,10 @@ def commit_report(clone, branch, unit, lines):
 def report(project, unit):
     conf = helpers.read_conf(project)
     clone, branch = conf["REPO"], conf["BRANCH"]
-    product = str(pathlib.Path(clone) / project)
+    found = jig_clones.other_clone(clone)
     close.fetch(clone)
-    fetch_product(product)
+    fetch_product(clone, found)
+    product = str(found)
     started, logged = current_run(clone, branch, unit)
     filled_by = close.newest_commit(clone, f"{logged}..refs/remotes/origin/{branch}",
                                     f"report: {unit}")

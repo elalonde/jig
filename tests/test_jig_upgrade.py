@@ -320,16 +320,19 @@ class UpgradeTest(TempTestCase):
         # The command runs from a clone's tree, with that tree's install script, while
         # current is an older version that has no upgrade command and no usable
         # install script. The repository comes from the origin of the account's jig
-        # clone, as no override names it.
+        # clone, beside ~/ws/src/jig-dev, as no override names it.
         old = self.root / "0.3.0"
         (old / "tools").mkdir(parents=True)
         (old / "tools" / "install.sh").write_text("#!/bin/bash\nexit 9\n")
         (old / "tools" / "install.sh").chmod(0o755)
         (self.root / "current").symlink_to("0.3.0")
-        clone = self.home / "ws" / "src" / "jig-dev" / "jig"
+        (self.home / "ws" / "src" / "jig-dev").mkdir(parents=True)
+        clone = self.home / "ws" / "src" / "jig"
         (clone / "libexec").mkdir(parents=True)
         (clone / "tools").mkdir()
+        (clone / "lib").mkdir()
         shutil.copy(UPGRADE, clone / "libexec" / "jig-upgrade")
+        shutil.copy(UPGRADE.parent.parent / "lib" / "jig_clones.py", clone / "lib")
         script = INSTALL.read_text().replace(
             "set -euo pipefail\n", "set -euo pipefail\necho 'install: from the clone'\n", 1)
         (clone / "tools" / "install.sh").write_text(script)

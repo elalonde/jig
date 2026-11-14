@@ -3,9 +3,11 @@
 
 usage: jig trace check | coverage | gen <product path> ... | form <commit>
 
-Run in the -dev clone, on the product clone nested in it (the -dev directory's
-name without -dev). The product's own comments and test names carry no record
-IDs; the trace in the -dev clone ties them to the code instead.
+Run in the -dev clone, on the product clone beside it, ../<project> (the -dev
+directory's name without -dev). A product clone that a release before 0.6 put
+inside the -dev clone, at <project>, is used only while nothing sits beside it.
+The product's own comments and test names carry no record IDs; the trace in the
+-dev clone ties them to the code instead.
 
 The spec documents are the files under specs/ at any depth, except the kickoff
 record, the status file, specs/ids.tsv and specs/id-map.tsv. An ID occurs in a
@@ -90,6 +92,7 @@ import tokenize
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 
+import jig_clones  # noqa: E402
 import jig_ids  # noqa: E402
 import jig_trace  # noqa: E402
 import lint_a  # noqa: E402
@@ -351,28 +354,26 @@ def check_completeness(dev, product, classes, id_map):
 
 
 def check(start):
-    dev = jig_trace.dev_root(start)
+    dev, product, missing = product_of(start)
     if dev is None:
-        return [f"{start} is not inside a -dev clone"]
-    product = jig_trace.product_dir(dev)
-    failures = []
-    classes, found = check_ids_file(dev)
-    failures += found
+        return missing
+    classes, failures = check_ids_file(dev)
     documents = jig_trace.spec_documents(dev)
-    if (product / ".git").exists():
+    if product:
         failures += check_trace_files(dev, product, classes, documents)
     else:
         # Anchors, product files and commits all live in the product; without it
-        # they cannot be read, and one line says why.
-        failures.append(f"{dev.name}: no product clone at {product}")
+        # they cannot be read, and the one line of product_of says why. The checks
+        # of the records alone still run.
+        failures += missing
     failures += check_class_matches(classes, documents)
-    if (product / ".git").exists():
+    if product:
         failures += check_ledger(dev, product)
     id_map, found = read_id_map(dev)
     failures += found
     # A broken ID map would make every ID it should have renamed look missing, so
     # its one line stands alone.
-    if id_map is not False and (product / ".git").exists():
+    if id_map is not False and product:
         failures += check_completeness(dev, product, classes, id_map)
     return failures
 
@@ -703,11 +704,18 @@ def gen_one(dev, product, name):
 
 
 def product_of(start):
-    """Return (dev, product, failures) for the -dev clone around start."""
+    """Return (dev, product, failures) for the -dev clone around start.
+
+    product is None, with one failure line, when lib/jig_clones.py finds no product
+    clone for that -dev clone, or finds a directory that is not a git clone.
+    """
     dev = jig_trace.dev_root(start)
     if dev is None:
         return None, None, [f"{start} is not inside a -dev clone"]
-    product = jig_trace.product_dir(dev)
+    product = jig_clones.other_clone(dev)
+    if product is None:
+        return dev, None, [f"{dev.name}: no product clone at "
+                           f"{dev.parent / dev.name[:-len('-dev')]}"]
     if not (product / ".git").exists():
         return dev, None, [f"{dev.name}: no product clone at {product}"]
     return dev, product, []

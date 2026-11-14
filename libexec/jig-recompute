@@ -8,7 +8,8 @@ scripts that make them again in vectors/recompute/, and a copy of the vectors in
 product, in the directory where the product's CI reads them. That directory is the
 second argument, a path from the root of the product clone (no leading "/", no "..").
 This works in the -dev clone, the REPO of ~/.config/jig/<project>.conf, and in the
-product clone nested in it at REPO/<project>. In order, it:
+product clone beside it, the directory <project> next to REPO (or REPO/<project>,
+where a release before 0.6 put it, when nothing is beside REPO). In order, it:
 
   1. fetches the product clone's origin;
   2. stops when a file under vectors/ is not committed (new, changed or removed),
@@ -49,6 +50,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
+import jig_clones  # noqa: E402
 import jig_units  # noqa: E402
 
 USAGE = "usage: jig recompute <project> <product vector directory>"
@@ -146,7 +148,9 @@ def tree_differences(repo):
     return sorted(found, key=lambda item: (item[1], item[0]))
 
 
-def fetch_product(product):
+def fetch_product(repo, product):
+    if product is None:
+        jig_units.refuse("product", f"no product clone beside {repo}")
     if not (pathlib.Path(product) / ".git").exists():
         jig_units.refuse("product", f"no product clone at {product}")
     fetched = git(product, "fetch", "-q", "origin")
@@ -205,10 +209,11 @@ def product_differences(repo, product, revision, directory):
 def recompute(project, directory):
     conf = jig_units.read_conf(project)
     repo, branch = conf["REPO"], conf["BRANCH"]
-    product = str(pathlib.Path(repo) / project)
     if not (pathlib.Path(repo) / ".git").exists():
         jig_units.refuse("repo", f"no -dev clone at {repo}")
-    fetch_product(product)
+    clone = jig_clones.other_clone(repo)
+    fetch_product(repo, clone)
+    product = str(clone)
 
     uncommitted = tree_differences(repo)
     if uncommitted:

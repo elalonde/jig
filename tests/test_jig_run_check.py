@@ -17,6 +17,7 @@ ROWS = [
     ("no-newline", "sleep 1.2; printf 'last words'", ACCOUNT, "60"),
     ("words", "printf '%s\\n'", ACCOUNT, "60"),
     ("where", "pwd", ACCOUNT, "60"),
+    ("product", "cat ../jig/marker.txt", ACCOUNT, "60"),
     ("elsewhere", "echo should not run > ran.txt", "someone-else", "60"),
 ]
 
@@ -37,7 +38,7 @@ class RunCheckCase(TempTestCase):
 
     def setUp(self):
         super().setUp()
-        self.dev = self.tmp / "dev"
+        self.dev = self.tmp / "jig-dev"
         self.dev.mkdir()
         lines = ["name\tcommand\taccount\tcap_seconds"] + ["\t".join(row) for row in ROWS]
         (self.dev / "checks.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -154,6 +155,15 @@ class RunCheckResultTest(RunCheckCase):
     def test_the_command_runs_in_the_root_of_the_dev_clone(self):
         self.assertEqual(self.in_session("jig-impl-demo", "jig", "where")[0], 0)
         self.assertEqual(self.output("where").splitlines()[0], str(self.dev))
+
+    def test_a_row_names_the_product_clone_beside_the_dev_clone_as_dotdot(self):
+        # The product clone is the sibling of the -dev clone, so a row that runs in the
+        # root of the -dev clone reaches a product file as ../jig/<file>.
+        product = self.dev.parent / "jig"
+        product.mkdir()
+        (product / "marker.txt").write_text("the product clone\n", encoding="utf-8")
+        self.assertEqual(self.in_session("jig-impl-demo", "jig", "product")[0], 0)
+        self.assertEqual(self.output("product").splitlines()[0], "the product clone")
 
     def test_a_new_run_replaces_the_exit_file_of_an_earlier_one(self):
         self.reviews.mkdir(parents=True)

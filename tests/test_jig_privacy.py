@@ -71,7 +71,7 @@ CHECKS_TEXT = ("name\tcommand\taccount\tcap\n"
 
 
 class PrivacyCase(TempTestCase):
-    """A -dev clone with an origin, a terms file and a checks.tsv, a product nested in it,
+    """A -dev clone with an origin, a terms file and a checks.tsv, a product clone beside it,
     and a host list under a stand-in for /srv/jig.
 
     The row recompute names tests/vectors as the product's vector directory; the
@@ -83,15 +83,14 @@ class PrivacyCase(TempTestCase):
         super().setUp()
         self.srv = self.tmp / "srv"
         self.write(self.srv, {"hosts.toml": HOSTS_TEXT})
-        self.dev = self.git_init(self.tmp / "dev")
-        self.write(self.dev, {"terms.txt": TERMS_TEXT, "checks.tsv": CHECKS_TEXT,
-                              ".gitignore": "demo/\n"})
+        self.dev = self.git_init(self.tmp / "demo-dev")
+        self.write(self.dev, {"terms.txt": TERMS_TEXT, "checks.tsv": CHECKS_TEXT})
         self.git_commit_all(self.dev)
         self.push_dev()
         conf = self.home / ".config" / "jig" / "demo.conf"
         conf.parent.mkdir(parents=True)
         conf.write_text(f"REPO={self.dev}\nBRANCH=master\n", encoding="utf-8")
-        self.product = self.git_init(self.dev / "demo")
+        self.product = self.git_init(self.tmp / "demo")
         self.write(self.product, {"tools/lint-a-patterns.txt": PATTERNS_TEXT,
                                   "tests/test_tool.py": "def test_tool():\n    pass\n",
                                   "src/tool.py": "print('a tool')\n"})
@@ -262,9 +261,13 @@ class PrivacyFailureTest(PrivacyCase):
                                         "names no product directory")
 
     def test_a_missing_product_clone_fails(self):
+        # The -dev clone of the project other has no product clone beside it or inside
+        # it: the scan fails and names the place beside it.
+        other = self.git_init(self.tmp / "other-dev")
+        self.write(other, {"terms.txt": TERMS_TEXT})
         conf = self.home / ".config" / "jig" / "other.conf"
-        conf.write_text(f"REPO={self.dev}\nBRANCH=master\n", encoding="utf-8")
-        self.assert_failed(self.scan("scan", "other"), f"no product clone at {self.dev / 'other'}")
+        conf.write_text(f"REPO={other}\nBRANCH=master\n", encoding="utf-8")
+        self.assert_failed(self.scan("scan", "other"), f"no product clone at {self.tmp / 'other'}")
 
 
 class PrivacyUsageTest(PrivacyCase):

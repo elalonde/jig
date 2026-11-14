@@ -25,15 +25,16 @@ conf file can be written, and changes nothing while a lock exists or a conf file
 missing: a project in the middle of a unit never has its version moved. A conf file
 with no JIG_VERSION line gets one.
 
-The GitHub repository is the origin of the jig clone ~/ws/src/jig-dev/jig, unless
-JIG_UPGRADE_REPO=<owner>/<repo> names it. The other places come from the
+The GitHub repository is the origin of the product clone of ~/ws/src/jig-dev: the
+clone ~/ws/src/jig beside it, or ~/ws/src/jig-dev/jig, where a release before 0.6
+put it, when nothing is beside it. JIG_UPGRADE_REPO=<owner>/<repo> names another. The other places come from the
 environment too: JIG_ROOT (default /opt/jig), JIG_GITHUB_API (default
 https://api.github.com), JIG_SSH (default ssh -o BatchMode=yes) and JIG_LOCK_DIR
 (default /run/jig/lock).
 
 A new version can be installed before any installed version has this command, by
 running this file by its path from a clone:
-  ~/ws/src/jig-dev/jig/libexec/jig-upgrade <version>
+  ~/ws/src/jig/libexec/jig-upgrade <version>
 
 Steps go to stdout; a refusal goes to stderr as one line. Exits 0 on success, 1 on
 a refusal or a failed download or install, 2 on a usage error.
@@ -57,6 +58,10 @@ sys.dont_write_bytecode = True
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 INSTALL = ROOT / "tools" / "install.sh"
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_clones  # noqa: E402
+
 GITHUB_API = "https://api.github.com"
 INSTALL_ROOT = "/opt/jig"
 LOCK_DIR = "/run/jig/lock"
@@ -156,7 +161,10 @@ def repository():
         if not SLUG.fullmatch(named):
             raise Refusal(f"JIG_UPGRADE_REPO={named!r} is not <owner>/<repo>")
         return named
-    clone = pathlib.Path.home() / "ws" / "src" / "jig-dev" / "jig"
+    dev = pathlib.Path.home() / "ws" / "src" / "jig-dev"
+    clone = jig_clones.other_clone(dev)
+    if clone is None:
+        raise Refusal(f"no jig clone beside {dev}; set JIG_UPGRADE_REPO to <owner>/<repo>")
     try:
         origin = subprocess.run(["git", "-C", str(clone), "remote", "get-url", "origin"],
                                 capture_output=True, text=True, check=True).stdout.strip()

@@ -1,6 +1,7 @@
 """Readers of a project's trace records, shared by the jig trace commands.
 
-The trace lives in the -dev clone and describes the product clone nested in it.
+The trace lives in the -dev clone and describes the product clone, which
+lib/jig_clones.py finds beside it.
 trace/<product path>.json holds the entries of one product file: each entry ties
 record IDs and comment text to a code line, found again by the line's text and by
 which occurrence of that text it is. specs/ids.tsv declares the project's ID
@@ -64,11 +65,6 @@ def dev_root(start):
         if candidate.name.endswith("-dev") and len(candidate.name) > len("-dev"):
             return candidate
     return None
-
-
-def product_dir(dev):
-    """The product clone nested in a -dev clone: the -dev name without its suffix."""
-    return dev / dev.name[:-len("-dev")]
 
 
 def _is_count(value, least):
@@ -240,10 +236,11 @@ def defined_files(dev, patterns):
     """The files under dev that the glob patterns of a class name, in pattern order.
 
     In a pattern, * matches any characters except a slash, and every other
-    character stands for itself. Each file is listed once. The product clone
-    nested in dev is never listed, because records live in the -dev repo only.
+    character stands for itself. Each file is listed once. A product clone that
+    an older release left inside dev, under the project's name, is never listed,
+    because records live in the -dev repo only.
     """
-    product = product_dir(dev).name
+    product = dev.name[:-len("-dev")]
     found = []
     for pattern in patterns:
         # A pattern that climbs out of the -dev repo names no record of it.

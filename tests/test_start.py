@@ -743,6 +743,14 @@ class StartDirectoriesTest(StartCase):
         self.assertEqual(self.start().returncode, 0)
         self.assertEqual(self.given_dirs(), [*self.worker_list, self.approved])
 
+    def test_add_dir_gives_the_product_clone_beside_the_dev_clone_when_it_exists(self):
+        # The account has the product clone ~/ws/src/jig beside its -dev clone: the
+        # implementer's session gets it, in the order of the list.
+        self.git_init(self.worker_home / "ws" / "src" / "jig")
+        self.assertEqual(self.start().returncode, 0)
+        self.assertEqual(self.given_dirs(),
+                         [*self.worker_list, self.in_worker("ws/src/jig"), self.approved])
+
     def test_add_dir_for_the_spec_writer(self):
         self.reference.mkdir(parents=True)
         self.for_session("spec", "specwriter")
@@ -770,13 +778,16 @@ class StartDirectoriesTest(StartCase):
             self.assertTrue(os.path.isdir(path), path)
 
     def test_add_dir_lists_of_the_module_are_the_lists_of_the_spec(self):
-        worker_list = ["~/ws/prompts/p", "~/ws/reviews/p"]
+        # Every worker role gets the product clone beside the -dev clone; the
+        # orchestrator, who reads no product, does not.
+        shared = ["~/ws/prompts/p", "~/ws/reviews/p"]
+        worker_list = [*shared, "~/ws/src/p"]
         approved = "~/ws/src/p-dev-approved"
         self.assertEqual(jig_dirs.of_role("spec", "p"), [*worker_list, "~/ws/ref/p"])
         self.assertEqual(jig_dirs.of_role("impl", "p"), [*worker_list, approved])
         self.assertEqual(jig_dirs.of_role("rev", "p"), [*worker_list, approved])
         self.assertEqual(jig_dirs.of_role("orch", "p"),
-                         [*worker_list, "/srv/jig/in/p", "/srv/jig/out/p", "/srv/jig/blocks/p"])
+                         [*shared, "/srv/jig/in/p", "/srv/jig/out/p", "/srv/jig/blocks/p"])
         self.assertEqual(jig_dirs.of_role("other", "p"), [])
 
     def test_add_dir_keeps_the_prompt_unchanged_through_jig_start(self):
@@ -950,7 +961,11 @@ class StartConfTest(StartCase):
 
 
 class StartHookTest(StartCase):
-    """The worker's -dev clone holds a product clone, and origin may hold the row terms."""
+    """The worker's -dev clone holds a product clone, and origin may hold the row terms.
+
+    The product clone is inside the -dev clone, at the place of the releases before
+    0.6, which jig start still uses while nothing is beside the -dev clone.
+    """
 
     def setUp(self):
         super().setUp()
@@ -1098,6 +1113,15 @@ class StartHookTest(StartCase):
         result = self.worker_alone("--approved-tag", "spec-p0")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_jigs_hook(self.default_hook())
+
+    def test_start_installs_the_hook_in_the_product_clone_beside_and_not_inside(self):
+        # The account has a product clone beside the -dev clone and a leftover one
+        # inside it: jig start installs the hook in the clone beside it only.
+        beside = self.git_init(self.worker_home / "ws" / "src" / "jig")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_jigs_hook(beside / ".git" / "hooks" / "pre-commit")
+        self.assertFalse(self.default_hook().exists())
 
 
 if __name__ == "__main__":

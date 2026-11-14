@@ -19,8 +19,10 @@ a refused push gets one fetch and one rebase with --autostash, so an uncommitted
 change in that clone, such as those idle lines, stays in place. Then the prompt
 and its inbox directory go to the worker account, and the worker part starts the
 session, with the text of jig's pre-commit hook from this tree, which the worker
-installs in its product clone or removes from it. JIG_SSH holds the ssh command, and
-tests set it. Exits 1 on a refusal; 2 on a usage error.
+installs in its product clone or removes from it, and the text of lib/jig_clones.py,
+by which the worker finds that clone beside its -dev clone. The session gets the
+role's directories of lib/jig_dirs.py that exist in the worker account as --add-dir,
+the product clone among them. JIG_SSH holds the ssh command, and tests set it. Exits 1 on a refusal; 2 on a usage error.
 """
 
 import argparse
@@ -41,6 +43,8 @@ WORKER_SCRIPT = ROOT / "libexec" / "jig-start-worker"
 VALIDATE = ROOT / "libexec" / "jig-validate"
 # The worker account cannot read this tree, so the hook's text travels with the command.
 HOOK = ROOT / "hooks" / "pre-commit"
+# The worker part cannot import from this tree, so it gets this module as text.
+CLONES = ROOT / "lib" / "jig_clones.py"
 sys.path.insert(0, str(ROOT / "lib"))
 
 import jig_dirs  # noqa: E402
@@ -117,8 +121,10 @@ def read_prompt(args):
 def run_worker(account, args, stage, extra, tags, approved_tag):
     """Run a stage of the worker part in the worker account; refuse when it fails."""
     target = f"~/ws/prompts/{args.project}/{args.unit}.md"
+    clones = base64.b64encode(CLONES.read_bytes()).decode("ascii")
     words = ["python3", "-I", "-", args.project, args.role, args.unit, target,
-             "--stage", stage, "--account", account, "--effort", args.effort, *extra]
+             "--stage", stage, "--account", account, "--effort", args.effort,
+             "--clones", clones, *extra]
     for tag in tags:
         words += ["--tag", tag]
     if approved_tag:

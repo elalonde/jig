@@ -12,20 +12,20 @@ FIRST_LINE, SECOND_LINE = "terms.txt line 3", "terms.txt line 5"
 
 
 class TermsCase(TempTestCase):
-    """A -dev clone with a terms file and a clean product clone nested in it.
+    """A -dev clone with a terms file and a clean product clone beside it.
 
     The conf file names the line 0.4, so the tags v0.4.<n> mark its releases.
     """
 
     def setUp(self):
         super().setUp()
-        self.dev = self.git_init(self.tmp / "dev")
-        self.write(self.dev, {"terms.txt": TERMS_TEXT, ".gitignore": "demo/\n"})
+        self.dev = self.git_init(self.tmp / "demo-dev")
+        self.write(self.dev, {"terms.txt": TERMS_TEXT})
         self.git_commit_all(self.dev)
         conf = self.home / ".config" / "jig" / "demo.conf"
         conf.parent.mkdir(parents=True)
         conf.write_text(f"REPO={self.dev}\nBRANCH=0.4\n", encoding="utf-8")
-        self.product = self.git_init(self.dev / "demo")
+        self.product = self.git_init(self.tmp / "demo")
         self.write(self.product, {"src/tool.py": "print('a public tool')\n",
                                   "README.md": "A tool.\n", ".gitignore": "build/\n"})
         self.commit("Add the tool")
@@ -208,11 +208,14 @@ class TermsFailureTest(TermsCase):
         self.assert_failed(self.terms(), "holds no term")
 
     def test_a_missing_product_clone_fails(self):
-        self.write(self.dev, {"other/x.txt": "x\n"})
+        # The -dev clone of the project other has its terms but no product clone
+        # beside it or inside it: the check fails and names the place beside it.
+        other = self.git_init(self.tmp / "other-dev")
+        self.write(other, {"terms.txt": TERMS_TEXT})
         conf = self.home / ".config" / "jig" / "other.conf"
-        conf.write_text(f"REPO={self.dev}\nBRANCH=0.4\n", encoding="utf-8")
+        conf.write_text(f"REPO={other}\nBRANCH=0.4\n", encoding="utf-8")
         self.assert_failed(self.terms("check", "other"),
-                           f"no product clone at {self.dev / 'other'}")
+                           f"no product clone at {self.tmp / 'other'}")
 
     def test_a_missing_directory_fails(self):
         missing = self.tmp / "nowhere"
