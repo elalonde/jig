@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKER_SCRIPT = ROOT / "libexec" / "jig-start-worker"
@@ -52,6 +53,10 @@ class Unit:
         self.start = start
         self.expected = expected
 
+    @property
+    def lock(self):
+        return worker.lock_path(self.project, self.account)
+
 
 def lock_dir():
     """Return the directory of every lock: the parent of any lock path."""
@@ -83,12 +88,36 @@ def _read_lock(path):
     return values
 
 
-def _read_expected(lock):
+def read_expected(lock):
+    """Return the expected minutes beside the lock, or None when the file is missing or
+    holds no whole number above 0."""
     try:
         text = worker.expected_path(lock).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+def write_expected(lock, minutes):
+    """Put new expected minutes beside the lock, in the place of the old value.
+
+    The old file belongs to the worker account that took the lock, while jig wait runs
+    in the orchestrator's. So the value goes into a temporary file in the lock directory,
+    and a rename puts it over the old one: that needs write access to the directory
+    only, not to the old file, and a reader never sees a half-written value. The name of
+    the temporary file starts with a dot, so it is never taken for a lock.
+    """
+    target = worker.expected_path(lock)
+    descriptor, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(f"{minutes}\n")
+        # Group-readable, as jig start leaves it, for the tools of the other accounts.
+        os.chmod(name, 0o664)
+        os.replace(name, target)
+    except BaseException:
+        pathlib.Path(name).unlink(missing_ok=True)
+        raise
 
 
 def _parse_start(text):
@@ -116,7 +145,7 @@ def running_units(project):
             continue
         account = lock.name[len(project) + 1:]
         units.append(Unit(project, account, values["session"], matched[1], matched[2],
-                          _parse_start(values.get("start")), _read_expected(lock)))
+                          _parse_start(values.get("start")), read_expected(lock)))
     return units
 
 

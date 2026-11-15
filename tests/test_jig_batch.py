@@ -9,12 +9,14 @@ start line of impl/log/status.log, the wait double commits the unit's report as
 the end line. What each double does next is set by files in the fake directory.
 """
 
+import datetime
 import re
 import shutil
+import subprocess
 import time
 
 from tests.support import ROOT, run
-from tests.units_support import UnitsTestCase
+from tests.units_support import NORMAL_SCREEN, UnitsTestCase
 
 # One script for the four doubles; the file name says which tool it stands for. Each
 # call appends "<tool> <ID>" to calls. The exit code comes from codes/<tool>-<ID>, one
@@ -681,3 +683,93 @@ class BatchFileTest(BatchCase):
         result = run([self.tree / "libexec" / "jig-batch", "jig"], env=self.base_env())
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("usage: jig batch", result.stderr)
+
+
+class BatchExpectedTest(BatchCase):
+    """The tree holds the real jig wait in place of its double, so the batch waits on a
+    lock in the lock directory and polls the fixture screen, as it does for a unit."""
+
+    # Short polls, and a screen check that never comes during a test.
+    FAST_WAIT = {"JIG_WAIT_POLL": "0.05", "JIG_WAIT_CHECK": "600"}
+
+    def setUp(self):
+        super().setUp()
+        shutil.copy(ROOT / "libexec" / "jig-wait", self.tree / "libexec" / "jig-wait")
+        self.set_screen("implementer", NORMAL_SCREEN)
+
+    def lock_started(self, seconds_ago, expected):
+        start = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=seconds_ago)
+        self.write_lock(session="jig-impl-u1", start=start, expected=expected)
+        return start
+
+    def start_batch(self):
+        """Start a batch of one unit and return once its jig wait has polled the screen."""
+        path = self.tmp / "batch.tsv"
+        path.write_text(self.row("u1") + "\n", encoding="utf-8")
+        env = self.base_env(DOUBLE_CLONE=str(self.seed), JIG_HOLD_DIR=str(self.hold_dir),
+                            JIG_BATCH_CLOSE_DELAY="0", **self.FAST_WAIT)
+        process = subprocess.Popen([self.tree / "libexec" / "jig-batch", "jig", path],
+                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        self.addCleanup(self.stop, process)
+        for _ in range(200):
+            if self.ssh_targets():
+                return process
+            time.sleep(0.05)
+        self.fail("the jig wait of the batch never polled the screen")
+
+    def stop(self, process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+
+    def finish(self, process):
+        try:
+            out, err = process.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("the batch did not end")
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+    def test_a_shorter_expected_time_stops_a_running_batch_on_the_timeout(self):
+        # The unit started 4 minutes ago with 5 expected, so the batch waits on. jig
+        # wait --expected 1 makes the timeout 3 minutes from the start, already past:
+        # the batch's own jig wait reads the new value, and the batch stops with its
+        # timeout code before any report or close.
+        self.lock_started(240, 5)
+        batch = self.start_batch()
+        result = self.tool("wait", "jig", "u1", "--expected", "1", **self.FAST_WAIT)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assert_stopped(self.finish(batch), 7, "u1: the timeout of 3x the expected time")
+        self.assertEqual(self.calls(), ["start u1"])
+
+    def test_a_longer_expected_time_keeps_a_running_batch_past_the_old_timeout(self):
+        # The unit started 5 seconds less than 3 minutes ago with 1 expected, so the
+        # timeout is 5 seconds away. A second jig wait sets 30 minutes before then. The
+        # batch is still waiting a second after the old timeout, and when the report
+        # lands it reports and closes the unit as usual.
+        start = self.lock_started(175, 1)
+        batch = self.start_batch()
+        setter = subprocess.Popen(
+            [ROOT / "libexec" / "jig-wait", "jig", "u1", "--expected", "30"],
+            env=self.base_env(**self.FAST_WAIT), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        self.addCleanup(self.stop, setter)
+        expected = self.lock_dir / "jig-implementer.expected"
+        for _ in range(100):
+            if expected.read_text(encoding="utf-8") == "30\n":
+                break
+            time.sleep(0.05)
+        old_timeout = start + datetime.timedelta(minutes=3)
+        self.assertLess(datetime.datetime.now().astimezone(), old_timeout,
+                        "the new value came after the old timeout")
+        time.sleep(max(0.0, (old_timeout - datetime.datetime.now().astimezone())
+                       .total_seconds()) + 1)
+        self.assertIsNone(batch.poll(), "the batch stopped on the old timeout")
+        log = self.seed / "impl" / "log"
+        log.mkdir(parents=True, exist_ok=True)
+        (log / "u1-report.md").write_text("OK: done\n", encoding="utf-8")
+        self.ok(["git", "-C", self.seed, "add", "-A"])
+        self.push_subject("log: u1")
+        result = self.finish(batch)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), ["start u1", "report u1", "close u1"])

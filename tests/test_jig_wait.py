@@ -1,4 +1,6 @@
 import datetime
+import stat
+import subprocess
 import sys
 import time
 import unittest
@@ -251,6 +253,7 @@ class JigWaitTest(UnitsTestCase):
     def test_wait_usage_names_every_exit_code(self):
         result = self.tool("wait", "jig")
         self.assertEqual(result.returncode, USAGE)
+        self.assertIn("usage: jig wait <project> <ID> [--expected <minutes>]", result.stderr)
         for code in range(8):
             self.assertRegex(result.stderr, rf"(?m)^  {code}  ")
 
@@ -258,6 +261,108 @@ class JigWaitTest(UnitsTestCase):
         self.write_lock()
         result = self.tool("wait", "jig", "demo", JIG_WAIT_POLL="0")
         self.assertEqual(result.returncode, REFUSED)
+
+
+
+class WaitExpectedTest(UnitsTestCase):
+    """jig wait --expected puts a new expected time beside the lock of a running unit."""
+
+    def expected_file(self):
+        return self.lock_dir / "jig-implementer.expected"
+
+    def start_wait(self, *extra):
+        """Start a jig wait that keeps running, and return once it has polled the screen."""
+        process = subprocess.Popen(
+            [ROOT / "libexec" / "jig-wait", "jig", "demo", *extra],
+            env=self.base_env(**NO_CHECK), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(self.stop, process)
+        for _ in range(200):
+            if self.ssh_targets():
+                return process
+            time.sleep(0.05)
+        self.fail("the running jig wait never polled the screen")
+
+    def stop(self, process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+
+    def ended(self, process, seconds=10):
+        try:
+            out, err = process.communicate(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            self.fail("the running jig wait did not end")
+        return process.returncode, out + err
+
+    def lock_from_minutes_ago(self, minutes, expected):
+        started = datetime.datetime.now().astimezone() - datetime.timedelta(minutes=minutes)
+        self.write_lock(start=started, expected=expected)
+        self.set_screen_script("implementer", CHANGING_SCREEN)
+
+    def test_expected_gives_a_running_wait_a_shorter_timeout(self):
+        # The session started 4 minutes ago with 5 expected, so a wait now runs on. A
+        # second wait sets 1 minute: both end at once on the timeout, since 3x the new
+        # value counts from the session start, not from either wait.
+        self.lock_from_minutes_ago(4, 5)
+        running = self.start_wait()
+        result = self.tool("wait", "jig", "demo", "--expected", "1", **NO_CHECK)
+        self.assertEqual(result.returncode, TIMEOUT, result.stdout + result.stderr)
+        self.assertIn("expected 1 minutes", result.stdout)
+        self.assertEqual(self.expected_file().read_text(encoding="utf-8"), "1\n")
+        code, output = self.ended(running)
+        self.assertEqual(code, TIMEOUT, output)
+        self.assertIn("timeout: 3x 1 minutes", output)
+
+    def test_expected_replaces_a_read_only_file_and_leaves_it_group_readable(self):
+        # The old file belongs to the worker account and may not be writable here: the
+        # new value still replaces it, readable by the group as jig start leaves it.
+        self.lock_from_minutes_ago(4, 5)
+        self.expected_file().chmod(0o444)
+        result = self.tool("wait", "jig", "demo", "--expected", "1", **NO_CHECK)
+        self.assertEqual(result.returncode, TIMEOUT, result.stdout + result.stderr)
+        self.assertEqual(self.expected_file().read_text(encoding="utf-8"), "1\n")
+        self.assertEqual(stat.S_IMODE(self.expected_file().stat().st_mode), 0o664)
+        self.assertEqual(sorted(path.name for path in self.lock_dir.iterdir()),
+                         ["jig-implementer", "jig-implementer.expected"])
+
+    def test_a_wait_keeps_the_last_value_when_the_file_holds_none(self):
+        # A running wait rereads the file at each poll. While the file is empty or holds
+        # a word, it keeps the 5 minutes it had and runs on; a valid 1 then ends it.
+        self.lock_from_minutes_ago(4, 5)
+        running = self.start_wait()
+        for text in ("", "soon\n"):
+            self.expected_file().write_text(text, encoding="utf-8")
+            time.sleep(0.4)
+            self.assertIsNone(running.poll(), f"the wait ended on {text!r}")
+        self.expected_file().write_text("1\n", encoding="utf-8")
+        code, output = self.ended(running)
+        self.assertEqual(code, TIMEOUT, output)
+
+    def test_expected_with_no_lock_refuses_in_one_line_and_writes_nothing(self):
+        # Only another unit holds a lock, and the report of this one is on origin: a
+        # wait without --expected would end with 0, but a new value has nowhere to go.
+        self.write_lock(session="jig-impl-other")
+        self.push_subject("log: demo")
+        before = self.expected_file().read_text(encoding="utf-8")
+        result = self.tool("wait", "jig", "demo", "--expected", "60", **NO_CHECK)
+        self.assertEqual(result.returncode, REFUSED, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("no lock", result.stderr)
+        self.assertEqual(self.expected_file().read_text(encoding="utf-8"), before)
+        self.assertEqual(sorted(path.name for path in self.lock_dir.iterdir()),
+                         ["jig-implementer", "jig-implementer.expected"])
+
+    def test_expected_that_is_not_a_whole_number_above_zero_is_a_usage_error(self):
+        # Zero, a word, a negative or fractional number, and a missing value are each a
+        # usage error with the usage text, and the file beside the lock stays as it was.
+        self.lock_from_minutes_ago(1, 45)
+        for value in (["0"], ["soon"], ["-5"], ["1.5"], []):
+            with self.subTest(value=value):
+                result = self.tool("wait", "jig", "demo", "--expected", *value)
+                self.assertEqual(result.returncode, USAGE, result.stdout + result.stderr)
+                self.assertIn("usage: jig wait", result.stderr)
+                self.assertEqual(self.expected_file().read_text(encoding="utf-8"), "45\n")
 
 
 if __name__ == "__main__":
