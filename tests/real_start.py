@@ -6,7 +6,7 @@ starts one small session, starts it again, and removes only that session and
 that lock. The close test leaves a session at the folder-trust dialog and
 closes it as a dead unit. The hook test starts a fixture project twice, with and
 without the term check on origin, and reads jig's pre-commit hook in its product
-clone. The version line test reads a spec tag of a version line from a fixture
+clone; a second hook test starts it with a pre-commit hook that the product tracks. The version line test reads a spec tag of a version line from a fixture
 prompt with jig start's own readers, and starts the fixture project with it. The
 tests use their own test IDs, which no real unit uses.
 """
@@ -63,6 +63,8 @@ HOOK_PROMPTS = HOME / "ws" / "prompts" / HOOK_PROJECT
 HOOK_HOME_CLONES = tuple(HOME / "ws" / "src" / name for name in
                          (f"{HOOK_PROJECT}-dev", HOOK_PROJECT, f"{HOOK_PROJECT}-dev-approved"))
 HOOK_REVIEWS = HOME / "ws" / "reviews" / HOOK_PROJECT
+# The text of each hook that the fixture product tracks: not jig's, as it has no marker.
+PRODUCT_HOOK = "#!/bin/sh\nexit 0\n"
 
 
 def load_script(name, path):
@@ -247,6 +249,10 @@ class FixtureProjectCase(unittest.TestCase):
     them. The session waits at the folder-trust dialog in the new folder, so the worker
     stops there after the install, and the test ends that session and frees its lock.
 
+    The fixture product tracks a hooks directory, and the clone has no core.hooksPath,
+    as a product has before its first make check: the start sets core.hooksPath to
+    hooks. PRODUCT_HOOKS names the files the product tracks there.
+
     The product clone is inside the -dev clone, the place of the releases before 0.6.
     A case with IN_HOME true puts the two clones side by side in ~/ws/src instead, where
     the role's list of directories names the product clone; it refuses to start when
@@ -254,6 +260,7 @@ class FixtureProjectCase(unittest.TestCase):
     """
 
     IN_HOME = False
+    PRODUCT_HOOKS = ("commit-msg",)
 
     def setUp(self):
         places = (HOOK_CONF, HOOK_PROMPTS, HOOK_REVIEWS,
@@ -298,12 +305,15 @@ class FixtureProjectCase(unittest.TestCase):
 
         self.git("init", "-q", "-b", "master", str(self.product))
         (self.product / "README").write_text("the fixture product\n", encoding="utf-8")
+        (self.product / "hooks").mkdir()
+        for name in self.PRODUCT_HOOKS:
+            hook = self.product / "hooks" / name
+            hook.write_text(PRODUCT_HOOK, encoding="utf-8")
+            hook.chmod(0o755)
         self.git("-C", str(self.product), "add", "-A")
         self.git("-C", str(self.product), "commit", "-q", "--no-verify", "-m", "fixture")
         self.git("-C", str(self.product), "remote", "add", "origin", str(product_origin))
         self.git("-C", str(self.product), "push", "-q", "origin", "master")
-        # As make check of a product sets it: the hook path then lies in the work tree.
-        self.git("-C", str(self.product), "config", "--local", "core.hooksPath", "hooks")
 
         HOOK_CONF.parent.mkdir(parents=True, exist_ok=True)
         HOOK_CONF.write_text(f"REPO={self.dev}\nBRANCH=master\n"
@@ -354,6 +364,13 @@ class FixtureProjectCase(unittest.TestCase):
         self.assertFalse(session_alive(HOOK_SESSION))
         return command
 
+    def hooks_path(self):
+        """Return the core.hooksPath that git uses in the product clone, or None."""
+        result = capture("git", "-C", str(self.product), "config", "core.hooksPath")
+        value = result.stdout.strip() if result.returncode == 0 else None
+        print(f"core.hooksPath of the product clone: {value}")
+        return value
+
     def hook_path(self):
         named = self.git("-C", str(self.product), "rev-parse", "--git-path", "hooks/pre-commit")
         print(f"git rev-parse --git-path hooks/pre-commit: {named}")
@@ -369,10 +386,14 @@ class RealHookTest(FixtureProjectCase):
         return exclude.read_text(encoding="utf-8").splitlines()
 
     def test_real_start_installs_and_removes_the_pre_commit_hook(self):
-        # With the row terms on origin, the start installs jig's hook at the hooks path
-        # and excludes that path; the product clone stays clean.
+        # The product tracks hooks/ and the clone has no core.hooksPath: the start sets
+        # it to hooks. With the row terms on origin, it installs jig's hook at that path
+        # and excludes the path; the product clone stays clean.
+        self.assertIsNone(self.hooks_path())
         self.run_worker()
+        self.assertEqual(self.hooks_path(), "hooks")
         hook = self.hook_path()
+        self.assertEqual(hook, self.product / "hooks" / "pre-commit")
         self.assertEqual(hook.read_bytes(), (ROOT / "hooks" / "pre-commit").read_bytes())
         self.assertTrue(os.access(hook, os.X_OK))
         line_2 = hook.read_text(encoding="utf-8").splitlines()[1]
@@ -388,6 +409,30 @@ class RealHookTest(FixtureProjectCase):
         print(f"hook after the start without the row: {'present' if hook.exists() else 'absent'}")
         self.assertFalse(hook.exists())
         self.assertIn("/hooks/pre-commit", self.excluded())
+
+
+class RealTrackedHookTest(FixtureProjectCase):
+    """A fixture product that tracks its own pre-commit hook in hooks/, without jig's
+    marker, as a product file."""
+
+    PRODUCT_HOOKS = ("commit-msg", "pre-commit")
+
+    def test_real_start_leaves_a_pre_commit_hook_that_the_product_tracks(self):
+        # The start sets core.hooksPath, so git names the tracked hooks/pre-commit. With
+        # the row terms on origin it still starts: it neither refuses that file nor
+        # writes it, and the exclude file and the work tree stay as they were.
+        hook = self.product / "hooks" / "pre-commit"
+        exclude = self.product / ".git" / "info" / "exclude"
+        before = (hook.read_bytes(), hook.stat().st_ino, hook.stat().st_mtime_ns,
+                  exclude.read_bytes() if exclude.exists() else None)
+        self.run_worker()
+        self.assertEqual(self.hooks_path(), "hooks")
+        self.assertEqual(self.hook_path(), hook)
+        after = (hook.read_bytes(), hook.stat().st_ino, hook.stat().st_mtime_ns,
+                 exclude.read_bytes() if exclude.exists() else None)
+        print(f"tracked hook and exclude file unchanged: {after == before}")
+        self.assertEqual(after, before)
+        self.assertEqual(self.git("-C", str(self.product), "status", "--porcelain"), "")
 
 
 class RealSiblingStartTest(FixtureProjectCase):

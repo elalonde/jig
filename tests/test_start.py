@@ -649,6 +649,22 @@ git push -q origin master
         self.wait_for(self.worker_file("claude-args"))
         self.assertIn("claude-opus-5-1", self.worker_file("claude-args").read_text(encoding="utf-8"))
 
+    def test_start_accepts_the_family_name_of_the_prompt_as_model(self):
+        # The prompt names Opus, and --model gives the same family by its name: the
+        # start goes on and runs the newest Opus model.
+        result = self.start("--model", "Opus")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.claude_args()
+        self.assertEqual(args[args.index("--model") + 1], "claude-opus-5-5")
+
+    def test_start_accepts_a_model_id_of_the_prompts_family_as_model(self):
+        # The prompt names Opus, and --model gives a model ID of that family: the start
+        # goes on and runs that exact model.
+        result = self.start("--model", "claude-opus-5-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.claude_args()
+        self.assertEqual(args[args.index("--model") + 1], "claude-opus-5-1")
+
     def test_start_runs_the_newest_fable_for_the_family_name(self):
         # A review prompt names only the family, so the start must pick the
         # newest Fable model and not an older one.
