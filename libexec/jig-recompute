@@ -8,8 +8,7 @@ scripts that make them again in vectors/recompute/, and a copy of the vectors in
 product, in the directory where the product's CI reads them. That directory is the
 second argument, a path from the root of the product clone (no leading "/", no "..").
 This works in the -dev clone, the REPO of ~/.config/jig/<project>.conf, and in the
-product clone beside it, the directory <project> next to REPO (or REPO/<project>,
-where a release before 0.6 put it, when nothing is beside REPO). In order, it:
+product clone beside it, the directory <project> next to REPO. In order, it:
 
   1. fetches the product clone's origin;
   2. stops when a file under vectors/ is not committed (new, changed or removed),

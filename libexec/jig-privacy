@@ -4,9 +4,8 @@
 usage: jig privacy scan <project>
 
 The project's -dev clone is the clone that REPO names in ~/.config/jig/<project>.conf,
-and its product clone is the directory <project> beside it (or <REPO>/<project>,
-where a release before 0.6 put it, when nothing is beside <REPO>), the clone that
-jig terms check reads too. The scan reads the path and the contents
+and its product clone is the directory <project> beside it, the clone that jig
+terms check reads too. The scan reads the path and the contents
 of these files:
   every regular file under captures/ and vectors/ of the -dev clone, at any depth;
   every regular file under the product's vector directory. That directory is the

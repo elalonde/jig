@@ -26,9 +26,8 @@ missing: a project in the middle of a unit never has its version moved. A conf f
 with no JIG_VERSION line gets one.
 
 The GitHub repository is the origin of the product clone of ~/ws/src/jig-dev: the
-clone ~/ws/src/jig beside it, or ~/ws/src/jig-dev/jig, where a release before 0.6
-put it, when nothing is beside it. JIG_UPGRADE_REPO=<owner>/<repo> names another. The other places come from the
-environment too: JIG_ROOT (default /opt/jig), JIG_GITHUB_API (default
+clone ~/ws/src/jig beside it. JIG_UPGRADE_REPO=<owner>/<repo> names another. The
+other places come from the environment too: JIG_ROOT (default /opt/jig), JIG_GITHUB_API (default
 https://api.github.com), JIG_SSH (default ssh -o BatchMode=yes) and JIG_LOCK_DIR
 (default /run/jig/lock).
 

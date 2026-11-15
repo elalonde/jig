@@ -11,9 +11,8 @@ case, also inside a longer word: a private name joined to another word is still
 published.
 
 Three places are read:
-  the product clone beside the -dev clone, the directory <project> next to <REPO>
-    (or <REPO>/<project>, where a release before 0.6 put it, when nothing is
-    beside <REPO>): every file that git lists, tracked or new and not ignored, by
+  the product clone beside the -dev clone, the directory <project> next to <REPO>:
+    every file that git lists, tracked or new and not ignored, by
     its path and by its contents;
   the messages of the product commits since the last release on the line that
     BRANCH names: the commits reachable from the clone's HEAD and not from the

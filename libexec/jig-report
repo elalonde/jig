@@ -14,9 +14,8 @@ one ID: the newest "status: <ID> start" commit on origin begins the current run,
 that run needs its "log: <ID>" commit. The report, impl/log/<ID>-report.md on origin,
 must pass jig validate report, and every hash of its commits: line must name a commit
 reachable from origin in the -dev clone or in its product clone, the directory
-<project> beside it (or <project> inside it, where a release before 0.6 put it, when
-nothing is beside it). When the prompt names the implementer account, no such product commit may add, change or remove
-a file in the product's vector directory: the last word of the command of the row
+<project> beside it. When the prompt names the implementer account, no such product
+commit may add, change or remove a file in the product's vector directory: the last word of the command of the row
 recompute in checks.tsv on origin. A project without that row has no such directory.
 Nor may any other product commit on origin touch that directory when the report does
 not name it and it was made during the unit: committed after the unit's first start

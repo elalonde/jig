@@ -30,8 +30,7 @@ text of jig's pre-commit hook, hooks/pre-commit of its own tree, as --hook; run
 alone from a jig tree, the script reads that file beside it.
 
 The product clone is the one lib/jig_clones.py finds for the -dev clone REPO: the
-clone beside it, ~/ws/src/<project>, or, for a project that a release before 0.6
-set up and that has nothing beside its -dev clone, REPO/<project>. For the same
+clone beside it, ~/ws/src/<project>. For the same
 reason as the hook, jig start passes the text of that module as --clones, and the
 script runs it; run alone from a jig tree, the script reads the module beside it.
 jig's pre-commit hook is the file that git rev-parse --git-path

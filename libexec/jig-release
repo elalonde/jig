@@ -8,8 +8,7 @@ usage: jig release <project> prepare --entry <file> --trailer <line>
 Runs as the implementer, inside the tmux session of the unit that makes the release,
 because the checks that the implementer runs go through jig run-check, which records
 their exit codes for that unit. The -dev clone is REPO of ~/.config/jig/<project>.conf,
-the product clone is the directory <project> beside it (or <REPO>/<project>, where a
-release before 0.6 put it, when nothing is beside <REPO>), and the version line is
+the product clone is the directory <project> beside it, and the version line is
 BRANCH, of the form
 <X>.<Y>. The version is <X>.<Y>.0 when the product has no tag v<X>.<Y>.<n> on the line,
 else the newest such tag with its last number plus 1.

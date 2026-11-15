@@ -4,8 +4,7 @@
 usage: jig trace check | coverage | gen <product path> ... | form <commit>
 
 Run in the -dev clone, on the product clone beside it, ../<project> (the -dev
-directory's name without -dev). A product clone that a release before 0.6 put
-inside the -dev clone, at <project>, is used only while nothing sits beside it.
+directory's name without -dev).
 The product's own comments and test names carry no record IDs; the trace in the
 -dev clone ties them to the code instead.
 
