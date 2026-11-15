@@ -135,6 +135,29 @@ class HostConfTest(SlotCase):
                 self.assertIn(str(self.srv / "host.conf"), str(caught.exception))
                 self.assertIn("HEAVY_SLOTS", str(caught.exception))
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file of any mode")
+    def test_a_host_conf_that_cannot_be_read_names_the_file(self):
+        # A heavy row run without the limit that the host may set would defeat it, so
+        # a file that exists and cannot be read is refused, never taken as no limit.
+        self.host_conf("HEAVY_SLOTS=1\n")
+        (self.srv / "host.conf").chmod(0)
+        with self.assertRaises(jig_checks.SlotError) as caught:
+            jig_checks.heavy_slots()
+        self.assertIn(f"cannot read {self.srv / 'host.conf'}", str(caught.exception))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file of any mode")
+    def test_the_hook_refuses_a_host_conf_that_cannot_be_read_as_the_module_does(self):
+        # The hook keeps its own copy of the read; both refuse the unreadable file with
+        # the same line.
+        hook = load_hook()
+        self.host_conf("HEAVY_SLOTS=1\n")
+        (self.srv / "host.conf").chmod(0)
+        found = outcome(lambda _: hook.heavy_slots(), hook.SlotError, None)
+        self.assertEqual(found, outcome(lambda _: jig_checks.heavy_slots(),
+                                        jig_checks.SlotError, None))
+        self.assertEqual(found, f"refused: cannot read {self.srv / 'host.conf'}: "
+                                "Permission denied")
+
     def test_the_hook_reads_host_conf_as_the_module_does(self):
         hook = load_hook()
         for text in [case[1] for case in self.CASES] + self.BAD:

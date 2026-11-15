@@ -6,6 +6,7 @@ import signal
 import sys
 import threading
 import time
+import unittest
 
 from tests.support import ROOT, TempTestCase, run
 
@@ -41,6 +42,10 @@ HEAVY_ROWS = [
     ("inner", "echo inner ran", ACCOUNT, "30", "heavy"),
     ("stoppable", "echo $$ > sh.pid; sleep 60 & echo $! > child.pid; wait", ACCOUNT, "60",
      "heavy"),
+    # The shell's parent is jig run-check itself, so the test can signal it.
+    ("light-stoppable",
+     "echo $$ > sh.pid; echo $PPID > runner.pid; sleep 60 & echo $! > child.pid; wait",
+     ACCOUNT, "60", "light"),
     ("big", "echo should not run > ran.txt", ACCOUNT, "60", "huge"),
     ("six", "echo should not run > ran.txt", ACCOUNT, "60", "heavy", "extra"),
 ]
@@ -533,7 +538,9 @@ class RunCheckHeavyTest(RunCheckHeavyCase):
 
     def test_sigterm_during_a_heavy_row_ends_its_group_and_frees_the_slot(self):
         # jig run-check gets SIGTERM while the command and its child sleep: it kills
-        # their group, exits 143, and the slot is free at once for the next run.
+        # their group, exits 143, and the slot is free at once for the next run. A
+        # stopped run has no result, so it leaves no exit file that a report could read
+        # as one.
         waiting = self.start("jig-impl-demo", "jig", "stoppable")
         self.wait_for(self.dev / "child.pid")
         holder = (self.heavy / "1").read_text(encoding="utf-8").rstrip("\n").split("\t")
@@ -543,9 +550,24 @@ class RunCheckHeavyTest(RunCheckHeavyCase):
         self.assertEqual(result[0], 143, result)
         self.assertIn("stopped by SIGTERM", result[2])
         self.assertEqual(group_members(group), [])
+        self.assertFalse((self.reviews / "demo-stoppable.exit").exists())
         descriptor = jig_checks.try_slot(self.heavy / "1")
         self.assertIsNotNone(descriptor)
         os.close(descriptor)
+
+    def test_sigterm_during_a_light_row_ends_its_group_and_writes_no_exit_file(self):
+        # A light row takes no slot, but a signal still must not leave its command
+        # running on into its output file: jig run-check kills the group, exits 143 and
+        # writes no exit file.
+        running = self.start("jig-impl-demo", "jig", "light-stoppable")
+        self.wait_for(self.dev / "child.pid")
+        group = int((self.dev / "sh.pid").read_text(encoding="utf-8"))
+        os.kill(int((self.dev / "runner.pid").read_text(encoding="utf-8")), signal.SIGTERM)
+        result = self.finish(running)
+        self.assertEqual(result[0], 143, result)
+        self.assertEqual(group_members(group), [])
+        self.assertIn("stopped by SIGTERM", result[2])
+        self.assertFalse((self.reviews / "demo-light-stoppable.exit").exists())
 
     def test_the_slot_directory_and_file_are_made_for_every_account(self):
         # Under a umask that keeps files private, the missing directory gets mode 2775
@@ -595,6 +617,20 @@ class RunCheckSlotsTest(RunCheckHeavyCase):
                 self.assertEqual(light[0], 0, light)
                 (self.reviews / "demo-light-row.exit").unlink()
                 (self.reviews / "demo-light-row.txt").unlink()
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file of any mode")
+    def test_an_unreadable_host_conf_refuses_a_heavy_row_and_not_a_light_one(self):
+        # host.conf exists but this account cannot read it: a heavy row cannot know
+        # the host's limit, so it refuses and names the file; a light row never reads
+        # the file and runs.
+        path = self.srv / "host.conf"
+        path.chmod(0)
+        result = self.in_session("jig-impl-demo", "jig", "quick")
+        self.assert_refused(result)
+        self.assertIn(f"cannot read {path}", result[2])
+        light = self.in_session("jig-impl-demo", "jig", "light-row")
+        self.assertEqual(light[0], 0, light)
+        self.assertEqual(self.recorded("light-row"), "0\n")
 
     def test_a_weight_other_than_heavy_or_light_and_a_sixth_field_are_refused(self):
         for name in ("big", "six"):
