@@ -328,7 +328,8 @@ def seed_repos(project, host, values, home):
         return
     if product_target.exists() or product_target.is_symlink():
         raise Refusal(f"{product_target} exists with no {target.name} beside it; "
-                      "nothing is overwritten")
+                      "nothing is overwritten (if a stopped jig new left it, remove it "
+                      "and run jig new again)")
     scratch = pathlib.Path(tempfile.mkdtemp(prefix=f".{project}-dev.", dir=target.parent))
     try:
         work = scratch / target.name

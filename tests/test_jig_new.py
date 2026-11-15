@@ -635,6 +635,26 @@ class JigNewTest(TempTestCase):
                           "did not make it; nothing is overwritten"])
         self.assertEqual(self.snapshot(), before)
 
+    def test_a_product_clone_left_by_a_stopped_run_is_refused_with_a_way_out(self):
+        # A run that stopped between its two moves left ~/ws/src/demo with no -dev
+        # clone beside it, and its marker tells the rerun that jig new started the
+        # project. The rerun gets as far as making the clones, refuses there with one
+        # line that names the directory and says it may be removed, and changes nothing:
+        # it never moves its new clone onto the old one.
+        self.made()
+        shutil.rmtree(self.home / "ws" / "src" / f"{PROJECT}-dev")
+        product = self.home / "ws" / "src" / PROJECT
+        self.assertTrue((self.srv / "blocks" / PROJECT / ".jig-new").is_file())
+        before = self.snapshot()
+        result = self.new(PROJECT)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.splitlines(),
+                         [f"jig new: {product} exists with no {PROJECT}-dev beside it; "
+                          "nothing is overwritten (if a stopped jig new left it, remove it "
+                          "and run jig new again)"])
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
     def test_project_name_that_is_a_file_is_not_overwritten(self):
         (self.srv / "in" / PROJECT).write_text("a file\n", encoding="utf-8")
         before = self.snapshot()
