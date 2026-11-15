@@ -1,10 +1,16 @@
 import os
 import pathlib
 import shutil
+import sys
+import threading
 import unittest
 
 from tests import clone_cases
 from tests.support import ROOT, TempTestCase, run
+
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_checks  # noqa: E402
 
 HOOK = ROOT / "hooks" / "pre-commit"
 HEADER = "name\tcommand\taccount\tcap_seconds"
@@ -136,6 +142,77 @@ class PreCommitTest(PreCommitCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         listed = (self.dev / "listed.txt").read_text(encoding="utf-8").split()
         self.assertEqual(listed, ["checks.tsv"])
+
+
+class PreCommitHeavyTest(PreCommitCase):
+    """The host config allows one heavy row at a time, and the test can hold that slot."""
+
+    def setUp(self):
+        self.srv_dir = None
+        super().setUp()
+        self.srv_dir = self.tmp / "srv"
+        self.srv_dir.mkdir()
+        (self.srv_dir / "host.conf").write_text("HEAVY_SLOTS=1\n", encoding="utf-8")
+        self.heavy = self.tmp / "heavy"
+        self.heavy.mkdir()
+
+    def env(self, **extra):
+        if self.srv_dir is not None:
+            extra.update(JIG_SRV=str(self.srv_dir), JIG_HEAVY_DIR=str(self.heavy),
+                         JIG_HEAVY_POLL="0.1")
+        return super().env(**extra)
+
+    def hold(self, seconds):
+        """Hold the only slot from this process, and let it go after that many seconds."""
+        slot = jig_checks.Slot(1, jig_checks.try_slot(self.heavy / "1"))
+        self.assertIsNotNone(slot.descriptor)
+        self.addCleanup(slot.release)
+        os.write(slot.descriptor, b"other\tab12\tbuild\tsomeone\t-\t1\n")
+        timer = threading.Timer(seconds, slot.release)
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+    def test_a_heavy_term_check_waits_for_the_slot_and_its_cap_counts_after(self):
+        # The slot is held for about 1.5 s and the row's cap is one second: the hook
+        # says whom it waits for, takes the slot, and the commit goes through. The slot
+        # then holds the hook's line: the project from the -dev clone's name, no unit
+        # outside tmux, and the row.
+        self.write_rows(("terms", "sleep 0.2", "implementer", "1", "heavy"))
+        self.install()
+        self.hold(1.5)
+        result = self.commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commits(), 1)
+        self.assertIn("every heavy slot is held, waiting: slot 1: project other, unit ab12, "
+                      "row build", result.stderr)
+        self.assertRegex(result.stderr, r"took heavy slot 1 after [0-9]+ s")
+        fields = (self.heavy / "1").read_text(encoding="utf-8").split("\t")
+        self.assertEqual(fields[:3], ["demo", "-", "terms"])
+
+    def test_a_light_term_check_does_not_wait_for_a_held_slot(self):
+        # The test holds the slot for longer than the test runs; a row light by its
+        # fifth field, or with four fields, commits at once.
+        self.hold(30)
+        for weight in ("light", None):
+            with self.subTest(weight=weight):
+                row = ("terms", "true", "implementer", "60")
+                self.write_rows(row + ((weight,) if weight else ()))
+                self.install()
+                (self.product / "notes.txt").write_text(f"{weight}\n", encoding="utf-8")
+                result = self.commit()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("slot", result.stderr)
+
+    def test_a_weight_other_than_heavy_or_light_and_a_sixth_field_are_refused(self):
+        for extra in (("huge",), ("heavy", "extra")):
+            with self.subTest(extra=extra):
+                self.write_rows(("terms", "true", "implementer", "60", *extra))
+                self.install()
+                result = self.commit()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.commits(), 0)
+                self.assertIn("the row terms of", result.stderr)
+                self.assertIn("heavy or light", result.stderr)
 
 
 class PreCommitSharedLayoutTest(TempTestCase):

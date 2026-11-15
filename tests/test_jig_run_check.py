@@ -2,9 +2,16 @@ import os
 import pathlib
 import pwd
 import shlex
+import signal
+import sys
+import threading
 import time
 
 from tests.support import ROOT, TempTestCase, run
+
+sys.path.insert(0, str(ROOT / "lib"))
+
+import jig_checks  # noqa: E402
 
 RUN_CHECK = ROOT / "libexec" / "jig-run-check"
 ACCOUNT = pwd.getpwuid(os.getuid()).pw_name
@@ -19,6 +26,23 @@ ROWS = [
     ("where", "pwd", ACCOUNT, "60"),
     ("product", "cat ../jig/marker.txt", ACCOUNT, "60"),
     ("elsewhere", "echo should not run > ran.txt", "someone-else", "60"),
+]
+
+
+# The heavy rows of the slot tests, in both fixture projects. Each writes into the root
+# of its -dev clone, so that a test can read when its command ran.
+TIMED = "date +%s.%N > started.txt; sleep 1.2; date +%s.%N > ended.txt"
+HEAVY_ROWS = [
+    ("build", TIMED, ACCOUNT, "60", "heavy"),
+    ("capped", "sleep 60 & echo $! > child.pid; wait", ACCOUNT, "1", "heavy"),
+    ("quick", "sleep 0.2; echo quick ran", ACCOUNT, "1", "heavy"),
+    ("light-row", "echo light ran", ACCOUNT, "60", "light"),
+    ("outer", f"{RUN_CHECK} jig inner", ACCOUNT, "30", "heavy"),
+    ("inner", "echo inner ran", ACCOUNT, "30", "heavy"),
+    ("stoppable", "echo $$ > sh.pid; sleep 60 & echo $! > child.pid; wait", ACCOUNT, "60",
+     "heavy"),
+    ("big", "echo should not run > ran.txt", ACCOUNT, "60", "huge"),
+    ("six", "echo should not run > ran.txt", ACCOUNT, "60", "heavy", "extra"),
 ]
 
 
@@ -64,6 +88,13 @@ class RunCheckCase(TempTestCase):
 
     def in_session(self, session, *args):
         """Run jig run-check inside a tmux session of that name; return code, stdout, stderr."""
+        return self.finish(self.start(session, *args))
+
+    def start(self, session, *args, umask=None):
+        """Start jig run-check inside a tmux session of that name, and return at once.
+
+        The result is the place of its output files, for finish.
+        """
         self.runs += 1
         out = self.tmp / f"run{self.runs}"
         environment = " ".join(f"{key}={shlex.quote(value)}"
@@ -71,19 +102,24 @@ class RunCheckCase(TempTestCase):
         script = self.tmp / f"run{self.runs}.sh"
         script.write_text(
             f"#!/bin/sh\nexport {environment}\n"
-            f"{shlex.join([str(RUN_CHECK), *args])} > {out}.out 2> {out}.err\n"
+            + (f"umask {umask}\n" if umask else "")
+            + f"{shlex.join([str(RUN_CHECK), *args])} > {out}.out 2> {out}.err\n"
             f"echo $? > {out}.part && mv {out}.part {out}.code\n", encoding="utf-8")
         script.chmod(0o755)
         started = run(["tmux", "new-session", "-d", "-s", session, str(script)],
                       env=self.tmux_env())
         self.assertEqual(started.returncode, 0, started.stderr)
+        return out
+
+    def finish(self, out):
+        """Wait for the run that start began; return its code, stdout and stderr."""
         code = pathlib.Path(f"{out}.code")
         for _ in range(600):
             if code.exists():
                 break
             time.sleep(0.05)
         else:
-            self.fail(f"jig run-check did not finish in the session {session}")
+            self.fail(f"jig run-check did not finish: {out}")
         return (int(code.read_text(encoding="utf-8")),
                 pathlib.Path(f"{out}.out").read_text(encoding="utf-8"),
                 pathlib.Path(f"{out}.err").read_text(encoding="utf-8"))
@@ -312,3 +348,259 @@ class RunCheckTermsTest(RunCheckCase):
         result = self.in_session("jig-spec-demo", "jig", "terms")
         self.assert_refused(result)
         self.assertIn("the-implementer", result[2])
+
+
+def group_members(group):
+    """Return the processes of a process group that still run, zombies left out."""
+    members = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        if fields[0] != "Z" and int(fields[2]) == group:
+            members.append(int(entry.name))
+    return members
+
+
+class RunCheckHeavyCase(RunCheckCase):
+    """Two fixture projects, jig and demo, with heavy rows, a host config and slots."""
+
+    def setUp(self):
+        super().setUp()
+        self.heavy = self.tmp / "heavy"
+        self.other = self.tmp / "demo-dev"
+        self.other.mkdir()
+        for root in (self.dev, self.other):
+            lines = ["name\tcommand\taccount\tcap_seconds"] + \
+                ["\t".join(row) for row in [*ROWS, *HEAVY_ROWS]]
+            (root / "checks.tsv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (self.conf.parent / "demo.conf").write_text(
+            f"REPO={self.other}\nBRANCH=master\nIMPL_ACCOUNT={ACCOUNT}\n", encoding="utf-8")
+        self.srv.mkdir()
+        self.slots(1)
+
+    def tmux_env(self):
+        return self.env(TMUX_TMPDIR=str(self.tmux_dir), JIG_SRV=str(self.srv),
+                        JIG_HEAVY_DIR=str(self.heavy), JIG_HEAVY_POLL="0.1")
+
+    def slots(self, value):
+        text = "" if value is None else f"HEAVY_SLOTS={value}\n"
+        (self.srv / "host.conf").write_text(f"# host config of the test\n{text}",
+                                            encoding="utf-8")
+
+    def hold(self, text="demo\tab12\tbuild\tsomeone\t-\t1\n", number=1):
+        """Hold a slot from this process, as another run would; return what lets it go."""
+        self.heavy.mkdir(exist_ok=True)
+        slot = jig_checks.Slot(number, jig_checks.try_slot(self.heavy / str(number)))
+        self.assertIsNotNone(slot.descriptor)
+        self.addCleanup(slot.release)
+        os.ftruncate(slot.descriptor, 0)
+        os.write(slot.descriptor, text.encode())
+        return slot.release
+
+    def release_later(self, release, seconds):
+        timer = threading.Timer(seconds, release)
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+    def times(self, root):
+        return tuple(float((root / name).read_text(encoding="utf-8"))
+                     for name in ("started.txt", "ended.txt"))
+
+    def wait_for(self, path):
+        for _ in range(200):
+            if path.exists() and path.read_text(encoding="utf-8").strip():
+                return
+            time.sleep(0.05)
+        self.fail(f"{path} did not appear")
+
+    def two_builds(self):
+        """Start the heavy row build of both projects at once; return both results."""
+        first = self.start("jig-impl-one", "jig", "build")
+        second = self.start("demo-impl-two", "demo", "build")
+        results = {"jig": self.finish(first), "demo": self.finish(second)}
+        return results, {"jig": self.times(self.dev), "demo": self.times(self.other)}
+
+
+class RunCheckHeavyTest(RunCheckHeavyCase):
+    def test_with_one_slot_two_heavy_rows_of_two_projects_run_one_after_the_other(self):
+        # Both start at once and one slot is free: the one that comes second waits, says
+        # whose row holds the slot and which slot it took, and starts only after the
+        # first ended.
+        results, times = self.two_builds()
+        for project, result in results.items():
+            self.assertEqual(result[0], 0, (project, result))
+        first, second = sorted(times, key=lambda project: times[project][0])
+        base = times[first][0]
+        print(f"\none slot: {first} ran {times[first][0] - base:.2f} to "
+              f"{times[first][1] - base:.2f} s, {second} ran {times[second][0] - base:.2f} to "
+              f"{times[second][1] - base:.2f} s", file=sys.stderr)
+        self.assertGreaterEqual(times[second][0], times[first][1])
+        units = {"jig": "one", "demo": "two"}
+        err = results[second][2]
+        self.assertIn(f"every heavy slot is held, waiting: slot 1: project {first}, "
+                      f"unit {units[first]}, row build", err)
+        self.assertRegex(err, r"took heavy slot 1 after [0-9]+ s")
+        self.assertNotIn("heavy slot", results[first][2])
+        output = self.home / "ws" / "reviews" / second / f"{units[second]}-build.txt"
+        self.assertRegex(output.read_text(encoding="utf-8").splitlines()[-2], r"^wait: [0-9]+s$")
+
+    def test_with_two_slots_two_heavy_rows_of_two_projects_overlap(self):
+        self.slots(2)
+        results, times = self.two_builds()
+        for project, result in results.items():
+            self.assertEqual(result[0], 0, (project, result))
+            self.assertNotIn("heavy slot", result[2])
+        base = min(start for start, _ in times.values())
+        print("\ntwo slots: " + ", ".join(
+            f"{project} ran {start - base:.2f} to {end - base:.2f} s"
+            for project, (start, end) in sorted(times.items())), file=sys.stderr)
+        self.assertLess(times["jig"][0], times["demo"][1])
+        self.assertLess(times["demo"][0], times["jig"][1])
+
+    def test_a_heavy_row_killed_at_its_cap_frees_its_slot_for_a_waiting_row(self):
+        # The first row holds the only slot and passes its cap of one second; the row of
+        # the other project waits for it, and takes the slot once the first is killed.
+        capped = self.start("jig-impl-one", "jig", "capped")
+        self.wait_for(self.dev / "child.pid")
+        waiting = self.start("demo-impl-two", "demo", "quick")
+        killed, taken = self.finish(capped), self.finish(waiting)
+        self.assertEqual(killed[0], 124, killed)
+        self.assertEqual(taken[0], 0, taken)
+        self.assertIn("slot 1: project jig, unit one, row capped", taken[2])
+        self.assertRegex(taken[2], r"took heavy slot 1 after [0-9]+ s")
+
+    def test_a_light_row_runs_at_once_while_every_slot_is_held(self):
+        # The test holds the only slot; a light row, by its fifth field or with four
+        # fields, runs and says nothing about slots.
+        self.hold()
+        for name in ("light-row", "passes"):
+            with self.subTest(name):
+                began = time.monotonic()
+                result = self.in_session("jig-impl-demo", "jig", name)
+                self.assertEqual(result[0], 0, result)
+                self.assertLess(time.monotonic() - began, 5)
+                self.assertNotIn("slot", result[2])
+
+    def test_a_waiter_keeps_the_holders_text_and_names_its_holder(self):
+        # The test holds the only slot with a holder line. While the row waits and polls,
+        # the line stays as it was; the row's wait line names that holder.
+        text = "demo\tab12\tbuild\tsomeone\t-\t1\n"
+        release = self.hold(text)
+        waiting = self.start("jig-impl-demo", "jig", "quick")
+        time.sleep(0.8)
+        self.assertEqual((self.heavy / "1").read_text(encoding="utf-8"), text)
+        release()
+        result = self.finish(waiting)
+        self.assertEqual(result[0], 0, result)
+        self.assertIn("slot 1: project demo, unit ab12, row build", result[2])
+
+    def test_a_slot_with_no_usable_text_is_named_by_a_question_mark(self):
+        self.release_later(self.hold(""), 0.5)
+        result = self.in_session("jig-impl-demo", "jig", "quick")
+        self.assertEqual(result[0], 0, result)
+        self.assertIn("every heavy slot is held, waiting: slot 1: ?", result[2])
+
+    def test_the_cap_of_a_waiting_row_counts_only_after_its_wait(self):
+        # The row's cap is one second, and it waits about two for the slot: it still
+        # passes, and its output names the wait before the wall time.
+        self.release_later(self.hold(), 2)
+        result = self.in_session("jig-impl-demo", "jig", "quick")
+        self.assertEqual(result[0], 0, result)
+        lines = self.output("quick").splitlines()
+        self.assertEqual(lines[0], "quick ran")
+        self.assertIn(lines[-2], ("wait: 2s", "wait: 3s"))
+        self.assertRegex(lines[-1], r"^wall: [0-9]+s$")
+
+    def test_a_row_that_did_not_wait_has_no_wait_line(self):
+        result = self.in_session("jig-impl-demo", "jig", "quick")
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual([line for line in self.output("quick").splitlines()
+                          if line.startswith("wait:")], [])
+
+    def test_a_heavy_row_inside_a_heavy_row_runs_at_once(self):
+        # One slot, held by the outer row; its command runs the inner heavy row through
+        # jig run-check, which would wait for ever if it waited for the slot.
+        result = self.in_session("jig-impl-demo", "jig", "outer")
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.recorded("inner"), "0\n")
+        self.assertIn("inner ran", self.output("inner"))
+        self.assertNotIn("heavy slot", self.output("outer"))
+
+    def test_sigterm_during_a_heavy_row_ends_its_group_and_frees_the_slot(self):
+        # jig run-check gets SIGTERM while the command and its child sleep: it kills
+        # their group, exits 143, and the slot is free at once for the next run.
+        waiting = self.start("jig-impl-demo", "jig", "stoppable")
+        self.wait_for(self.dev / "child.pid")
+        holder = (self.heavy / "1").read_text(encoding="utf-8").rstrip("\n").split("\t")
+        group = int((self.dev / "sh.pid").read_text(encoding="utf-8"))
+        os.kill(int(holder[5]), signal.SIGTERM)
+        result = self.finish(waiting)
+        self.assertEqual(result[0], 143, result)
+        self.assertIn("stopped by SIGTERM", result[2])
+        self.assertEqual(group_members(group), [])
+        descriptor = jig_checks.try_slot(self.heavy / "1")
+        self.assertIsNotNone(descriptor)
+        os.close(descriptor)
+
+    def test_the_slot_directory_and_file_are_made_for_every_account(self):
+        # Under a umask that keeps files private, the missing directory gets mode 2775
+        # and the slot file 664, and the file holds this run's holder line.
+        result = self.finish(self.start("jig-impl-demo", "jig", "quick", umask="077"))
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.heavy.stat().st_mode & 0o7777, 0o2775)
+        self.assertEqual((self.heavy / "1").stat().st_mode & 0o7777, 0o664)
+        fields = (self.heavy / "1").read_text(encoding="utf-8").rstrip("\n").split("\t")
+        self.assertEqual(fields[:4], ["jig", "demo", "quick", ACCOUNT])
+        self.assertRegex(fields[5], r"^[0-9]+$")
+
+
+class RunCheckSlotsTest(RunCheckHeavyCase):
+    """The number of slots that host.conf gives."""
+
+    def test_with_no_key_a_heavy_row_runs_at_once_and_says_nothing_of_slots(self):
+        # The test holds slot 1; with no limit, the row does not look at it.
+        self.hold()
+        for text in ("# no key\n", None):
+            with self.subTest(text):
+                if text is None:
+                    (self.srv / "host.conf").unlink()
+                else:
+                    (self.srv / "host.conf").write_text(text, encoding="utf-8")
+                result = self.in_session("jig-impl-demo", "jig", "quick")
+                self.assertEqual(result[0], 0, result)
+                self.assertNotIn("slot", result[2])
+
+    def test_with_two_slots_and_one_held_a_heavy_row_takes_the_second(self):
+        self.slots(2)
+        self.hold()
+        result = self.in_session("jig-impl-demo", "jig", "quick")
+        self.assertEqual(result[0], 0, result)
+        self.assertNotIn("slot", result[2])
+        fields = (self.heavy / "2").read_text(encoding="utf-8").split("\t")
+        self.assertEqual(fields[:3], ["jig", "demo", "quick"])
+
+    def test_a_bad_number_of_slots_refuses_a_heavy_row_and_not_a_light_one(self):
+        for value in ("0", "two"):
+            with self.subTest(value):
+                self.slots(value)
+                result = self.in_session("jig-impl-demo", "jig", "quick")
+                self.assert_refused(result)
+                self.assertIn(f"{self.srv / 'host.conf'}: HEAVY_SLOTS='{value}'", result[2])
+                light = self.in_session("jig-impl-demo", "jig", "light-row")
+                self.assertEqual(light[0], 0, light)
+                (self.reviews / "demo-light-row.exit").unlink()
+                (self.reviews / "demo-light-row.txt").unlink()
+
+    def test_a_weight_other_than_heavy_or_light_and_a_sixth_field_are_refused(self):
+        for name in ("big", "six"):
+            with self.subTest(name):
+                result = self.in_session("jig-impl-demo", "jig", name)
+                self.assert_refused(result)
+                self.assertIn(f"the row {name} of", result[2])
+                self.assertIn("heavy or light", result[2])
+                self.assertFalse((self.dev / "ran.txt").exists())

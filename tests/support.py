@@ -22,14 +22,16 @@ PUBLIC_ADDRESS = "@".join(["eric", "lalonde.com"])
 # Variables that would make a test depend on where it runs: CI sets some, a git
 # hook sets others, the status line's overrides would point it at other files, a
 # proxy would swallow requests to a local fake server, and a tmux variable would
-# point a test at the real server.
+# point a test at the real server. The heavy slot variables would make a test wait for
+# the slots of the host, or skip a wait because an outer run holds a slot.
 UNSET = {"CI", "LINT_TERMS", "JIG_ROOT", "JIG_GITHUB_API", "JIG_SSH", "JIG_LOCK_DIR",
          "JIG_UPGRADE_REPO",
          "JIG_START_SETTLE", "JIG_SRV", "JIG_HOST", "JIGSHOT_CMD", "JIGSHOT_DIR",
          "JIG_WAIT_POLL", "JIG_WAIT_CHECK", "JIG_BATCH_DIR", "JIG_BATCH_CLOSE_DELAY",
          "JIG_HOLD_DIR", "JIG_ORCH_POLL", "JIG_CTX_DIR", "JIG_CTX_SOFT", "JIG_CTX_HARD",
          "JIG_SEND_PAUSE", "JIG_SEND_CHECK", "JIG_CI_POLL", "JIG_RELEASE_CI_WAIT",
-         "JIG_STATUSLINE_CONF", "HEALTH_FILE", "MODEL_POLICY", "USAGE_FILE", "CTX_DIR",
+         "JIG_STATUSLINE_CONF", "JIG_HEAVY_DIR", "JIG_HEAVY_POLL", "JIG_HEAVY_SLOT",
+         "HEALTH_FILE", "MODEL_POLICY", "USAGE_FILE", "CTX_DIR",
          "TMUX", "TMUX_PANE", "TMUX_TMPDIR",
          "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"}
 
@@ -210,6 +212,9 @@ class TempTestCase(unittest.TestCase):
         self.home.mkdir()
 
     def env(self, **extra):
+        # A heavy row in a test takes its slots here, never in the slot directory of
+        # the host.
+        extra.setdefault("JIG_HEAVY_DIR", str(self.tmp / "heavy"))
         return clean_env(HOME=str(self.home), **extra)
 
     def git_init(self, path):

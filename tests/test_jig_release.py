@@ -308,6 +308,61 @@ class PreparePassTest(ReleaseCase):
         self.assertEqual(result[0], 0, result)
 
 
+class PrepareHeavyTest(ReleaseCase):
+    """The host allows one heavy row at a time, and prepare runs one."""
+
+    def test_prepare_waits_for_a_held_heavy_slot_and_then_passes(self):
+        # The test holds the only slot for about two seconds. The heavy row waits in jig
+        # run-check, its wait lines show in prepare's output while it waits, and prepare
+        # then passes.
+        heavy = self.tmp / "heavy"
+        heavy.mkdir()
+        (self.srv / "host.conf").write_text("HEAVY_SLOTS=1\n", encoding="utf-8")
+        self.extra_env = {"JIG_HEAVY_DIR": str(heavy), "JIG_HEAVY_POLL": "0.1"}
+        with open(self.dev / "checks.tsv", "a", encoding="utf-8") as stream:
+            stream.write(f"build\techo built\t{ACCOUNT}\t60\theavy\n")
+        slot = release.jig_checks.Slot(1, release.jig_checks.try_slot(heavy / "1"))
+        self.addCleanup(slot.release)
+        os.write(slot.descriptor, b"other\tab12\tbuild\tsomeone\t-\t1\n")
+        timer = threading.Timer(2, slot.release)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        result = self.prepare()
+        self.assertEqual(result[0], 0, result)
+        self.assertIn("every heavy slot is held, waiting: slot 1: project other, unit ab12, "
+                      "row build", result[1])
+        self.assertRegex(result[1], r"took heavy slot 1 after [0-9]+ s")
+        exit_file = self.home / "ws" / "reviews" / PROJECT / f"r{self.runs}-build.exit"
+        self.assertEqual(exit_file.read_text(encoding="utf-8"), "0\n")
+
+
+class ReadRowsTest(TempTestCase):
+    """prepare reads every row by the rule of jig run-check, also one of another account."""
+
+    def rows(self, *lines):
+        (self.tmp / "checks.tsv").write_text(
+            "\n".join(["name\tcommand\taccount\tcap_seconds", *lines]) + "\n",
+            encoding="utf-8")
+        return release.read_rows(self.tmp)
+
+    def test_rows_of_four_and_five_fields_are_read(self):
+        self.assertEqual(self.rows("a\ttrue\tsomeone\t60", "b\ttrue\tother\t60\theavy",
+                                   "c\ttrue\tother\t60\tlight", "d\ttrue\tother\t60\t"),
+                         [("a", "someone"), ("b", "other"), ("c", "other"), ("d", "other")])
+
+    def test_a_bad_weight_a_sixth_field_and_a_bad_cap_stop_prepare(self):
+        # The cap is checked for a row of every account: a row that jig run-check would
+        # refuse stops the release before any row runs.
+        for name, rest, words in (("big", "60\thuge", "heavy or light"),
+                                  ("six", "60\theavy\tx", "heavy or light"),
+                                  ("nocap", "soon", "cap in seconds")):
+            with self.subTest(name):
+                with self.assertRaises(release.StepFailed) as caught:
+                    self.rows(f"{name}\ttrue\tother\t{rest}")
+                self.assertIn(f"the row {name} of", str(caught.exception))
+                self.assertIn(words, str(caught.exception))
+
+
 class PrepareRerunTest(ReleaseCase):
     def release_subjects(self):
         log = self.git("--git-dir", self.origin, "log", "--format=%s", LINE)

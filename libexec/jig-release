@@ -58,8 +58,11 @@ and prepare exits 1, so that publish never finds a partial set of files.
     unpacked into a directory of the archive's name, and jig privacy scan <project>
     all exit 0. jig terms check reads an archive as its compressed bytes, so a term
     in a file that only the package holds is found only in the unpacked copy.
-  the rows of checks.tsv: a row of the implementer account runs through jig
-    run-check and must exit 0. For a row of another account, the copy of its exit
+  the rows of checks.tsv: every row must have the form that jig run-check reads,
+    its cap and weight included, also a row of another account. A row of the
+    implementer account runs through jig run-check and must exit 0; a heavy row may
+    first wait there for a heavy slot of the host, and jig run-check's lines about
+    the wait are printed as they come. For a row of another account, the copy of its exit
     file, <JIG_SRV>/checks/<project>/<name>.exit with JIG_SRV /srv/jig unless set,
     must hold 0 on its first line, and on its second a -dev commit that is
     origin/<line> after a fetch, or an ancestor of it, with no change outside impl/
@@ -136,6 +139,7 @@ sys.dont_write_bytecode = True
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 
+import jig_checks  # noqa: E402
 import jig_clones  # noqa: E402
 import jig_units  # noqa: E402
 
@@ -329,10 +333,14 @@ def read_rows(dev):
     for text in lines[1:]:
         if not text.strip():
             continue
-        fields = text.split("\t")
-        if len(fields) != 4:
-            raise StepFailed(f"a row of {path} is not name, command, account, cap: {text}")
-        rows.append((fields[0], fields[2]))
+        # Every row is read by the rule of jig run-check, also a row of another account
+        # that prepare does not run, so that a malformed row stops the release here.
+        name = text.split("\t")[0]
+        try:
+            _, _, account, _, _ = jig_checks.parse_row(text)
+        except jig_checks.BadRow as problem:
+            raise StepFailed(f"the row {name} of {path} {problem}") from None
+        rows.append((name, account))
     return rows
 
 
@@ -365,14 +373,18 @@ class Prepare:
         self.log = None
         self.commit = None
 
-    def logged(self, command, cwd, capture=False, env=None):
+    def logged(self, command, cwd, capture=False, env=None, show=None):
         """Run a command with its output in the log; return the code, and the text if asked.
 
-        env replaces the environment of the command when it is given.
+        env replaces the environment of the command when it is given. show, when given,
+        is a test of a line of the output: each line that passes it is printed as it
+        comes, and the output is captured.
         """
         with open(self.log, "a", encoding="utf-8") as stream:
             stream.write(f"$ {' '.join(map(str, command))}  (in {cwd})\n")
             stream.flush()
+            if show is not None:
+                return self.streamed(command, cwd, env, stream, show)
             try:
                 result = subprocess.run([str(part) for part in command], cwd=cwd, env=env,
                                         stdin=subprocess.DEVNULL, check=False, text=True,
@@ -383,6 +395,22 @@ class Prepare:
             if capture:
                 stream.write(result.stdout)
         return result.returncode, (result.stdout if capture else "")
+
+    def streamed(self, command, cwd, env, stream, show):
+        try:
+            process = subprocess.Popen([str(part) for part in command], cwd=cwd, env=env,
+                                       stdin=subprocess.DEVNULL, text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except OSError as error:
+            raise StepFailed(f"cannot run {command[0]}: {error.strerror}") from None
+        lines = []
+        with process.stdout:
+            for line in process.stdout:
+                lines.append(line)
+                stream.write(line)
+                if show(line):
+                    print(line.rstrip("\n"), flush=True)
+        return process.wait(), "".join(lines)
 
     def make(self, cwd, *targets, wrapper=(), env=None):
         code, _ = self.logged([*wrapper, "make", *targets], cwd, env=env)
@@ -608,8 +636,10 @@ class Prepare:
                     raise StepFailed(f"the row {name} of the account {account}: {problem}")
         for name, account in rows:
             if account == self.impl_account:
+                # A heavy row may wait for a slot of the host; its wait lines show here
+                # while it waits, not only in the log.
                 code, output = self.logged([ROOT / "libexec" / "jig-run-check", self.project,
-                                            name], self.dev, capture=True)
+                                            name], self.dev, show=jig_checks.is_wait_line)
                 if code != 0:
                     raise StepFailed(f"the row {name} exited {code}: {last_line(output)}")
 

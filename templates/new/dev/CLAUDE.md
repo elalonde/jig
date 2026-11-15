@@ -134,6 +134,9 @@ rule to the code is the trace in the `-dev` repo.
 ## Checks
 
 `checks.tsv` names every check: name, command, account, time cap in seconds.
+An optional fifth column gives the weight, `heavy` or `light` (light when it is
+missing); when the host config sets `HEAVY_SLOTS`, a heavy row waits for a free
+heavy slot of the host, and the wait does not count toward its time cap.
 A unit runs every check its prompt names through `jig run-check @PROJECT@
 <name>`, which runs the row within its time cap and writes the exit code to
 `~/ws/reviews/@PROJECT@/<ID>-<name>.exit`. The unit writes the placeholders

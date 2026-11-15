@@ -4,7 +4,8 @@
 usage: jig run-check <project> <name> [<word> ...]
 
 The checks are the rows of checks.tsv at the root of the project's -dev clone, the REPO
-of the conf file: name, command, account, time cap in seconds. The command is a shell
+of the conf file: name, command, account, time cap in seconds, and an optional fifth
+column, the weight, heavy or light; a row without it is light. The command is a shell
 command line; it runs with sh -c in that root, with the words after <name> quoted and
 appended, so that a unit can narrow a check to the parts it touched.
 
@@ -32,6 +33,22 @@ run is removed first, and the new one is written by a rename, as the exit file i
 the copy cannot be written, the exit file is still written, the reason goes to stderr,
 and this exits 1 whatever the check's code was, since the result did not reach its
 reader.
+
+A heavy row first takes a heavy slot of the host, when the host config sets
+HEAVY_SLOTS (lib/jig_checks.py says how the slots work). When every slot is held, this
+prints one line on stderr that names the holder of each slot, waits until one is free,
+and prints one line with the slot it took and the seconds it waited. The wait has no
+limit of its own, and later runs may take a freed slot first. The time cap counts from
+the start of the command, after the wait, and the head commit for the copy is read
+after it too, so that the copy names the tree the command ran on. A row that waited
+gets a line with the wait before the wall line of its output. A light row never waits.
+
+The slot is held for the whole run of the command. When this process gets SIGTERM,
+SIGHUP or SIGINT while the command runs, it kills the command's process group first
+and then exits with 128 plus the signal number, so that the slot is free only once
+the command is gone; otherwise a closed tmux session would leave a heavy command
+running while another took its slot. SIGKILL cannot be caught: after it, the command
+runs on, unlimited, while its slot is free.
 """
 
 import os
@@ -46,6 +63,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
+import jig_checks  # noqa: E402
 import jig_ids  # noqa: E402
 import jig_units  # noqa: E402
 
@@ -64,6 +82,21 @@ SRV_ROOT = "/srv/jig"
 DEFAULT_IMPL_ACCOUNT = "implementer"
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
 TERMS_ROW = "terms"
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+class Stopped(Exception):
+    """A signal asked this run to stop; it carries the signal number."""
+
+
+def on_signal(signum, _frame):
+    raise Stopped(signum)
+
+
+def ignore_stop_signals():
+    """Let no second signal cut short the kill of the command's group."""
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
 
 
 def unit_id(project):
@@ -85,38 +118,43 @@ def unit_id(project):
 
 
 def read_row(repo, name):
-    """Return the command, account and cap of the checks.tsv row of that name, or refuse."""
+    """Return the command, account, cap and weight of the checks.tsv row of that name."""
     path = pathlib.Path(repo) / "checks.tsv"
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as error:
         jig_units.refuse("row", f"cannot read {path}: {error.strerror}")
     for line in lines[1:]:
-        fields = line.split("\t")
-        if fields[0] != name:
+        if line.split("\t")[0] != name:
             continue
-        if len(fields) != 4 or not fields[3].isdigit() or int(fields[3]) == 0:
-            jig_units.refuse("row", f"the row {name} of {path} is not "
-                                    f"name, command, account, cap in seconds")
-        return fields[1], fields[2], int(fields[3])
+        try:
+            _, command, account, cap, weight = jig_checks.parse_row(line)
+        except jig_checks.BadRow as problem:
+            jig_units.refuse("row", f"the row {name} of {path} {problem}")
+        return command, account, cap, weight
     jig_units.refuse("row", f"{path} has no row {name}")
     return None
 
 
-def run(command, repo, output, cap):
+def run(command, repo, output, cap, env=None):
     """Run the command in its own process group; return its exit code and wall seconds."""
     started = time.monotonic()
     with open(output, "wb") as stream:
         process = subprocess.Popen(["sh", "-c", command], cwd=repo, stdin=subprocess.DEVNULL,
-                                   stdout=stream, stderr=subprocess.STDOUT,
+                                   stdout=stream, stderr=subprocess.STDOUT, env=env,
                                    start_new_session=True)
         try:
             code = process.wait(timeout=cap)
         except subprocess.TimeoutExpired:
             # The group holds every process the command started, so none outlives the cap
             # and keeps writing to the output or holding a lock.
+            ignore_stop_signals()
             kill_group(process)
             code = TIMED_OUT
+        except Stopped:
+            ignore_stop_signals()
+            kill_group(process)
+            raise
     wall = time.monotonic() - started
     # A signal shows as a negative code; the shell's 128 + signal is what a reader expects.
     return (128 - code if code < 0 else code), wall
@@ -139,13 +177,16 @@ def kill_group(process):
     process.wait()
 
 
-def add_wall_line(output, wall):
+def add_wall_line(output, wall, waited=None):
+    """End the output with the wall time, after the wait for a slot when there was one."""
     with open(output, "rb+") as stream:
         stream.seek(0, os.SEEK_END)
         if stream.tell() > 0:
             stream.seek(-1, os.SEEK_END)
             if stream.read(1) != b"\n":
                 stream.write(b"\n")
+        if waited is not None:
+            stream.write(f"wait: {round(waited)}s\n".encode())
         stream.write(f"wall: {round(wall)}s\n".encode())
 
 
@@ -188,7 +229,7 @@ def run_check(project, name, words):
     unit = unit_id(project)
     conf = jig_units.read_conf(project)
     repo = conf["REPO"]
-    command, account, cap = read_row(repo, name)
+    command, account, cap, weight = read_row(repo, name)
     current = pwd.getpwuid(os.getuid()).pw_name
     allowed = {account}
     if name == TERMS_ROW:
@@ -210,6 +251,18 @@ def run_check(project, name, words):
     except OSError as error:
         jig_units.refuse("reviews", f"cannot prepare {reviews}: {error.strerror}")
 
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, on_signal)
+    slot, waited, env = None, None, None
+    if weight == jig_checks.HEAVY:
+        try:
+            slot, waited = jig_checks.take(project, unit, name, say)
+        except jig_checks.SlotError as error:
+            jig_units.refuse("slot", str(error))
+        if slot is not None:
+            # A heavy row inside the command runs at once: this run holds its slot.
+            env = dict(os.environ, **{jig_checks.HELD: str(slot.number)})
+
     copy, commit = None, None
     if account != (conf.get("IMPL_ACCOUNT") or DEFAULT_IMPL_ACCOUNT):
         root = pathlib.Path(os.environ.get("JIG_SRV") or SRV_ROOT)
@@ -222,8 +275,10 @@ def run_check(project, name, words):
         except OSError:
             pass
 
-    code, wall = run(command, repo, output, cap)
-    add_wall_line(output, wall)
+    code, wall = run(command, repo, output, cap, env)
+    if slot is not None:
+        slot.release()
+    add_wall_line(output, wall, waited)
     write_exit(exit_file, code)
     print(f"jig run-check: {name} exited {code} in {round(wall)}s; output in {output}")
     if copy is None:
@@ -236,6 +291,10 @@ def run_check(project, name, words):
     return code
 
 
+def say(text):
+    print(f"jig run-check: {text}", file=sys.stderr, flush=True)
+
+
 def main(argv):
     if len(argv) < 2 or not jig_units.PROJECT.fullmatch(argv[0]) \
             or not CHECK_NAME.fullmatch(argv[1]):
@@ -246,6 +305,10 @@ def main(argv):
     except jig_units.Refused as error:
         print(f"jig run-check: {error}", file=sys.stderr)
         return 1
+    except Stopped as stopped:
+        signum = stopped.args[0]
+        print(f"jig run-check: stopped by {signal.Signals(signum).name}", file=sys.stderr)
+        return 128 + signum
 
 
 if __name__ == "__main__":

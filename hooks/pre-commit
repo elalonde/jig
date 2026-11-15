@@ -5,12 +5,18 @@
 
 The term check looks for the project's private terms, the lines of terms.txt, in
 the product. The -dev clone of a product clone named demo is demo-dev beside it,
-and no other place counts. The check is the row "terms" of checks.tsv at the root of that -dev clone: name,
-command, account and time cap in seconds, separated by tabs. This hook runs the
-row's command with sh -c from that root and refuses the commit when the command
-does not exit 0, when it runs past its cap, or when there is no such row. The
-check names the place of each match and never the term, so its output is safe
-to show here.
+and no other place counts. The check is the row "terms" of checks.tsv at the root of
+that -dev clone: name, command, account, time cap in seconds, and an optional weight,
+heavy or light, separated by tabs. This hook runs the row's command with sh -c from
+that root and refuses the commit when the command does not exit 0, when it runs past
+its cap, or when there is no such row. The check names the place of each match and
+never the term, so its output is safe to show here.
+
+When the row is heavy and the host config sets HEAVY_SLOTS, the hook first takes a
+heavy slot of the host, as jig run-check does, and waits while every slot is held;
+the cap counts from the start of the command, after the wait. On SIGTERM, SIGHUP or
+SIGINT while the command runs, it kills the command's group before it exits, so that
+the slot is free only once the command is gone.
 
 jig start and jig new replace or remove a hook only when its second line is the
 marker line, so a project's own pre-commit hook is never lost.
@@ -18,15 +24,51 @@ marker line, so a project's own pre-commit hook is never lost.
 The hook is a single file with no import from jig's tree, because jig start
 copies it into clones of accounts that cannot read that tree. So dev_clone below
 writes again the rule of lib/jig_clones.py, and tests/test_clones.py runs the same
-layouts on both.
+layouts on both. In the same way parse_row and the slot code write again those of
+lib/jig_checks.py, which explains the slots, and tests/test_jig_checks.py runs the
+same rows on both parses.
 """
 
+import datetime
+import fcntl
 import os
+import pathlib
+import pwd
+import re
 import signal
 import subprocess
 import sys
+import time
 
 ROW = "terms"
+HEAVY = "heavy"
+LIGHT = "light"
+SHAPE = ("is not name, command, account, cap in seconds, and an optional weight, "
+         "heavy or light")
+WHOLE_NUMBER = re.compile(r"[0-9]+")
+SLOTS_KEY = "HEAVY_SLOTS"
+HELD = "JIG_HEAVY_SLOT"
+DENIED_POLLS = 3
+HOLDER_FIELDS = 6
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+# A unit's tmux session is <project>-<role>-<ID>, as jig run-check reads it.
+SESSION_NAME = re.compile(r".+-(?:spec|impl|rev)-(?P<id>[a-z0-9]{1,6})")
+
+
+class BadRow(Exception):
+    """A row of checks.tsv is malformed; the message says how, after the row's name."""
+
+
+class SlotError(Exception):
+    """A heavy slot cannot be taken; the message names the file or the key."""
+
+
+class Stopped(Exception):
+    """A signal asked the hook to stop; it carries the signal number."""
+
+
+def on_signal(signum, _frame):
+    raise Stopped(signum)
 
 
 def git(*args, env=None):
@@ -57,8 +99,21 @@ def dev_clone(product):
     return beside if os.path.isdir(beside) else None
 
 
+def parse_row(line):
+    """Return name, command, account, cap and weight of one row, or raise BadRow."""
+    fields = line.split("\t")
+    if len(fields) not in (4, 5) or not WHOLE_NUMBER.fullmatch(fields[3]) \
+            or int(fields[3]) == 0:
+        raise BadRow(SHAPE)
+    weight = fields[4] if len(fields) == 5 else ""
+    if weight not in ("", HEAVY, LIGHT):
+        raise BadRow(f"has the weight {weight!r}; the weight is heavy or light, "
+                     f"or empty for light")
+    return fields[0], fields[1], fields[2], int(fields[3]), weight or LIGHT
+
+
 def read_row(dev):
-    """Return the command and the cap of the row, or None and the reason it is unusable."""
+    """Return the command, cap and weight of the row, or None and why it is unusable."""
     path = os.path.join(dev, "checks.tsv")
     try:
         with open(path, encoding="utf-8") as stream:
@@ -67,13 +122,190 @@ def read_row(dev):
         return None, f"cannot read {path}: {getattr(error, 'strerror', None) or error}"
     # The first line names the columns.
     for line in lines[1:]:
-        fields = line.split("\t")
-        if fields[0] != ROW:
+        if line.split("\t")[0] != ROW:
             continue
-        if len(fields) != 4 or not fields[3].isdigit() or int(fields[3]) == 0:
-            return None, f"the row {ROW} of {path} is not name, command, account, cap in seconds"
-        return (fields[1], int(fields[3])), None
+        try:
+            _, command, _, cap, weight = parse_row(line)
+        except BadRow as problem:
+            return None, f"the row {ROW} of {path} {problem}"
+        return (command, cap, weight), None
     return None, f"{path} has no row {ROW}, so the term check cannot run"
+
+
+def heavy_slots():
+    """Return HEAVY_SLOTS of host.conf, or None for no limit, as jig_checks reads it."""
+    path = pathlib.Path(os.environ.get("JIG_SRV") or "/srv/jig") / "host.conf"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as error:
+        raise SlotError(f"cannot read {path}: {getattr(error, 'strerror', None) or error}") \
+            from None
+    value = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, found = line.split("=", 1)
+            if key.strip() == SLOTS_KEY:
+                value = found.strip()
+    if value is None:
+        return None
+    if not WHOLE_NUMBER.fullmatch(value) or int(value) == 0:
+        raise SlotError(f"{path}: {SLOTS_KEY}={value!r} is not a whole number of 1 or more")
+    return int(value)
+
+
+def poll_seconds():
+    text = os.environ.get("JIG_HEAVY_POLL")
+    if not text:
+        return 5.0
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = 0
+    if not seconds > 0:
+        raise SlotError(f"JIG_HEAVY_POLL={text!r} is not a number of seconds above 0")
+    return seconds
+
+
+def make_dir(path):
+    """Make the slot directory when it is missing; set its mode only when made here."""
+    try:
+        os.mkdir(path, 0o2775)
+    except FileExistsError:
+        return
+    except OSError as error:
+        raise SlotError(f"cannot make {path}: {error.strerror}") from None
+    try:
+        os.chmod(path, 0o2775)
+    except OSError as error:
+        raise SlotError(f"cannot set the mode of {path}: {error.strerror}") from None
+
+
+def owner(path):
+    try:
+        uid = os.stat(path).st_uid
+    except OSError:
+        return "?"
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def try_slot(path):
+    """Return a descriptor that holds the slot's lock, or None when it is held."""
+    # No O_TRUNC: a waiter that opens a held slot must not erase its holder's line.
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o664)
+    try:
+        if os.fstat(descriptor).st_uid == os.getuid():
+            # The other accounts of the host share the file; only the owner may chmod.
+            os.fchmod(descriptor, 0o664)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def unit_name(env):
+    """Return the unit ID from the tmux session name, the whole name, or "-" outside tmux."""
+    if not env.get("TMUX"):
+        return "-"
+    shown = subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True,
+                           text=True, env=env, stdin=subprocess.DEVNULL, check=False)
+    session = shown.stdout.strip()
+    if shown.returncode != 0 or not session:
+        return "-"
+    match = SESSION_NAME.fullmatch(session)
+    return match["id"] if match else session
+
+
+def holder_line(dev, env):
+    """Return who holds the slot: project, unit, row, account, start time and pid."""
+    name = os.path.basename(os.path.realpath(dev))
+    project = name[:-len("-dev")] if name.endswith("-dev") else name
+    fields = (project, unit_name(env), ROW, pwd.getpwuid(os.getuid()).pw_name,
+              datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+              str(os.getpid()))
+    return "\t".join(field or "-" for field in fields) + "\n"
+
+
+def describe(path):
+    """Return project, unit and row of the slot's holder from its text, or "?"."""
+    try:
+        with open(path, encoding="utf-8") as stream:
+            fields = stream.readline().rstrip("\n").split("\t")
+    except (OSError, UnicodeDecodeError):
+        return "?"
+    if len(fields) != HOLDER_FIELDS or not all(fields[:3]):
+        return "?"
+    return f"project {fields[0]}, unit {fields[1]}, row {fields[2]}"
+
+
+def say(text):
+    print(f"jig pre-commit hook: {text}", file=sys.stderr, flush=True)
+
+
+def take_slot(dev, env):
+    """Return the number of a free heavy slot, held, waiting while every slot is held.
+
+    Return None when there is no limit or this process tree already holds a slot. The
+    lock lasts until the hook exits.
+    """
+    if env.get(HELD):
+        return None
+    count = heavy_slots()
+    if count is None:
+        return None
+    poll = poll_seconds()
+    directory = pathlib.Path(env.get("JIG_HEAVY_DIR") or "/run/jig/heavy")
+    make_dir(directory)
+    line = holder_line(dev, env)
+    denied = {}
+    started = time.monotonic()
+    waited = False
+    while True:
+        for number in range(1, count + 1):
+            path = directory / str(number)
+            try:
+                descriptor = try_slot(path)
+            except PermissionError:
+                denied[number] = denied.get(number, 0) + 1
+                if denied[number] > DENIED_POLLS:
+                    raise SlotError(f"cannot open {path}, a file of {owner(path)}, after "
+                                    f"{DENIED_POLLS} more tries") from None
+                continue
+            except OSError as error:
+                raise SlotError(f"cannot take {path}: {error.strerror}") from None
+            if descriptor is None:
+                denied.pop(number, None)
+                continue
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, line.encode("utf-8"))
+            if waited:
+                say(f"took heavy slot {number} after {round(time.monotonic() - started)} s")
+            return number
+        if not waited:
+            held = "; ".join(f"slot {number}: {describe(directory / str(number))}"
+                             for number in range(1, count + 1))
+            say(f"every heavy slot is held, waiting: {held}")
+            waited = True
+        time.sleep(poll)
+
+
+def kill_group(process):
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def run_check(command, dev, env, cap):
@@ -83,12 +315,11 @@ def run_check(command, dev, env, cap):
     try:
         return process.wait(timeout=cap)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        kill_group(process)
         return None
+    except Stopped:
+        kill_group(process)
+        raise
 
 
 def main():
@@ -103,8 +334,21 @@ def main():
     row, problem = read_row(dev)
     if problem:
         return refuse(problem)
-    command, cap = row
-    code = run_check(command, dev, env, cap)
+    command, cap, weight = row
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, on_signal)
+    try:
+        if weight == HEAVY:
+            try:
+                slot = take_slot(dev, env)
+            except SlotError as error:
+                return refuse(str(error))
+            if slot is not None:
+                env = dict(env, **{HELD: str(slot)})
+        code = run_check(command, dev, env, cap)
+    except Stopped as stopped:
+        refuse(f"stopped by {signal.Signals(stopped.args[0]).name}")
+        return 128 + stopped.args[0]
     if code is None:
         return refuse(f"the term check ran past its cap of {cap} s")
     if code != 0:
