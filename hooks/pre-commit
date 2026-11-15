@@ -4,10 +4,8 @@
 """Refuse a commit to the product while the project's term check does not pass.
 
 The term check looks for the project's private terms, the lines of terms.txt, in
-the product. The -dev clone of a product clone named demo is demo-dev beside it;
-releases of jig before 0.6 put the product clone inside its -dev clone instead, as
-demo-dev/demo, and that place counts only when nothing sits beside the clone. The
-check is the row "terms" of checks.tsv at the root of that -dev clone: name,
+the product. The -dev clone of a product clone named demo is demo-dev beside it,
+and no other place counts. The check is the row "terms" of checks.tsv at the root of that -dev clone: name,
 command, account and time cap in seconds, separated by tabs. This hook runs the
 row's command with sh -c from that root and refuses the commit when the command
 does not exit 0, when it runs past its cap, or when there is no such row. The
@@ -56,11 +54,7 @@ def dev_clone(product):
     product = os.path.realpath(product)
     parent, name = os.path.split(product)
     beside = os.path.join(parent, name + "-dev")
-    if os.path.isdir(beside):
-        return beside
-    if os.path.basename(parent) == name + "-dev":
-        return parent
-    return None
+    return beside if os.path.isdir(beside) else None
 
 
 def read_row(dev):
