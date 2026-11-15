@@ -5,6 +5,154 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.7.0
+
+What changed: `jig start` now sets `core.hooksPath` of a product clone to
+`hooks` when the product tracks files in `hooks/` and no git config scope sets
+the value yet. Such a product's own `make check` sets the same value at its
+first run, and from then on git no longer runs a hook in `.git/hooks`, so a hook
+that `jig start` had put there would stop the term check before a commit
+without a word. The value is set in the local config of the clone before the
+hook path is read; a value from any scope stays as it is, and a refused start
+keeps the value it set. A pre-commit hook at the hook path that the product
+tracks belongs to the product: `jig start` leaves it alone, writes no hook there
+and adds nothing to the exclude file. An untracked hook there that is not jig's
+is refused, as before.
+
+`jig wait <project> <ID> --expected <minutes>` gives a running unit a new
+expected time. It puts the minutes, a whole number above 0, into the file
+beside the unit's lock in the place of the old value, then waits as without the
+option. Every wait that already runs reads the file again at each poll, so the
+timeout, three times the expected time since the session started, moves for
+them too, and a running `jig batch` follows the new value with no change of its
+own. The file is written whole under another name and then renamed, with mode
+664, so a reader never sees half a value; a file that holds no valid value keeps
+the last one. With `--expected` and no lock for the unit, `jig wait` refuses and
+writes nothing, even when the report is already on origin.
+
+The product clone inside the `-dev` clone, the place of the releases before
+0.6, is no longer found by any tool, by jig's pre-commit hook or by the
+dispatcher `jig`. `other_clone` in `lib/jig_clones.py` looks only beside the
+clone, the hook looks for the `-dev` clone only beside the product clone, and the
+dispatcher takes the project from a product clone only when its `-dev` clone is
+beside it. A product clone left inside a `-dev` directory still runs the
+version that project pins, because the dispatcher takes the project from the
+`-dev` directory that holds the working directory first.
+
+Heavy checks: a row of `checks.tsv` may have an optional fifth column, its
+weight, `heavy` or `light`; a row with 4 fields, or with an empty fifth field,
+is light. Several projects share one host, and a heavy row, such as a full
+build with every test, uses all of its cores; when too many run at once, each
+runs slower and can pass its time cap with correct code. So the host config
+`/srv/jig/host.conf` may set `HEAVY_SLOTS`, the number of heavy rows that may run
+at once on the host; with no such key there is no limit. A heavy row in
+`jig run-check` first takes a free slot, one of the files `1` to `<n>` in the slot
+directory `/run/jig/heavy`, by an exclusive lock that the kernel frees when the
+process ends, however it ends. While every slot is held it prints one line that
+names the project, unit and row of each holder, tries again every 5 seconds, and
+prints the slot it took after the wait. The wait does not count toward the
+row's time cap: the cap starts when the command starts, and the output gains a
+line `wait: <n>s` before the wall line. A command that runs while its process
+tree holds a slot gets `JIG_HEAVY_SLOT` in its environment, and a heavy row
+inside it runs at once, since waiting for a slot that its own tree holds would
+wait for ever. A host config that exists but cannot be read, and a value of
+`HEAVY_SLOTS` that is not a whole number of 1 or more, refuse a heavy row with one
+line; a light row does not read the host config.
+
+`jig run-check` now handles SIGTERM, SIGHUP and SIGINT for every row, light or
+heavy: it ends the whole process group of the command, frees its slot and exits
+128 plus the signal number. A stopped run writes no exit file, because it has no
+result. jig's pre-commit hook does the same for its term check: a heavy `terms`
+row waits for a slot there too, and a signal while it waits stops the hook
+without a slot. The hook keeps its own copy of the row reader and the slot
+code, because it cannot import from jig's tree; one set of tests runs on both.
+
+`jig release prepare` now reads every row of `checks.tsv` with the same reader as
+`jig run-check`, cap and weight included, also a row of another account: a bad
+cap on a row of any account now refuses, where 0.6.0 checked only the rows of
+the implementer account. A heavy row may wait for a slot during prepare, and the
+lines about the wait are printed as they come.
+
+`jig new` refuses a lone product clone, one with no `-dev` clone beside it, with
+one line that now also says how to recover: when a stopped `jig new` left it,
+remove it and run `jig new` again.
+
+Files and formats: new: `lib/jig_checks.py`, the row reader of `checks.tsv` and
+the slot code. New formats: the optional fifth column of `checks.tsv`; the key
+`HEAVY_SLOTS` in `/srv/jig/host.conf`; the slot directory `/run/jig/heavy`, mode
+2775 with the group `jig` and no sticky bit, which the first heavy run makes when
+it is missing, and its slot files, mode 664, each with one tab-separated line of
+its last holder: project, unit, row, account, start and process ID; the
+environment variable `JIG_HEAVY_SLOT`. Changed: the output of `jig run-check`
+(the wait lines and the line `wait: <n>s`) and its exit codes on a signal; the
+file of the expected minutes beside a unit's lock, which `jig wait` now
+rewrites, mode 664. Changed files: `bin/jig`, `hooks/pre-commit`,
+`lib/jig_clones.py`, `lib/jig_units.py`, `jig-new`, `jig-privacy`,
+`jig-recompute`, `jig-release`, `jig-report`, `jig-run-check`,
+`jig-start-worker`, `jig-terms`, `jig-trace`, `jig-upgrade` and `jig-wait`,
+`README.md`, the `Makefile`, and the template `CLAUDE.md` of the `-dev` clone of
+`jig new`, whose section "Checks" has one new sentence on the weight column and
+the heavy slots. The formats of the conf files, reports and the trace are
+unchanged.
+
+Migration: a host and its projects move from 0.6.0 to 0.7.0 in this order, and
+no unit of a project runs before its first `jig start` on 0.7.0. A project still
+on 0.5.1 or earlier first takes the steps of the 0.6.0 entry.
+
+1. Before the upgrade, check in every account that the clones of each project
+   are siblings, the product clone `<project>` beside `<project>-dev` and not
+   inside it. 0.7.0 no longer finds a product clone inside the `-dev` clone, so
+   a project whose clones are still nested stops working with it. Move such
+   clones first, with the move and the `-dev` commit of the 0.6.0 Migration.
+2. As the orchestrator account, run `jig upgrade 0.7.0`. It installs 0.7.0
+   under `/opt/jig/0.7.0/` and points `/opt/jig/current` to it.
+3. For each project, run `jig upgrade <project> 0.7.0` as the orchestrator
+   account. It sets `JIG_VERSION=0.7.0` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.7.0`.
+4. Before the first `jig start` of a project on 0.7.0, run
+   `git ls-files -- hooks/` and `git config core.hooksPath` in the product
+   clone of each worker account. When the first prints a path and the second
+   prints nothing, that start sets `core.hooksPath` to `hooks`, and git then runs
+   the pre-commit hook in `hooks/` of the product clone, not the one in
+   `.git/hooks`. If the product tracks `hooks/pre-commit`, that file is the
+   product's, `jig start` writes no hook, and jig's term check before a commit
+   runs only if the product's own hook runs it; if an untracked pre-commit hook
+   that is not jig's sits there, the start is refused. Decide what each clone
+   needs from that result before the start.
+5. Take the new sentence of the section "Checks" of the template `CLAUDE.md`,
+   `/opt/jig/0.7.0/templates/new/dev/CLAUDE.md`, into the common part of the
+   project's `CLAUDE.md`, in one `-dev` commit, pushed. A project made before
+   0.7.0 does not get it by itself, and a unit that meets a waiting row should
+   find the rule in its own `CLAUDE.md`.
+6. A product that holds a copy of `lib/jig_clones.py`, which `jig new` or the
+   0.6.0 Migration put there, takes the file
+   `/opt/jig/0.7.0/lib/jig_clones.py` in its next product commit, with its
+   ledger entry, so that no copy still looks at the nested place. Nothing breaks
+   before that: the copy only finds `terms.txt` for lint A, and the place beside
+   wins there.
+7. Add the fifth column to a row of `checks.tsv` only after every account of
+   the host runs 0.7.0 for that project, each worker account has had a
+   `jig start` on 0.7.0, which writes the 0.7.0 hook into its product clone, and
+   the project's own tools that read `checks.tsv` accept a fifth field. 0.6.0
+   refuses a row with 5 fields in `jig run-check`, `jig release` and the hook, so
+   a weight column added too early makes every check refuse.
+8. Optional, for a host: set `HEAVY_SLOTS=<n>` in `/srv/jig/host.conf`, a whole
+   number of 1 or more, and add the line `d /run/jig/heavy 2775 root jig -` to
+   the tmpfiles config of jig, `/etc/tmpfiles.d/jig.conf`, so that the slot
+   directory exists from boot with the group `jig`; it has no sticky bit, so
+   that an account can open a slot file that another account made. Check that
+   `/srv/jig/host.conf` can be read by every role account, because a host config
+   that cannot be read refuses every heavy row.
+9. Run a heavy row as a background command in a unit, not as a foreground tool
+   call, because its wait for a slot has no limit and a foreground call can time
+   out. A heavy `terms` row makes every commit wait behind the full builds of the
+   host, so keep that row light.
+
+Requested by: Eric; the heavy checks: a feature request of another project.
+
+Units: 2 minor, 2 patch, 4 none
+
 ## 0.6.0
 
 What changed: the two clones of a project in an account, the product clone and
