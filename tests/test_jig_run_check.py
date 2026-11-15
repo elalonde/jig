@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 
-from tests.support import ROOT, TempTestCase, run
+from tests.support import ROOT, TempTestCase, group_members, run
 
 sys.path.insert(0, str(ROOT / "lib"))
 
@@ -353,22 +353,6 @@ class RunCheckTermsTest(RunCheckCase):
         result = self.in_session("jig-spec-demo", "jig", "terms")
         self.assert_refused(result)
         self.assertIn("the-implementer", result[2])
-
-
-def group_members(group):
-    """Return the processes of a process group that still run, zombies left out."""
-    members = []
-    for entry in pathlib.Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat = (entry / "stat").read_text(encoding="utf-8")
-        except OSError:
-            continue
-        fields = stat.rsplit(")", 1)[1].split()
-        if fields[0] != "Z" and int(fields[2]) == group:
-            members.append(int(entry.name))
-    return members
 
 
 class RunCheckHeavyCase(RunCheckCase):

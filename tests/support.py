@@ -202,6 +202,22 @@ def push_kickoff(env, work, number, text, annotated=True):
     git_ok(env, "-C", work, "push", "-q", "origin", "master", f"refs/tags/{tag}")
 
 
+def group_members(group):
+    """Return the processes of a process group that still run, zombies left out."""
+    members = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        if fields[0] != "Z" and int(fields[2]) == group:
+            members.append(int(entry.name))
+    return members
+
+
 class TempTestCase(unittest.TestCase):
     """A test with a private directory and a HOME of its own inside it."""
 

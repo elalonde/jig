@@ -1,12 +1,16 @@
 import os
 import pathlib
+import pwd
 import shutil
+import signal
+import subprocess
 import sys
 import threading
+import time
 import unittest
 
 from tests import clone_cases
-from tests.support import ROOT, TempTestCase, run
+from tests.support import ROOT, TempTestCase, group_members, run
 
 sys.path.insert(0, str(ROOT / "lib"))
 
@@ -16,6 +20,11 @@ HOOK = ROOT / "hooks" / "pre-commit"
 HEADER = "name\tcommand\taccount\tcap_seconds"
 # What the real term check prints for a match: the place, and never the term.
 PLACE = "demo/notes.txt:3: terms.txt line 1"
+ACCOUNT = pwd.getpwuid(os.getuid()).pw_name
+# The line that another run leaves in a slot it holds.
+HOLDER = "other\tab12\tbuild\tsomeone\t-\t1\n"
+# A check that keeps running until it is stopped, and says where its group is.
+LONG = "echo $$ > sh.pid; sleep 30 & echo $! > child.pid; wait"
 
 
 class PreCommitCase(TempTestCase):
@@ -158,19 +167,149 @@ class PreCommitHeavyTest(PreCommitCase):
 
     def env(self, **extra):
         if self.srv_dir is not None:
-            extra.update(JIG_SRV=str(self.srv_dir), JIG_HEAVY_DIR=str(self.heavy),
-                         JIG_HEAVY_POLL="0.1")
+            extra.update(JIG_SRV=str(self.srv_dir), JIG_HEAVY_DIR=str(self.heavy))
+            extra.setdefault("JIG_HEAVY_POLL", "0.1")
         return super().env(**extra)
 
     def hold(self, seconds):
-        """Hold the only slot from this process, and let it go after that many seconds."""
+        """Hold the only slot from this process, and let it go after that many seconds.
+
+        The result lets it go at once.
+        """
         slot = jig_checks.Slot(1, jig_checks.try_slot(self.heavy / "1"))
         self.assertIsNotNone(slot.descriptor)
         self.addCleanup(slot.release)
-        os.write(slot.descriptor, b"other\tab12\tbuild\tsomeone\t-\t1\n")
+        os.write(slot.descriptor, HOLDER.encode("utf-8"))
         timer = threading.Timer(seconds, slot.release)
         timer.start()
         self.addCleanup(timer.cancel)
+        return slot.release
+
+    def start(self, **extra):
+        """Start the hook in the product clone, as git does, and return at once.
+
+        What the hook says goes to a file, so that the test can read it while the hook
+        still runs.
+        """
+        self.said_file = self.tmp / "hook.err"
+        stream = open(self.said_file, "w", encoding="utf-8")
+        self.addCleanup(stream.close)
+        hook = subprocess.Popen([HOOK], cwd=self.product, env=self.env(**extra),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=stream)
+        self.addCleanup(self.end, hook)
+        return hook
+
+    def end(self, hook):
+        """Leave no hook running after a failed test."""
+        if hook.poll() is None:
+            hook.kill()
+            hook.wait()
+
+    def said(self):
+        return self.said_file.read_text(encoding="utf-8")
+
+    def wait_until(self, ready, what):
+        for _ in range(200):
+            if ready():
+                return
+            time.sleep(0.05)
+        self.fail(f"{what} did not happen; the hook said: {self.said()!r}")
+
+    def assert_slot_free(self):
+        descriptor = jig_checks.try_slot(self.heavy / "1")
+        self.assertIsNotNone(descriptor, "the slot is still held")
+        os.close(descriptor)
+
+    def test_sigterm_while_a_heavy_term_check_runs_ends_its_group_and_frees_the_slot(self):
+        # The hook gets SIGTERM while the check and its child sleep: it kills their
+        # group, refuses the commit with 128 plus the signal, and the slot is free at
+        # once for the next run.
+        self.write_rows(("terms", LONG, "implementer", "60", "heavy"))
+        hook = self.start()
+        child = self.dev / "child.pid"
+        self.wait_until(lambda: child.exists() and child.read_text().strip(), "the check")
+        group = int((self.dev / "sh.pid").read_text(encoding="utf-8"))
+        hook.send_signal(signal.SIGTERM)
+        self.assertEqual(hook.wait(timeout=20), 143, self.said())
+        self.assertEqual(group_members(group), [])
+        self.assertIn("stopped by SIGTERM; the commit is refused", self.said())
+        self.assert_slot_free()
+
+    def test_sigterm_while_the_hook_waits_for_a_slot_stops_it_without_a_slot(self):
+        # The only slot is held for longer than the test runs. SIGTERM during the wait
+        # ends the hook with 143; the check never ran, and the holder's line is still in
+        # the slot, so the hook never took it.
+        self.write_rows(("terms", "echo ran > ran.txt", "implementer", "60", "heavy"))
+        release = self.hold(30)
+        hook = self.start()
+        self.wait_until(lambda: "every heavy slot is held" in self.said(), "the wait")
+        hook.send_signal(signal.SIGTERM)
+        self.assertEqual(hook.wait(timeout=20), 143, self.said())
+        self.assertIn("stopped by SIGTERM; the commit is refused", self.said())
+        self.assertFalse((self.dev / "ran.txt").exists())
+        release()
+        self.assertEqual((self.heavy / "1").read_text(encoding="utf-8"), HOLDER)
+        self.assert_slot_free()
+
+    def test_a_heavy_term_check_inside_a_heavy_row_runs_while_the_slot_is_held(self):
+        # The variable says that the process tree around the hook already holds a slot,
+        # as for a commit made by the command of a heavy row: the hook does not wait for
+        # the slot that its own tree holds, and says nothing about slots.
+        self.write_rows(("terms", "echo ran > ran.txt", "implementer", "60", "heavy"))
+        self.hold(5)
+        began = time.monotonic()
+        hook = self.start(JIG_HEAVY_SLOT="1")
+        self.assertEqual(hook.wait(timeout=20), 0, self.said())
+        self.assertLess(time.monotonic() - began, 3)
+        self.assertTrue((self.dev / "ran.txt").exists())
+        self.assertNotIn("slot", self.said())
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a file of any mode")
+    def test_a_slot_file_that_cannot_be_opened_is_refused_after_three_more_polls(self):
+        # The slot file allows no one to open it, as one of another account without
+        # group write would. The hook tries again at each of the next three polls of
+        # 0.2 s, then refuses the commit with a line that names the file and its owner.
+        path = self.heavy / "1"
+        path.write_text("", encoding="utf-8")
+        path.chmod(0)
+        self.write_rows(("terms", "echo ran > ran.txt", "implementer", "60", "heavy"))
+        began = time.monotonic()
+        hook = self.start(JIG_HEAVY_POLL="0.2")
+        self.assertEqual(hook.wait(timeout=20), 1, self.said())
+        self.assertGreaterEqual(time.monotonic() - began, 0.6)
+        self.assertIn(f"cannot open {path}, a file of {ACCOUNT}, after 3 more tries; "
+                      "the commit is refused", self.said())
+        self.assertFalse((self.dev / "ran.txt").exists())
+
+    def test_a_number_of_slots_that_is_not_a_whole_number_of_1_or_more_is_refused(self):
+        self.write_rows(("terms", "echo ran > ran.txt", "implementer", "60", "heavy"))
+        conf = self.srv_dir / "host.conf"
+        for value in ("0", "two"):
+            with self.subTest(value):
+                conf.write_text(f"HEAVY_SLOTS={value}\n", encoding="utf-8")
+                hook = self.start()
+                self.assertEqual(hook.wait(timeout=20), 1, self.said())
+                self.assertIn(f"{conf}: HEAVY_SLOTS='{value}' is not a whole number of 1 "
+                              "or more; the commit is refused", self.said())
+                self.assertFalse((self.dev / "ran.txt").exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file of any mode")
+    def test_an_unreadable_host_conf_refuses_a_heavy_term_check_and_not_a_light_one(self):
+        # host.conf exists and this account cannot read it: the heavy check cannot
+        # know the host's limit, so the commit is refused with a line that names the
+        # file; a light check never reads it and runs.
+        conf = self.srv_dir / "host.conf"
+        conf.chmod(0)
+        self.write_rows(("terms", "echo ran > ran.txt", "implementer", "60", "heavy"))
+        hook = self.start()
+        self.assertEqual(hook.wait(timeout=20), 1, self.said())
+        self.assertIn(f"cannot read {conf}", self.said())
+        self.assertFalse((self.dev / "ran.txt").exists())
+        self.write_rows(("terms", "echo ran > ran.txt", "implementer", "60", "light"))
+        hook = self.start()
+        self.assertEqual(hook.wait(timeout=20), 0, self.said())
+        self.assertTrue((self.dev / "ran.txt").exists())
 
     def test_a_heavy_term_check_waits_for_the_slot_and_its_cap_counts_after(self):
         # The slot is held for about 1.5 s and the row's cap is one second: the hook
