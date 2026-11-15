@@ -1081,17 +1081,107 @@ class StartHookTest(StartCase):
         self.assertFalse(self.lock().exists())
         self.assertEqual(list(shared.iterdir()), [])
 
+    def exclude_bytes(self):
+        exclude = self.product / ".git" / "info" / "exclude"
+        return exclude.read_bytes() if exclude.exists() else None
+
     def test_start_leaves_a_hook_path_that_the_product_tracks(self):
         # The product keeps its own pre-commit hook in its tree: jig start neither
-        # refuses it nor writes over it, and adds no exclude line for it.
+        # refuses it nor writes over it, and the exclude file stays byte for byte.
         hook = self.use_hooks_path()
         hook.parent.mkdir()
         hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         hook.chmod(0o755)
         self.git_commit_all(self.product)
+        exclude = self.exclude_bytes()
         self.assertEqual(self.start().returncode, 0)
         self.assertEqual(hook.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
-        self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 0)
+        self.assertEqual(self.exclude_bytes(), exclude)
+
+    def test_start_keeps_a_tracked_hook_with_the_marker_on_a_line_without_the_row(self):
+        # jig's own product tracks jig's hook, marker included. On a line whose
+        # checks.tsv has no row terms, jig start would remove its hook, but this file
+        # belongs to the product: it stays, the exclude file stays, and the start runs.
+        self.set_terms_row(False)
+        hook = self.use_hooks_path()
+        hook.parent.mkdir()
+        shutil.copy2(HOOK, hook)
+        self.git_commit_all(self.product)
+        exclude = self.exclude_bytes()
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_jigs_hook(hook)
+        self.assertEqual(self.exclude_bytes(), exclude)
+        self.assertEqual(self.ok(["git", "-C", self.product, "status", "--porcelain"]), "")
+
+    def track_hooks_dir(self):
+        """Commit a file under hooks/ other than pre-commit, as a product with its own
+        hooks directory has, and set no core.hooksPath."""
+        (self.product / "hooks").mkdir()
+        (self.product / "hooks" / "commit-msg").write_text("#!/bin/sh\nexit 0\n",
+                                                           encoding="utf-8")
+        self.git_commit_all(self.product)
+        return self.product / "hooks" / "pre-commit"
+
+    def hooks_path(self, *scope):
+        result = run(["git", "-C", self.product, "config", *scope, "core.hooksPath"],
+                     env=self.base_env(HOME=str(self.worker_home)))
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def test_start_sets_the_hooks_path_of_a_product_that_tracks_hooks(self):
+        # The product tracks hooks/ and nothing sets core.hooksPath: jig start sets it
+        # to hooks, so the hook goes where git looks after the product's first make
+        # check, with its exclude line, and nothing goes into .git/hooks.
+        hook = self.track_hooks_dir()
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.hooks_path("--local"), "hooks")
+        self.assert_jigs_hook(hook)
+        self.assertFalse(self.default_hook().exists())
+        self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 1)
+
+    def test_start_keeps_a_hooks_path_that_is_already_set(self):
+        # The product tracks hooks/, but the clone names another hooks directory: jig
+        # start keeps that value and installs the hook there.
+        self.track_hooks_dir()
+        self.ok(["git", "-C", self.product, "config", "--local", "core.hooksPath",
+                 "githooks"])
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.hooks_path("--local"), "githooks")
+        self.assert_jigs_hook(self.product / "githooks" / "pre-commit")
+        self.assertFalse((self.product / "hooks" / "pre-commit").exists())
+
+    def test_start_keeps_a_global_hooks_path_outside_the_clone_and_refuses(self):
+        # The worker's global git config names an absolute hooks directory. That is a
+        # value, so jig start sets no local one, and the check stage refuses the path
+        # outside the clone before the lock, writing nothing there.
+        self.track_hooks_dir()
+        shared = self.tmp / "shared-hooks"
+        (self.worker_home / ".gitconfig").write_text(
+            f"[core]\n\thooksPath = {shared}\n", encoding="utf-8")
+        result = self.start()
+        self.assert_refused(result, "hook")
+        self.assertIn(str(shared / "pre-commit"), result.stderr)
+        self.assertIsNone(self.hooks_path("--local"))
+        self.assertFalse(self.lock().exists())
+        self.assertFalse(shared.exists())
+
+    def test_start_sets_the_hooks_path_and_then_refuses_another_hook_there(self):
+        # After jig start sets core.hooksPath, the hook path is hooks/pre-commit, where
+        # an untracked hook without the marker waits. The check stage refuses it,
+        # before the start line and the lock, and leaves the file. The value stays
+        # set: it is the one the product's own make check would set anyway.
+        hook = self.track_hooks_dir()
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        subjects = self.origin_subjects()
+        result = self.start()
+        self.assert_refused(result, "hook")
+        self.assertIn(str(hook), result.stderr)
+        self.assertFalse(self.lock().exists())
+        self.assertEqual(self.origin_subjects(), subjects)
+        self.assertEqual(hook.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+        self.assertEqual(self.hooks_path("--local"), "hooks")
 
     def test_start_removes_its_hook_without_the_row_and_keeps_the_exclude_line(self):
         # A line of the -dev repo without the term check: jig's hook goes, so that the

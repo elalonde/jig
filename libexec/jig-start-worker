@@ -46,7 +46,10 @@ holds the row terms, the launch writes the hook, and adds its path to
 the hook never becomes a product file. Without that row, the launch removes jig's
 hook, so that a unit on a line without the term check can still commit, and leaves
 the exclude line. A hook path that git tracks in the product clone belongs to the
-product, and is left as it is.
+product, and is left as it is. When the product tracks files in hooks/ and git has
+no core.hooksPath in any scope, the check stage first sets core.hooksPath to hooks in
+the product clone, since the product's own make check sets it too and git then no
+longer runs a hook in .git/hooks. A start that a later check refuses keeps that value.
 Exits 1 on a refusal, naming what refused on stderr; 2 on a usage error.
 """
 
@@ -410,6 +413,29 @@ def foreign_hook(product):
     return path, relative
 
 
+def set_hooks_path(product):
+    """Set core.hooksPath of the product clone to hooks when the product tracks files in
+    hooks/ and git has no value for core.hooksPath in any scope.
+
+    Such a product's own make check sets that value at its first run, and from then on
+    git no longer runs a hook in .git/hooks: a hook placed there before would stop the
+    term check without a word. So the value is set before the hook path is read. A value
+    from any scope stays as it is, also an absolute one from the global config, which
+    the hook check then refuses.
+    """
+    if product is None or not is_clone(product):
+        return
+    # git config exits 1 when no scope has the key; any other code leaves the clone as
+    # it is, and the hook check reports what is wrong with it.
+    if git(product, "config", "core.hooksPath").returncode != 1:
+        return
+    if not git_out(product, "ls-files", "--", "hooks/"):
+        return
+    result = git(product, "config", "--local", "core.hooksPath", "hooks")
+    if result.returncode != 0:
+        refuse("hook", f"cannot set core.hooksPath of {product}: {last_line(result)}")
+
+
 def check_hook(product):
     if product is not None and is_clone(product):
         foreign_hook(product)
@@ -610,7 +636,9 @@ def check(args, conf, session):
     check_session(session)
     check_account(conf, args.role, args.account)
     check_clone(conf, [*args.tag, *([args.approved_tag] if args.approved_tag else [])])
-    check_hook(product_clone(conf))
+    product = product_clone(conf)
+    set_hooks_path(product)
+    check_hook(product)
     if args.role == "impl" and not args.approved_tag:
         refuse("tag", "an implementer unit needs a spec tag for its approved worktree")
 
