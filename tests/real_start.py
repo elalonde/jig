@@ -253,10 +253,10 @@ class FixtureProjectCase(unittest.TestCase):
     as a product has before its first make check: the start sets core.hooksPath to
     hooks. PRODUCT_HOOKS names the files the product tracks there.
 
-    The product clone is inside the -dev clone, the place of the releases before 0.6.
-    A case with IN_HOME true puts the two clones side by side in ~/ws/src instead, where
-    the role's list of directories names the product clone; it refuses to start when
-    one of those places exists, and removes them at its end.
+    The two clones sit side by side in that directory under /tmp. A case with IN_HOME
+    true puts them side by side in ~/ws/src instead, where the role's list of
+    directories names the product clone; it refuses to start when one of those places
+    exists, and removes them at its end.
     """
 
     IN_HOME = False
@@ -290,14 +290,13 @@ class FixtureProjectCase(unittest.TestCase):
             self.dev, self.product = HOOK_HOME_CLONES[0], HOOK_HOME_CLONES[1]
         else:
             self.dev = self.base / f"{HOOK_PROJECT}-dev"
-            self.product = self.dev / HOOK_PROJECT
+            self.product = self.base / HOOK_PROJECT
         for origin in (dev_origin, product_origin):
             self.git("init", "-q", "--bare", "-b", "master", str(origin))
         self.git("init", "-q", "-b", "master", str(self.seed))
         self.git("-C", str(self.seed), "remote", "add", "origin", str(dev_origin))
-        # The -dev clone ignores the local settings that the start writes, and the product.
-        (self.seed / ".gitignore").write_text(f".claude/settings.local.json\n/{HOOK_PROJECT}/\n",
-                                              encoding="utf-8")
+        # The -dev clone ignores the local settings that the start writes.
+        (self.seed / ".gitignore").write_text(".claude/settings.local.json\n", encoding="utf-8")
         self.push_checks(terms=True)
         self.git("-C", str(self.seed), "tag", HOOK_TAG)
         self.git("-C", str(self.seed), "push", "-q", "origin", HOOK_TAG)

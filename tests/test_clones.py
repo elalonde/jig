@@ -55,12 +55,17 @@ class LintATermsTest(TempTestCase):
     def test_lint_a_reads_the_terms_of_the_dev_clone_of_each_shared_layout(self):
         # With no LINT_TERMS, lint A of a product clone reads terms.txt of the -dev
         # clone the rule finds, and refuses the planted term in the product. With no
-        # -dev clone it fails on the missing file, at the place beside the product.
+        # -dev clone beside the product, it fails on the missing file at the place
+        # beside it, also when a -dev clone around the product holds the term.
         for number, case in enumerate(clone_cases.FROM_PRODUCT):
             with self.subTest(case=case.name):
                 base = clone_cases.build(self.tmp / f"case{number}", case.layout)
                 product = self.plant(base, case)
-                place = (base / (case.expected or clone_cases.DEV)).resolve() / "terms.txt"
+                if case.expected is None:
+                    dev = product.parent / f"{product.name}-dev"
+                else:
+                    dev = base / case.expected
+                place = dev.resolve() / "terms.txt"
                 self.assertEqual(lint_a.terms_place(product), place)
                 env = self.env()
                 self.assertNotIn("LINT_TERMS", env)

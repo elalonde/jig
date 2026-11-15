@@ -264,8 +264,8 @@ class MirrorTest(TraceCase):
         self.assert_fails_with("trace/src/tool.py.json: the product has no file src/tool.py")
 
     def test_no_product_clone_fails_with_one_line(self):
-        # The -dev clone holds a trace but no product clone, beside it or inside it, to
-        # check it against; the one line names the place beside it.
+        # The -dev clone holds a trace but no product clone beside it to check it
+        # against; the one line names the place beside it.
         dev = self.tmp / "lone-dev"
         self.write(dev / "specs/ids.tsv", ID_CLASSES)
         self.write(dev / "specs/jig-spec.md", SPEC_TEXT)
@@ -285,11 +285,12 @@ class ProductPlaceTest(TraceCase):
         self.product.rename(inside)
         self.product = inside
 
-    def test_a_product_clone_inside_the_dev_clone_is_checked_when_none_is_beside_it(self):
-        # The place of the releases before 0.6: with nothing beside the -dev clone, the
-        # clone inside it is the product, and its trace passes.
+    def test_a_product_clone_inside_the_dev_clone_is_not_checked(self):
+        # The only product clone is a copy inside the -dev clone, where nothing looks:
+        # the check fails with the one line that names the missing place beside it.
         self.move_inside()
-        self.assert_passes()
+        beside = self.dev.resolve().parent / "demo"
+        self.assert_fails_with(f"demo-dev: no product clone at {beside}")
 
     def test_gen_reads_the_clone_beside_when_one_is_inside_too(self):
         # Both places hold a clone, and only the file of the clone beside it has a

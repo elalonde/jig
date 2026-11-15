@@ -977,20 +977,13 @@ class StartConfTest(StartCase):
 
 
 class StartHookTest(StartCase):
-    """The worker's -dev clone holds a product clone, and origin may hold the row terms.
-
-    The product clone is inside the -dev clone, at the place of the releases before
-    0.6, which jig start still uses while nothing is beside the -dev clone.
-    """
+    """The worker's -dev clone has a product clone beside it, and origin may hold the row terms."""
 
     def setUp(self):
         super().setUp()
-        # The -dev clone ignores its nested product clone, as a real one does.
-        (self.seed / ".gitignore").write_text(".claude/settings.local.json\n/jig/\n",
-                                              encoding="utf-8")
         self.set_terms_row(True)
         self.ok(["git", "-C", self.worker_clone, "pull", "-q", "--ff-only", "origin", "master"])
-        self.product = self.git_init(self.worker_clone / "jig")
+        self.product = self.git_init(self.worker_clone.parent / "jig")
         (self.product / "README").write_text("the product\n", encoding="utf-8")
         self.git_commit_all(self.product)
 
@@ -1221,13 +1214,17 @@ class StartHookTest(StartCase):
         self.assert_jigs_hook(self.default_hook())
 
     def test_start_installs_the_hook_in_the_product_clone_beside_and_not_inside(self):
-        # The account has a product clone beside the -dev clone and a leftover one
-        # inside it: jig start installs the hook in the clone beside it only.
-        beside = self.git_init(self.worker_home / "ws" / "src" / "jig")
+        # The account has the product clone beside the -dev clone and a leftover copy
+        # inside it, which the -dev clone ignores: jig start installs the hook in the
+        # clone beside it, and leaves the copy without one.
+        leftover = self.git_init(self.worker_clone / "jig")
+        with open(self.worker_clone / ".git" / "info" / "exclude", "a", encoding="utf-8") \
+                as stream:
+            stream.write("/jig/\n")
         result = self.start()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_jigs_hook(beside / ".git" / "hooks" / "pre-commit")
-        self.assertFalse(self.default_hook().exists())
+        self.assert_jigs_hook(self.default_hook())
+        self.assertFalse((leftover / ".git" / "hooks" / "pre-commit").exists())
 
 
 if __name__ == "__main__":

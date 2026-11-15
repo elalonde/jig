@@ -46,10 +46,9 @@ project_from_dev() {
 
 # Print the project of the nearest product clone around the working directory:
 # the nearest directory that has a -dev clone. The product clone of demo has the
-# -dev clone demo-dev beside it. Releases before 0.6 kept the product clone inside
-# its -dev clone instead, as demo-dev/demo; that place counts only when nothing
-# sits beside it. This is the rule of lib/jig_clones.py, written again here
-# because this script picks the tree that holds that module.
+# -dev clone demo-dev beside it, and no other place counts. This is the rule of
+# lib/jig_clones.py, written again here because this script picks the tree that
+# holds that module.
 project_from_product() {
     local dir base parent
     dir=$(pwd -P 2>/dev/null) || return 0
@@ -57,7 +56,7 @@ project_from_product() {
         base=${dir##*/}
         parent=${dir%/*}
         if is_project "$base" && [[ "$base" != *-dev ]]; then
-            if [ -d "$parent/$base-dev" ] || [ "${parent##*/}" = "$base-dev" ]; then
+            if [ -d "$parent/$base-dev" ]; then
                 printf '%s' "$base"
                 return 0
             fi

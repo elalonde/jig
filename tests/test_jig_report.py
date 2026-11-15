@@ -23,7 +23,7 @@ def report_text(commits="none", checks="none", context="none", status="OK: done"
 
 
 class ReportCase(StartCase):
-    """The fixtures of jig start, with a product repo nested in the orchestrator's clone.
+    """The fixtures of jig start, with a product clone beside the orchestrator's -dev clone.
 
     A unit is begun by its start commit alone: jig report needs no live session.
     """
@@ -39,13 +39,13 @@ class ReportCase(StartCase):
         self.git_commit_all(self.product_seed)
         self.ok(["git", "-C", self.product_seed, "push", "-q", "origin", "master"])
         self.product_head = self.ok(["git", "-C", self.product_seed, "rev-parse", "HEAD"])
-        self.product = self.orch_clone / "jig"
+        self.product = self.orch_clone.parent / "jig"
         self.ok(["git", "clone", "-q", "-b", "master", self.product_origin, self.product])
         self.ctx_dir = self.tmp / "ctx"
         self.ctx_dir.mkdir()
         self.reviews = self.worker_home / "ws" / "reviews" / "jig"
         self.reviews.mkdir(parents=True)
-        self.push_files({"checks.tsv": CHECKS_TSV, ".gitignore": "jig/\n"}, "checks")
+        self.push_files({"checks.tsv": CHECKS_TSV}, "checks")
 
     def push_files(self, files, subject):
         """Commit files from the seed clone and push them, as another account would."""

@@ -72,14 +72,16 @@ class DispatcherTest(TempTestCase):
     def test_dispatcher_takes_the_project_from_the_dev_directory(self):
         self.two_versions()
         self.pin("demo", "JIG_VERSION=0.1.0\n")
-        inside = self.tmp / "ws" / "demo-dev" / "demo" / "deep"
+        inside = self.tmp / "ws" / "demo-dev" / "specs" / "deep"
         inside.mkdir(parents=True)
         self.assert_runs(self.jig("probe", cwd=inside), "0.1.0")
 
     def test_dispatcher_takes_the_project_of_each_shared_layout(self):
         # demo is pinned to the older version. From a product clone, or from deep in
         # one, the dispatcher takes the project of the -dev clone that the rule finds,
-        # and runs the pin; with no -dev clone it runs current.
+        # and runs the pin; with no -dev clone it runs current. A clone inside the -dev
+        # clone demo-dev is still a directory of demo-dev, so there the project comes
+        # from that -dev directory, which the dispatcher asks about before the rule.
         self.two_versions()
         self.pin(clone_cases.PROJECT, "JIG_VERSION=0.1.0\n")
         cases = (*clone_cases.FROM_PRODUCT, *clone_cases.DEEP_CASES)
@@ -88,7 +90,8 @@ class DispatcherTest(TempTestCase):
                 base = clone_cases.build(self.tmp / "cases" / f"case{number}", case.layout)
                 inside = base / case.start
                 inside.mkdir(parents=True, exist_ok=True)
-                expected = "0.2.0" if case.expected is None else "0.1.0"
+                in_dev = case.start.startswith(f"{clone_cases.DEV}/")
+                expected = "0.2.0" if case.expected is None and not in_dev else "0.1.0"
                 self.assert_runs(self.jig("probe", cwd=inside), expected)
 
     def test_dispatcher_argument_wins_over_the_dev_directory(self):
