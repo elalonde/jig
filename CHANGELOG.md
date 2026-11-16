@@ -5,6 +5,39 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.8.1
+
+What changed: the screen reader of the supervisor loop, `jig orch`, now takes
+the top rule of Claude Code's input box as a rule also when Claude Code draws
+the session name into it, as it does for a session started with
+`--remote-control`, which every `jig orch` session is. In 0.8.0 it did not, so
+the loop wrote `idle` into `orch/activity` while the orchestrator session ran a
+turn, a project that waited on it with `wait-on` got a stall line and never a
+resumed line, and the reader of the input box fell back to the last lines of
+the screen.
+
+Files and formats: changed file: `lib/jig_tmux.py`. The formats of
+`orch/activity`, `orch/waits` and `orch/events.log` are unchanged.
+
+Migration: a host and its projects move from 0.8.0 to 0.8.1 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.8.1`. It installs 0.8.1
+   under `/opt/jig/0.8.1/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.8.1` as the orchestrator
+   account. It sets `JIG_VERSION=0.8.1` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.8.1`.
+3. Restart each project's orchestrator loop, so that it loads the fixed screen
+   reader: let the session finish its step, then, from a shell of the
+   orchestrator account outside the session, run `jig orch <project> stop` and
+   then `jig orch <project> start`. A loop that is not restarted keeps the 0.8.0
+   reader. After the start, `jig orch <project> status` shows `busy` on its
+   activity line while the session runs a turn.
+
+Requested by: none; found in the use of 0.8.0.
+
+Units: 0 minor, 1 patch, 1 none
+
 ## 0.8.0
 
 What changed: the supervisor loop of each orchestrator, `jig orch`, now writes
