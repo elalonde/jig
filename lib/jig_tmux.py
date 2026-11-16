@@ -27,6 +27,12 @@ DIALOG_POLLS = 2
 
 # The input box lies between the last two rules of the screen: lines of this character.
 RULE = "─"
+# Claude Code draws the name of a session started with --remote-control into the top
+# rule, near its right end, as "───── demo-orch ─". So a rule is a run of at least three
+# rule characters, optionally followed by one word with a space on each side and at
+# least one more rule character. A reader that took only plain rules would find one rule
+# on such a screen, and so neither the box nor a running turn above it.
+RULE_LINE = re.compile(f"{RULE}{{3,}}(?: \\S+ {RULE}+)?")
 # Claude Code can show a long text as this marker in the box instead of the text.
 PASTED = "[Pasted text"
 
@@ -77,8 +83,7 @@ def literal(text):
 
 
 def is_rule(line):
-    text = line.strip()
-    return len(text) >= 3 and set(text) == {RULE}
+    return RULE_LINE.fullmatch(line.strip()) is not None
 
 
 def input_box(screen):

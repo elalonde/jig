@@ -42,6 +42,13 @@ def screen(*lines):
     return "\n".join(["● ready", *lines, "", RULE, "❯ ", RULE, BAR]) + "\n"
 
 
+def labeled_screen(*lines, box="❯ "):
+    """The screen of a session started with --remote-control: its name sits near the
+    right end of the top rule of the input box, which holds box."""
+    top = "─" * 190 + " demo-orch ─"
+    return "\n".join(["● ready", *lines, "", top, box, "─" * 202, BAR]) + "\n"
+
+
 def at(minutes):
     """A fixed clock: minutes after 2026-03-02 10:00 local time."""
     start = datetime.datetime(2026, 3, 2, 10, 0).astimezone()
@@ -79,6 +86,44 @@ class TestActivityState(unittest.TestCase):
         self.assertEqual(orch.activity_state(False, True, 0, screen(RUNNING)), "busy")
         self.assertEqual(orch.activity_state(False, True, 0, screen(DONE_LINE)), "idle")
         self.assertEqual(orch.activity_state(False, True, 0, None), "idle")
+
+
+class TestRuleWithSessionName(unittest.TestCase):
+    """The top rule of the input box can carry the session's name; the box, the running
+    turn and the activity state are still read from the two rules around the box."""
+
+    def test_rule_with_a_name_and_a_plain_rule_are_rules(self):
+        # A rule with one name in it, and a rule alone with blanks around it, are rules.
+        self.assertTrue(orch.jig_tmux.is_rule("─" * 190 + " demo-orch ─"))
+        self.assertTrue(orch.jig_tmux.is_rule("  " + "─" * 200 + "  "))
+
+    def test_rule_glyphs_in_a_sentence_two_names_or_other_glyphs_are_no_rule(self):
+        # Rule glyphs inside a longer sentence, a rule with two names in it, and a line
+        # of another box glyph are no rule, so ordinary screen text never bounds the box.
+        jig_tmux = orch.jig_tmux
+        self.assertFalse(jig_tmux.is_rule("the box ends at " + "─" * 20 + " and then the bar"))
+        self.assertFalse(jig_tmux.is_rule("─" * 90 + " demo-orch " + "─" * 90 + " demo ─"))
+        self.assertFalse(jig_tmux.is_rule("━" * 200))
+        self.assertFalse(jig_tmux.is_rule("═" * 90 + " demo-orch ═"))
+
+    def test_spinner_line_above_a_box_with_a_named_rule_is_a_running_turn(self):
+        # The spinner line just above the box reads as a running turn, and the done line
+        # left after the turn does not.
+        self.assertTrue(orch.jig_tmux.running_turn(labeled_screen(RUNNING)))
+        self.assertFalse(orch.jig_tmux.running_turn(labeled_screen(DONE_LINE)))
+
+    def test_input_box_is_the_text_between_the_named_rule_and_the_bottom_rule(self):
+        # An empty box gives only its prompt glyph, which holds no text that a send
+        # waits to leave the box; a typed line gives that line and nothing else.
+        self.assertEqual(orch.jig_tmux.input_box(labeled_screen(RUNNING)), "❯ ")
+        typed = labeled_screen(DONE_LINE, box="❯ summarize the inbox")
+        self.assertEqual(orch.jig_tmux.input_box(typed), "❯ summarize the inbox")
+
+    def test_activity_state_with_a_named_rule(self):
+        # With the input bar on screen, the spinner line makes the state busy and the
+        # done line makes it idle.
+        self.assertEqual(orch.activity_state(False, True, 0, labeled_screen(RUNNING)), "busy")
+        self.assertEqual(orch.activity_state(False, True, 0, labeled_screen(DONE_LINE)), "idle")
 
 
 class TestUnitLock(TempTestCase):
