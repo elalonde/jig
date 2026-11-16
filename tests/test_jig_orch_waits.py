@@ -11,6 +11,7 @@ import datetime
 import fcntl
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -354,7 +355,8 @@ class TestWaitOn(WaitsTestCase):
         result = self.wait_on()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, rf"^jig orch: {PROJECT}: waits on other: idle since "
-                                        rf"{orch.stamp(since)}; waited on since \S+: a block\n$")
+                                        rf"{re.escape(orch.stamp(since))}; waited on since \S+: a "
+                                        rf"block\n$")
         (self.theirs / "activity").unlink()
         self.assertIn("waits on other: no activity file;", self.wait_on().stdout)
 
