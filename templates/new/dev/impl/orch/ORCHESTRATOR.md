@@ -121,6 +121,21 @@ change, a dialog shows, or 3 times the expected duration passes.
   escalate.
 - A dialog, or a timeout, is an escalation.
 
+## Waiting on another project
+
+When a step waits on another project of this host, say so to the supervisor:
+`jig orch @PROJECT@ wait-on <other> <what>`, with what you wait for in a few
+words. Clear it with `jig orch @PROJECT@ wait-on <other> --clear` when the
+thing arrives. While the other project sits idle or down for too long, the
+supervisor appends a line `stall: <other> ...` to the event file, and a line
+`resumed: <other> ...` when it works again.
+
+- A stall line: read the other orchestrator's screen
+  (`tmux capture-pane -p -t <other>-orch`) and the Current part of its
+  `state.md` (`~/ws/src/<other>-dev/impl/orch/state.md`), read only, and tell
+  Eric at once what blocks it and whose step it is.
+- A resumed line: nothing more.
+
 ## Running a batch
 
 `jig batch @PROJECT@ <batch file>` runs a batch. The batch file is a TSV with
@@ -204,13 +219,19 @@ the exit code.
   line wrote for this session, and its exit code says what to do next:
   - 0: go on.
   - 3, at about 250k tokens: roll over. Start no new step. Finish the step in
-    hand, write `state.md` and `handoff.md`, commit them, and exit. The
-    supervisor starts a fresh session.
-  - 4, at about 280k tokens: exit after the current tool call.
+    hand, write `state.md` and `handoff.md`, commit them, and end the session:
+    stop every background shell and the watcher, then run
+    `jig orch @PROJECT@ rollover`. The supervisor starts a fresh session.
+  - 4, at about 280k tokens: exit after the current tool call. Stop every
+    background shell and the watcher, then run `jig orch @PROJECT@ rollover`.
   - 2, no size: go on. A fresh session has none until its status line first
     writes, within about a minute. When it lasts longer, name it in the next
     hourly update.
 - Roll over also at every batch boundary, in the same way.
+- End the session only with `jig orch @PROJECT@ rollover`, never by asking
+  Eric to type `/exit`. It ends the session at once, so stop every background
+  shell and the watcher first: a shell that still runs can carry the old
+  session on beside the new one.
 - A running unit is a separate session in a worker account, and a rollover
   does not affect it. Name it in `handoff.md`.
 - A fresh session reads this file, `state.md`, `handoff.md`, the jig change

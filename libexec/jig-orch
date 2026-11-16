@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The supervisor of a project's orchestrator session.
 
-usage: jig orch <project> start | stop | status | events [--old]
+usage: jig orch <project> start | stop | status | events [--old] | rollover
+       jig orch <project> wait-on [<other> <what>... | <other> --clear]
 
   start   refuses when impl/orch/ORCHESTRATOR.md is not in the project's clone, when a
           loop already runs, or when tmux session <project>-orch exists and is not the
@@ -12,7 +13,9 @@ usage: jig orch <project> start | stop | status | events [--old]
           left as it is
   status  exit 0 when a loop runs, 3 when none does; with the state of the session's
           pane (live, dead or none), whether the session is the loop's own, and the
-          last line of its log
+          last line of its log; then a line with the activity state of the project and
+          its since, and a line for each wait: the other project, its state and since,
+          and what is waited for
   events  the session's watcher on the event file, orch/events.log: prints each line
           after the last line "start <session ID>", or from the top when there is none,
           then each new line as it is appended, and runs until it is stopped, its
@@ -21,6 +24,24 @@ usage: jig orch <project> start | stop | status | events [--old]
           prints once the events of the session before the newest one, the lines
           between the last two start lines, and exits 0; with one start line, the
           lines before it; with none, or with no file, nothing
+  rollover
+          run by the session itself to end its own Claude Code session, so that the
+          loop starts the next one as on any exit; first stop every background shell
+          of the session and its watcher. It sends SIGTERM to the pane's process only,
+          prints one line before the signal and does not wait. It refuses, and signals
+          nothing, when no loop runs, when the session is not live or not the loop's
+          own, when the pane's process does not run with the --session-id in
+          orch/session-ids, or when the caller does not run inside that pane
+  wait-on <other> <what>...
+          writes the line of <other> in orch/waits: the project waits on <other> for
+          <what>; the since of the line is kept when the line holds the same <what>.
+          It refuses when ~/ws/reviews/<other>/orch/ does not exist, and warns when
+          the activity file of <other> is missing or stale: its loop then writes
+          none, because it runs a jig older than 0.8.0 or no loop runs
+  wait-on <other> --clear
+          removes the line of <other>; exit 0 also when there was none
+  wait-on prints each wait, with the activity state of <other> and its since, or
+          "no waits"
 
   1  a refusal; 2 a usage error
 
@@ -131,11 +152,43 @@ polls) is reported at once, in one line to the tee and to the log, and never ans
 JIG_SRV names <root> (/srv/jig); JIG_ORCH_POLL the seconds between polls (5);
 JIG_ORCH_REPORT_POLL the seconds between fetches (60); JIG_ORCH_HOURLY the seconds
 between ticks (3600); JIG_ORCH_FORK_WINDOW the seconds after a restart in which the
-loop still looks for forks of the old session (60).
+loop still looks for forks of the old session (60); JIG_ORCH_ACTIVITY the seconds
+between activity polls (60); JIG_ORCH_STALL_SECONDS the stall time in seconds, in
+place of ORCH_STALL_MINUTES.
+
+Activity. Once an activity poll, the loop writes its project's state to orch/activity:
+one line of three fields split by tabs, the state, since and written, the times in
+date -Iseconds form, by a temporary file and a rename. The state is the first that
+holds of: unit, a lock in the lock directory (JIG_LOCK_DIR, /run/jig/lock) named
+<project>-<account> for an account of the conf file, younger than 3 times the
+expected minutes beside it; down, the session is not live; idle, a dialog (no input
+bar for a few polls); busy, a spinner line of a running turn just above the input box;
+idle, else. since is when the state began, kept across a restart of the loop when the
+old file holds the same state and is fresh, under 3 activity polls old. When the loop
+ends, for any reason, it writes down. A file that cannot be written is logged at most
+once an hour.
+
+Stalls. orch/waits holds a line for each project that the orchestrator waits on:
+the other project, since and what, split by tabs, written by wait-on. Once an activity
+poll the loop reads it, and for each line the activity file of the other project: a
+file that is missing, does not parse, or is older than 3 activity polls means down,
+since its written time or since the loop first saw it so. When that project has been
+idle or down for the stall time, the loop appends "stall: <other> <state> since
+<HH:MM> (waits on: <what>)", with the date before the time when it is not today. The
+stall is over when the other project runs a unit, or is busy on 3 activity polls in a
+row, so that a short turn, as one that reads an event, does not end it; the loop then
+appends "resumed: <other> <state>", and a later stall gets a new stall line. Both go
+through the queue in order, and neither is a change for the hourly tick. The loop
+keeps what it sent in memory only, so a restarted loop can append the stall line of
+the same stall once more; a cleared wait gets no further line. The stall time is
+ORCH_STALL_MINUTES of <root>/host.conf, a whole number of 1 or more, or 15; a bad
+value, or a file that cannot be read, is logged at the loop's start and gives 15. A
+waits file or activity file that does not parse is logged at most once an hour.
 
 Files, under ~/ws/reviews/<project>/: orch/events.log (the event file), orch/supervisor.log,
 orch/loop.lock (the pid of the loop), orch/session-ids (the tmux session ID and the
 Claude Code session ID of the session the loop started last, on one line), orch/announced, orch/reported, orch/reminded,
+orch/activity, orch/waits,
 orch/fetch.err (the error output of the last fetch), out/orch.txt (the tee),
 transcripts/orch/<run>/. In the project's clone: the idle lines in impl/orch/updates.log.
 """
@@ -153,6 +206,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -210,6 +264,35 @@ class FileMark:
     def __init__(self, path, inode, mtime):
         self.path, self.inode, self.mtime = path, inode, mtime
 
+
+class QuietMark:
+    """The mark of a stall or resumed line: it goes into no record, and it is no change
+    for the hourly tick, because the turn that it starts already tells the news."""
+
+    __slots__ = ()
+
+
+QUIET = QuietMark()
+
+# The activity file and the waits file, under orch/. Each holds lines of tab-separated
+# fields, and each is written whole into a temporary file that a rename puts in place.
+ACTIVITY_FILE = "activity"
+WAITS_FILE = "waits"
+ACTIVITY_SECONDS = 60.0
+# The activity states, in the order the loop tests them.
+STATES = ("unit", "down", "idle", "busy")
+# An activity file older than this many activity polls has no loop that writes it.
+STALE_POLLS = 3
+# A unit's lock older than this many times its expected minutes is the lock of a unit
+# that died: jig wait gives up on a unit at the same age.
+LOCK_FACTOR = 3
+# The host config key of the stall time, its default, and the busy polls that end a stall.
+STALL_KEY = "ORCH_STALL_MINUTES"
+STALL_MINUTES = 15
+RESUME_POLLS = 3
+# A problem that would repeat at every activity poll goes to the log once in this time.
+PROBLEM_SECONDS = 3600.0
+
 # A session that exits this often within the window stops the loop.
 QUICK_EXITS = 3
 QUICK_WINDOW_SECONDS = 600
@@ -223,7 +306,8 @@ STOP_WAIT_SECONDS = 30.0
 END_WAIT_SECONDS = 10.0
 # One line about the session's only pane, its fields split by tabs; the start command,
 # last, can hold blanks.
-PANE_FORMAT = "#{session_id}\t#{pane_dead}\t#{pane_pid}\t#{pane_pipe}\t#{pane_start_command}"
+PANE_FORMAT = ("#{session_id}\t#{pane_dead}\t#{pane_pid}\t#{pane_pipe}\t#{pane_id}\t"
+               "#{socket_path}\t#{pane_start_command}")
 # The Claude Code session ID in the pane's start command. The command is nested in
 # bash -lc, and in sg for a member of the session group, so it is found by its pattern
 # and not by splitting the command into words.
@@ -233,10 +317,11 @@ CLAUDE_ID = re.compile(r"--session-id\s+([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]
 class Pane:
     """The pane of the orchestrator's tmux session, as tmux shows it at one moment."""
 
-    __slots__ = ("session_id", "dead", "pid", "piped", "command")
+    __slots__ = ("session_id", "dead", "pid", "piped", "pane_id", "socket", "command")
 
     def __init__(self, line):
-        session_id, dead, pid, piped, self.command = line.split("\t", 4)
+        session_id, dead, pid, piped, self.pane_id, self.socket, self.command = \
+            line.split("\t", 6)
         self.session_id, self.dead, self.pid = session_id, dead == "1", int(pid)
         self.piped = piped == "1"
 
@@ -373,6 +458,301 @@ def try_lock(path):
     return descriptor
 
 
+# The activity file, the waits file and the stall lines. Each loop writes its project's
+# state to its activity file; an orchestrator names in its waits file the projects it
+# waits on; the loop reads their activity files and appends a stall line when one of
+# them has sat idle or down too long. All orchestrators run in one account, so each
+# loop can read the orch/ directory of every other project.
+
+def orch_dir(project):
+    return pathlib.Path.home() / "ws" / "reviews" / project / "orch"
+
+
+def stamp(moment):
+    return moment.astimezone().replace(microsecond=0).isoformat()
+
+
+def parse_stamp(text):
+    """Return the time of a text in date -Iseconds form, or None; a time without its
+    offset is refused, because it cannot be compared with now."""
+    try:
+        moment = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else None
+
+
+def clock(moment, now):
+    """The local time of day of a moment, with its date when that is not today."""
+    local = moment.astimezone()
+    return local.strftime("%H:%M" if local.date() == now.astimezone().date()
+                          else "%Y-%m-%d %H:%M")
+
+
+def write_whole(path, text):
+    """Write the file into a temporary file beside it and rename that over the old one,
+    so that a reader in another loop sees the old text or the new, never a part."""
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.chmod(name, 0o644)
+        os.replace(name, path)
+    except BaseException:
+        pathlib.Path(name).unlink(missing_ok=True)
+        raise
+
+
+def parse_activity(text):
+    """Return (state, since, written) of an activity file's text, or None when it is
+    not one line of a known state and two times."""
+    if text.count("\n") != 1 or not text.endswith("\n"):
+        return None
+    fields = text[:-1].split("\t")
+    if len(fields) != 3 or fields[0] not in STATES:
+        return None
+    since, written = parse_stamp(fields[1]), parse_stamp(fields[2])
+    if since is None or written is None:
+        return None
+    return fields[0], since, written
+
+
+def read_activity(path):
+    """Return (activity, problem): the parsed file and None, or None and "missing" or
+    "unparsed"."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, UnicodeDecodeError):
+        return None, "unparsed"
+    activity = parse_activity(text)
+    return (activity, None) if activity else (None, "unparsed")
+
+
+def kept_since(old, state, now, poll):
+    """Return the since of the state written now: the old since while the state stays
+    the same. A loop that starts again keeps the since of the old file only when that
+    file is fresh; an older file, as one that a killed loop left, starts a new since."""
+    if old is not None and old[0] == state \
+            and (now - old[2]).total_seconds() <= STALE_POLLS * poll:
+        return old[1]
+    return now
+
+
+def unit_running(conf, project, now):
+    """Say whether a project-account lock of the project names a unit that still runs.
+
+    Only the exact lock names of the accounts in the conf file count: a pattern would
+    also match the locks of a project whose name starts with this one, and the files of
+    expected minutes beside the locks. A lock older than LOCK_FACTOR times its expected
+    minutes is taken as the lock of a dead unit, so that an orchestrator that sits idle
+    beside it can still stall; without an expected time, or a start time that can be
+    read, the lock alone counts.
+    """
+    names = conf.get("ORCH_ACCOUNT", "").split() + jig_units.accounts(conf)
+    for account in dict.fromkeys(names):
+        lock = worker.lock_path(project, account)
+        if not lock.is_file():
+            continue
+        start = jig_units._parse_start(jig_units._read_lock(lock).get("start"))
+        expected = jig_units.read_expected(lock)
+        if start is None or expected is None \
+                or (now - start).total_seconds() < LOCK_FACTOR * expected * 60:
+            return True
+    return False
+
+
+def activity_state(unit, live, no_bar, screen):
+    """Return the activity state, from the facts the loop has at one poll.
+
+    no_bar is the count of polls in a row without the input bar. A dialog is idle even
+    with a spinner line above it: nobody answers it, and the stall line then brings the
+    orchestrator that waits, which reads the screen.
+    """
+    if unit:
+        return "unit"
+    if not live:
+        return "down"
+    if no_bar >= jig_tmux.DIALOG_POLLS:
+        return "idle"
+    if screen is not None and jig_tmux.running_turn(screen):
+        return "busy"
+    return "idle"
+
+
+def parse_waits(text):
+    """Return the lines of a waits file as (other, since text, what), and the count of
+    lines that do not parse, which are left out."""
+    waits, bad = [], 0
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 3 and jig_units.PROJECT.fullmatch(fields[0]) \
+                and parse_stamp(fields[1]) and fields[2].strip():
+            waits.append(tuple(fields))
+        elif line.strip():
+            bad += 1
+    return waits, bad
+
+
+def describe(found, now, poll):
+    """Say in words the activity of a project, from read_activity of its file."""
+    activity, problem = found
+    if activity is None:
+        return "no activity file" if problem == "missing" \
+            else "no activity file that can be read"
+    state, since, written = activity
+    if (now - written).total_seconds() > STALE_POLLS * poll:
+        return f"no activity file since {stamp(written)}"
+    return f"{state} since {stamp(since)}"
+
+
+def wait_lines(project, now, poll):
+    """Return one line for each wait of the project, with the activity of the other."""
+    try:
+        text = (orch_dir(project) / WAITS_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    waits, _ = parse_waits(text)
+    lines = []
+    for other, since, what in waits:
+        shown = describe(read_activity(orch_dir(other) / ACTIVITY_FILE), now, poll)
+        lines.append(f"waits on {other}: {shown}; waited on since {since}: {what}")
+    return lines
+
+
+class Watch:
+    """One wait as the loop follows it: whether its project stalled, the busy polls in a
+    row since then, and the since of each stall already sent."""
+
+    __slots__ = ("stalled", "busy", "sent")
+
+    def __init__(self):
+        self.stalled, self.busy, self.sent = False, 0, set()
+
+
+class Stalls:
+    """Which of the projects waited on stalled, and when each stall ended.
+
+    It keeps what it sent in memory only: a loop that starts again can send the stall
+    line of the same stall once more.
+    """
+
+    def __init__(self, stall_seconds, poll):
+        self.stall_seconds, self.poll = stall_seconds, poll
+        # A wait is the other project and the since of its line, so that a new wait-on
+        # with another text is a new wait, and a cleared wait is forgotten.
+        self.watches = {}
+        # When the loop first saw an activity file missing or unreadable, by project.
+        self.missing = {}
+
+    def state_of(self, other, found, now):
+        """Return the state and since of the other project as this loop sees it.
+
+        A missing or unreadable file, or one that its loop has not written for
+        STALE_POLLS polls, means that no loop of that project runs: down, since the
+        file was last written or since this loop first saw it so.
+        """
+        activity, problem = found
+        if activity is None:
+            seen = self.missing.get(other)
+            if seen is None or seen[0] != problem:
+                seen = self.missing[other] = (problem, now)
+            return "down", seen[1]
+        self.missing.pop(other, None)
+        state, since, written = activity
+        if (now - written).total_seconds() > STALE_POLLS * self.poll:
+            return "down", written
+        return state, since
+
+    def step(self, waits, read, now):
+        """Return the stall and resumed lines of one activity poll.
+
+        waits holds the lines of the waits file; read(other) returns read_activity of
+        the other project's file. A stall is over only when the other project runs a
+        unit, or is busy on RESUME_POLLS polls in a row: a short turn, as one that only
+        reads an event, leaves it, so two projects that wait on each other do not wake
+        each other in turn.
+        """
+        lines, current = [], set()
+        for other, waited_since, what in waits:
+            key = (other, waited_since)
+            current.add(key)
+            watch = self.watches.setdefault(key, Watch())
+            state, since = self.state_of(other, read(other), now)
+            if watch.stalled:
+                watch.busy = watch.busy + 1 if state == "busy" else 0
+                if state == "unit" or watch.busy >= RESUME_POLLS:
+                    watch.stalled = False
+                    lines.append(f"resumed: {other} {state}")
+            elif state in ("idle", "down") and since not in watch.sent \
+                    and (now - since).total_seconds() >= self.stall_seconds:
+                watch.stalled, watch.busy = True, 0
+                watch.sent.add(since)
+                lines.append(f"stall: {other} {state} since {clock(since, now)} "
+                             f"(waits on: {what})")
+        for key in set(self.watches) - current:
+            del self.watches[key]
+        return lines
+
+
+def stall_time(srv):
+    """Return the stall time in seconds from host.conf, and a problem to log or None.
+
+    host.conf holds one KEY=value per line, with spaces allowed around the =, and a line
+    that starts with # is a comment, as jig run-check reads it. A missing file or key
+    gives the default; a file that cannot be read, or a value that is not a whole
+    number of 1 or more, gives the default and a problem, so that the loop still runs.
+    """
+    path = srv / "host.conf"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return STALL_MINUTES * 60.0, None
+    except (OSError, UnicodeDecodeError) as error:
+        return STALL_MINUTES * 60.0, (f"cannot read {path}: "
+                                      f"{getattr(error, 'strerror', None) or error}")
+    value = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, found = line.split("=", 1)
+            if key.strip() == STALL_KEY:
+                value = found.strip()
+    if value is None:
+        return STALL_MINUTES * 60.0, None
+    if not re.fullmatch(r"[0-9]+", value) or int(value) == 0:
+        return STALL_MINUTES * 60.0, (f"{path}: {STALL_KEY}={value!r} is not a whole "
+                                      f"number of 1 or more")
+    return int(value) * 60.0, None
+
+
+def parent_of(pid):
+    """Return the parent pid of a process, or 0 when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError:
+        return 0
+    # The name in brackets can hold blanks and brackets, so the fields after it are
+    # counted from the last closing bracket.
+    try:
+        return int(text.rsplit(")", 1)[1].split()[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def runs_session(pid, session_id):
+    """Say whether the process runs with --session-id and this ID among its arguments."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            arguments = [os.fsdecode(part) for part in stream.read().split(b"\0")]
+    except OSError:
+        return False
+    return any(argument == "--session-id" and following == session_id
+               for argument, following in zip(arguments, arguments[1:]))
+
+
 # The event file. The loop appends one line to it for each event, and "start <session
 # ID>" before each start of a session; the session reads it with jig orch <project> events.
 
@@ -489,11 +869,68 @@ def watch_events(project, old):
         return REFUSED
 
 
+def wait_on(project, words, poll):
+    """jig orch <project> wait-on: list, write or clear the waits of the project."""
+    waits_file = orch_dir(project) / WAITS_FILE
+    now = datetime.datetime.now().astimezone()
+    if not words:
+        lines = wait_lines(project, now, poll)
+        print("\n".join(f"jig orch: {project}: {line}" for line in lines)
+              or f"jig orch: {project}: no waits")
+        return DONE
+    other, rest = words[0], words[1:]
+    if other == project or not jig_units.PROJECT.fullmatch(other):
+        print(f"jig orch: usage: wait-on takes the name of another project, not {other!r}",
+              file=sys.stderr)
+        return USAGE
+    clear = rest == ["--clear"]
+    if "--clear" in rest and not clear:
+        print("jig orch: usage: wait-on <other> --clear takes nothing more", file=sys.stderr)
+        return USAGE
+    what = " ".join(rest).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+    if not clear and not what:
+        print("jig orch: usage: wait-on <other> takes the thing it waits for, or --clear",
+              file=sys.stderr)
+        return USAGE
+    if not clear and not orch_dir(other).is_dir():
+        print(f"jig orch: refused: wait-on: {orch_dir(other)} does not exist: no "
+              f"orchestrator of {other} runs on this host", file=sys.stderr)
+        return REFUSED
+    try:
+        old = waits_file.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        old = []
+    mine = [line for line in old if line.split("\t", 1)[0] == other]
+    kept = [line for line in old if line.split("\t", 1)[0] != other]
+    if clear:
+        if mine:
+            write_whole(waits_file, "".join(f"{line}\n" for line in kept))
+            print(f"jig orch: {project} no longer waits on {other}")
+        else:
+            print(f"jig orch: {project} did not wait on {other}")
+        return DONE
+    since = stamp(now)
+    for line in mine:
+        fields = line.split("\t")
+        if len(fields) == 3 and fields[2] == what and parse_stamp(fields[1]):
+            since = fields[1]
+    waits_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = [*kept, f"{other}\t{since}\t{what}"]
+    write_whole(waits_file, "".join(f"{line}\n" for line in lines))
+    print(f"jig orch: {project} waits on {other} since {since}: {what}")
+    found = read_activity(orch_dir(other) / ACTIVITY_FILE)
+    shown = describe(found, now, poll)
+    if shown.startswith("no activity file"):
+        print(f"jig orch: warning: {other} has {shown}: its loop writes none, because it "
+              f"runs a jig older than 0.8.0 or no loop runs, so it shows as down")
+    return DONE
+
+
 class Orch:
     def __init__(self, project):
         self.project = project
         self.session = f"{project}-orch"
-        conf = jig_units.read_conf(project)
+        conf = self.conf = jig_units.read_conf(project)
         self.clone = pathlib.Path(conf["REPO"])
         self.branch = conf["BRANCH"]
         # A ref of the loop's own, so that its fetch moves nothing that other fetches use.
@@ -508,11 +945,14 @@ class Orch:
         self.announced_file = self.state / "announced"
         self.reported_file = self.state / "reported"
         self.reminded_file = self.state / "reminded"
+        self.activity_file = self.state / ACTIVITY_FILE
+        self.waits_file = self.state / WAITS_FILE
         self.state_md = self.clone / "impl" / "orch" / "state.md"
         self.fetch_err = self.state / "fetch.err"
         self.tee = reviews / "out" / "orch.txt"
         self.transcripts = reviews / "transcripts" / "orch"
         root = os.environ.get("JIG_SRV") or SRV_ROOT
+        self.srv = pathlib.Path(root)
         self.watched = (("inbox", pathlib.Path(root) / "in" / project),
                         ("readback", pathlib.Path(root) / "out" / project))
         self.directories = [root + path[len(SRV_ROOT):] if path.startswith(SRV_ROOT + "/")
@@ -1105,7 +1545,8 @@ class Orch:
         """Append the queued events to the event file, oldest first."""
         while self.queue and not self.stopping:
             # The mark of a line is its report commit, the (item, date) pair of a
-            # reminder, the FileMark of an inbox file or readback, or None.
+            # reminder, the FileMark of an inbox file or readback, QUIET for a stall or
+            # resumed line, or None.
             line, mark = self.queue[0]
             failure = self.append_event(line)
             if failure:
@@ -1121,12 +1562,14 @@ class Orch:
             again = " after a failure" if self.held == line else ""
             self.held = None
             self.log(f"appended{again}: {line}")
-            if line != HOURLY_LINE and not isinstance(mark, tuple):
+            if line != HOURLY_LINE and not isinstance(mark, (tuple, QuietMark)):
                 self.note_change()
             # A report commit, a reminder or a file goes into its record only once its
             # line is appended, so that a line that a stop drops while it waits in the
             # queue is appended after the restart.
-            if isinstance(mark, tuple):
+            if isinstance(mark, QuietMark):
+                pass
+            elif isinstance(mark, tuple):
                 self.reminded.add(mark)
                 self.write_reminded()
             elif isinstance(mark, FileMark):
@@ -1137,7 +1580,7 @@ class Orch:
                 self.reported.add(mark)
                 self.write_reported()
 
-    def loop(self, poll, report_poll, hourly, fork_window):
+    def loop(self, poll, report_poll, hourly, fork_window, activity, stall_override):
         self.stopping = False
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(signum, self.stop_request)
@@ -1163,10 +1606,20 @@ class Orch:
         self.fork_window, self.fork_watch, self.ended_forks = fork_window, {}, set()
         self.reminded, self.remind_problem = self.read_reminded(), None
         self.remind()
+        self.problems = {}
+        # The old file gives the since of a state that goes on across the restart.
+        self.activity = read_activity(self.activity_file)[0]
+        self.activity_poll, self.next_activity = activity, time.monotonic()
+        seconds, problem = stall_time(self.srv)
+        if problem:
+            self.log(f"stall time: {problem}; the loop uses {STALL_MINUTES} minutes")
+        self.stalls = Stalls(stall_override or seconds, activity)
         try:
             return self.supervise(poll)
         finally:
             self.end_fetch()
+            # Whatever ended the loop, no loop writes the file any more.
+            self.write_activity("down")
 
     def supervise(self, poll):
         exits = []
@@ -1202,17 +1655,15 @@ class Orch:
             # session reads them once the dialog is answered.
             self.append_queue()
             screen = jig_tmux.capture(self.session)
-            if screen is None:
-                self.rest(poll)
-                continue
-            if jig_tmux.has_input_bar(screen):
+            if screen is not None and jig_tmux.has_input_bar(screen):
                 no_bar, reported = 0, False
-            else:
+            elif screen is not None:
                 no_bar += 1
                 if no_bar >= jig_tmux.DIALOG_POLLS and not reported:
                     reported = True
                     self.log(f"dialog: session {self.session} shows no input bar; jig orch "
                              f"does not answer it: tmux attach -t {self.session}", tee=True)
+            self.watch_activity(screen, no_bar)
             self.rest(poll)
         # The session stays, with its dead pane, so that an attached client stays; a
         # session that is not the loop's own is not touched at all.
@@ -1225,6 +1676,64 @@ class Orch:
             self.copy_transcript()
         self.log("loop stopped by jig orch stop")
         return DONE
+
+    # The activity file and the stall lines.
+
+    def problem(self, key, text):
+        """Log a problem that would repeat at every activity poll, once an hour."""
+        moment = time.monotonic()
+        if moment < self.problems.get(key, moment):
+            return
+        self.problems[key] = moment + PROBLEM_SECONDS
+        self.log(text)
+
+    def write_activity(self, state, now=None):
+        now = now or datetime.datetime.now().astimezone()
+        since = kept_since(self.activity, state, now, self.activity_poll)
+        self.activity = (state, since, now)
+        try:
+            write_whole(self.activity_file, f"{state}\t{stamp(since)}\t{stamp(now)}\n")
+        except OSError as error:
+            self.problem("activity", f"cannot write {self.activity_file}: {error.strerror}")
+
+    def watch_activity(self, screen, no_bar):
+        """Once an activity poll, write the activity file and look for stalls."""
+        moment = time.monotonic()
+        if moment < self.next_activity:
+            return
+        self.next_activity = moment + self.activity_poll
+        now = datetime.datetime.now().astimezone()
+        state = activity_state(unit_running(self.conf, self.project, now), self.alive(),
+                               no_bar, screen)
+        self.write_activity(state, now)
+        self.watch_waits(now)
+
+    def watch_waits(self, now):
+        try:
+            text = self.waits_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = ""
+        except (OSError, UnicodeDecodeError) as error:
+            self.problem("waits", f"cannot read {self.waits_file}: "
+                                  f"{getattr(error, 'strerror', None) or error}")
+            return
+        waits, bad = parse_waits(text)
+        if bad:
+            self.problem("waits", f"{self.waits_file}: {bad} line(s) do not parse and are "
+                                  f"left out")
+
+        def read(other):
+            path = orch_dir(other) / ACTIVITY_FILE
+            found = read_activity(path)
+            if found[1] == "unparsed":
+                self.problem(f"activity {other}", f"{path} cannot be read or does not "
+                                                  f"parse; {other} counts as down")
+            return found
+
+        # Through the queue, so that these lines keep their order among the others.
+        for line in self.stalls.step(waits, read, now):
+            self.queue.append((line, QUIET))
+            self.log(f"queued: {line}")
 
     # The commands.
 
@@ -1302,7 +1811,7 @@ class Orch:
             print(f"jig orch: stopped the loop, pid {pid}; {left}")
         return DONE
 
-    def status(self):
+    def status(self, poll):
         self.state.mkdir(parents=True, exist_ok=True)
         descriptor = try_lock(self.lock)
         last = self.last_log_line() or "no log"
@@ -1313,17 +1822,72 @@ class Orch:
         if descriptor is not None:
             os.close(descriptor)
             print(f"jig orch: {self.project}: no loop runs; {session}; last: {last}")
-            return NO_LOOP
-        print(f"jig orch: {self.project}: loop {self.loop_pid()} runs; {session}; "
-              f"last: {last}")
+        else:
+            print(f"jig orch: {self.project}: loop {self.loop_pid()} runs; {session}; "
+                  f"last: {last}")
+        now = datetime.datetime.now().astimezone()
+        print(f"jig orch: {self.project}: activity: "
+              f"{describe(read_activity(self.activity_file), now, poll)}")
+        for line in wait_lines(self.project, now, poll):
+            print(f"jig orch: {self.project}: {line}")
+        return NO_LOOP if descriptor is not None else DONE
+
+    def inside(self, pane):
+        """Say whether this command runs inside the pane: as a descendant of its process,
+        or in a shell whose tmux pane and server are those of the pane."""
+        pid = os.getpid()
+        while pid > 1:
+            if pid == pane.pid:
+                return True
+            pid = parent_of(pid)
+        socket = os.environ.get("TMUX", "").split(",")[0]
+        return bool(socket) and os.environ.get("TMUX_PANE") == pane.pane_id \
+            and os.path.realpath(socket) == os.path.realpath(pane.socket)
+
+    def rollover(self):
+        """End the loop's own Claude Code session from inside it, so that the loop
+        starts the next one, as on any exit.
+
+        Each check refuses before anything is signalled. The process of the pane is
+        Claude Code itself, because the pane's command execs down to claude, so it is
+        the one process that gets the signal; its arguments must hold the session ID
+        that the loop gave it, so that a pane that runs something else is never ended.
+        """
+        self.state.mkdir(parents=True, exist_ok=True)
+        descriptor = try_lock(self.lock)
+        if descriptor is not None:
+            os.close(descriptor)
+            worker.refuse("loop", f"no loop runs for {self.project}, so none would start "
+                                  f"the next session; jig orch {self.project} start first")
+        pane = self.pane()
+        if pane is None or pane.dead:
+            worker.refuse("session", f"tmux session {self.session} is not live")
+        if not self.ours(pane):
+            worker.refuse("session", f"{self.foreign()}; jig orch leaves it as it is")
+        session_id = pane.claude_session()
+        if not runs_session(pane.pid, session_id):
+            worker.refuse("process", f"pid {pane.pid}, the process of the pane of "
+                                     f"{self.session}, does not run with --session-id "
+                                     f"{session_id}")
+        if not self.inside(pane):
+            worker.refuse("caller", f"this command does not run inside the pane of "
+                                    f"{self.session}; only the session itself rolls over")
+        # The caller's output ends with its session, so the line goes out first.
+        print(f"jig orch: ending Claude Code session {session_id}, pid {pane.pid}, in "
+              f"{self.session}; the loop starts the next session", flush=True)
+        try:
+            os.kill(pane.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         return DONE
 
 
 def main(argv):
-    commands = ("start", "stop", "status")
+    commands = ("start", "stop", "status", "rollover")
     hidden = len(argv) == 3 and argv[1] == "loop" and argv[2].isdigit()
     watcher = argv[1:] in (["events"], ["events", "--old"])
-    if not (len(argv) == 2 and argv[1] in commands or hidden or watcher) \
+    waits = len(argv) >= 2 and argv[1] == "wait-on"
+    if not (len(argv) == 2 and argv[1] in commands or hidden or watcher or waits) \
             or not jig_units.PROJECT.fullmatch(argv[0]):
         print("\n\n".join(__doc__.strip().split("\n\n")[1:3]), file=sys.stderr)
         return USAGE
@@ -1332,6 +1896,16 @@ def main(argv):
         # lock: it runs in the session beside the loop.
         return watch_events(argv[0], len(argv) == 3)
     try:
+        activity = setting("JIG_ORCH_ACTIVITY", ACTIVITY_SECONDS)
+        if waits:
+            # The waits file needs no conf file and no lock, as the watcher.
+            try:
+                return wait_on(argv[0], argv[2:], activity)
+            except OSError as error:
+                print(f"jig orch: refused: wait-on: cannot write {error.filename}: "
+                      f"{error.strerror}", file=sys.stderr)
+                return REFUSED
+        stall_override = setting("JIG_ORCH_STALL_SECONDS", None)
         poll = setting("JIG_ORCH_POLL", POLL_SECONDS)
         report_poll = setting("JIG_ORCH_REPORT_POLL", REPORT_POLL_SECONDS)
         hourly = setting("JIG_ORCH_HOURLY", HOURLY_SECONDS)
@@ -1342,7 +1916,10 @@ def main(argv):
             descriptor = int(argv[2])
             os.ftruncate(descriptor, 0)
             os.pwrite(descriptor, f"{os.getpid()}\n".encode(), 0)
-            return orch.loop(poll, report_poll, hourly, fork_window)
+            return orch.loop(poll, report_poll, hourly, fork_window, activity,
+                             stall_override)
+        if argv[1] == "status":
+            return orch.status(activity)
         return getattr(orch, argv[1])()
     except jig_units.Refused as error:
         print(f"jig orch: {error}", file=sys.stderr)

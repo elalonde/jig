@@ -106,8 +106,9 @@ class OrchTestCase(TempTestCase):
         return self.clone / "impl" / "orch" / "ORCHESTRATOR.md"
 
     def base_env(self):
+        # The loop reads the lock directory for its activity file: never the host's.
         return self.env(PATH=f"{self.bin_dir}:{os.environ['PATH']}", JIG_SRV=str(self.srv),
-                        JIG_ORCH_POLL=POLL,
+                        JIG_LOCK_DIR=str(self.tmp / "lock"), JIG_ORCH_POLL=POLL,
                         JIG_ORCH_REPORT_POLL=getattr(self, "report_poll", REPORT_POLL),
                         JIG_ORCH_HOURLY=getattr(self, "hourly", "3600"),
                         JIG_ORCH_FORK_WINDOW=getattr(self, "fork_window", "60"))

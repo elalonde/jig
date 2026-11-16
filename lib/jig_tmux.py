@@ -1,13 +1,17 @@
-"""A Claude Code session in tmux: the dialog test and the delivery of one line.
+"""A Claude Code session in tmux: the dialog test, the running-turn test and the
+delivery of one line.
 
 jig wait and the supervisor (jig orch) test for a dialog the same way: the session's
-normal input bar is missing for DIALOG_POLLS polls in a row. jig send delivers a line:
+normal input bar is missing for DIALOG_POLLS polls in a row. The supervisor also tells a
+session that works on a turn from one that waits at its input box, by the spinner line
+that Claude Code draws just above the box while a turn runs. jig send delivers a line:
 the text, a pause, Enter, then a check that the text reached the session and left its
 input box, because text and Enter sent together were measured to stay unsubmitted.
 
 tmux is the one on PATH, with its default server; a test puts its own tmux first.
 """
 
+import re
 import subprocess
 import time
 
@@ -25,6 +29,16 @@ DIALOG_POLLS = 2
 RULE = "─"
 # Claude Code can show a long text as this marker in the box instead of the text.
 PASTED = "[Pasted text"
+
+# While a turn runs, Claude Code draws a spinner line above the input box, as
+# "✽ Ruminating… (18s · ↓ 1.2k tokens)": a glyph in the first column, a space, a verb or
+# the active text of a task-list item, an ellipsis, then the time the turn has run. The
+# line it leaves after a turn, as "✻ Baked for 24s · done 9:44 AM", has no ellipsis and
+# no time in brackets. Only the last few lines above the box count, because a spinner
+# line quoted in a report or prompt higher up the screen is no running turn; the task
+# list that Claude Code draws under the spinner line is why a few and not one.
+RUNNING_LINE = re.compile(r"\S .*… \(\d+[smh]")
+TURN_LINES = 12
 
 PAUSE_SECONDS = 0.5
 CHECK_SECONDS = 5.0
@@ -74,6 +88,20 @@ def input_box(screen):
     if len(rules) >= 2:
         return "\n".join(lines[rules[-2] + 1:rules[-1]])
     return "\n".join(non_blank(screen)[-BAR_LINES:])
+
+
+def running_turn(screen):
+    """Say whether the screen shows a turn at work: a spinner line just above the box.
+
+    Without the two rules of an input box the screen shows no box to look above, so
+    it shows no running turn either.
+    """
+    lines = screen.splitlines()
+    rules = [index for index, line in enumerate(lines) if is_rule(line)]
+    if len(rules) < 2:
+        return False
+    above = non_blank("\n".join(lines[:rules[-2]]))[-TURN_LINES:]
+    return any(RUNNING_LINE.match(line) for line in above)
 
 
 def squeeze(text):
