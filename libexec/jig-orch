@@ -979,11 +979,20 @@ class Orch:
                 stream.write(f"\njig orch: {line}")
 
     def last_log_line(self):
+        """Return the last line of the log that says what the loop did.
+
+        The two lines of the last look for forks come after the line that says why
+        the loop ended, so they are passed over.
+        """
         try:
             lines = self.log_path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return None
-        return lines[-1] if lines else None
+        for line in reversed(lines):
+            text = line.split(" ", 1)[-1]
+            if not text.startswith(("looked for forks of ", "looked again for forks of ")):
+                return line
+        return None
 
     # The session.
 
@@ -1183,15 +1192,8 @@ class Orch:
         for session_id in self.fork_watch:
             self.end_forks(session_id)
 
-    def last_session(self):
-        """Return the Claude Code session ID that was started last, or None.
-
-        A loop whose first launch failed has started none, so the record of the loop
-        before it names the last one.
-        """
-        started = getattr(self, "claude_session", None)
-        if started:
-            return started
+    def recorded_session(self):
+        """Return the Claude Code session ID in orch/session-ids, or None."""
         try:
             recorded = self.ids_file.read_text(encoding="utf-8").split()
         except OSError:
@@ -1666,7 +1668,10 @@ class Orch:
             self.write_activity("down")
             # The sessions whose window is still open are looked at too: the loop
             # that ends would no longer watch them.
-            self.last_looks([self.last_session(), *self.fork_watch], self.fork_window)
+            # A loop whose first launch failed started no session; the loop before it
+            # took the looks for the one it started.
+            self.last_looks([getattr(self, "claude_session", None), *self.fork_watch],
+                            self.fork_window)
 
     def supervise(self, poll):
         exits = []
@@ -1853,7 +1858,7 @@ class Orch:
         # was dead or had to be killed, stop takes both looks in its place.
         if pid is None or killed:
             self.ended_forks = set()
-            last = self.last_session()
+            last = self.recorded_session()
             if last:
                 print(f"jig orch: looking for forks of Claude Code session {last} for "
                       f"{self.fork_window:g} s", flush=True)
