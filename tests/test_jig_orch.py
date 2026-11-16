@@ -11,6 +11,7 @@ jig send's tests share.
 """
 
 import datetime
+import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -42,6 +43,8 @@ TEMPLATE = ROOT / "templates" / "project.conf"
 PROJECT = "demo"
 SESSION = f"{PROJECT}-orch"
 POLL = "0.3"
+# Short, so that a loop that ends spends little time on its last look for forks.
+FORK_WINDOW = "0.1"
 REPORT_POLL = "1"
 BRANCH = "master"
 STANDING = "You are the orchestrator of demo.\nRead state.md first.\n"
@@ -111,7 +114,7 @@ class OrchTestCase(TempTestCase):
                         JIG_LOCK_DIR=str(self.tmp / "lock"), JIG_ORCH_POLL=POLL,
                         JIG_ORCH_REPORT_POLL=getattr(self, "report_poll", REPORT_POLL),
                         JIG_ORCH_HOURLY=getattr(self, "hourly", "3600"),
-                        JIG_ORCH_FORK_WINDOW=getattr(self, "fork_window", "60"))
+                        JIG_ORCH_FORK_WINDOW=getattr(self, "fork_window", FORK_WINDOW))
 
     def orch(self, *args):
         return run([ORCH, PROJECT, *args], env=self.base_env())
@@ -120,7 +123,14 @@ class OrchTestCase(TempTestCase):
         return run(["tmux", *args], env=self.base_env())
 
     def end_all(self):
-        run([ORCH, PROJECT, "stop"], env=self.base_env())
+        # A loop with a long fork window would spend it all on its last look for forks
+        # before it frees its lock; the cleanup ends such a loop at once, and its stop
+        # then looks with the short window.
+        if float(getattr(self, "fork_window", FORK_WINDOW)) > 1 and self.loop_runs():
+            os.kill(self.loop_pid(), signal.SIGKILL)
+            self.until(lambda: not self.loop_runs(), what="the end of the killed loop")
+        run([ORCH, PROJECT, "stop"],
+            env={**self.base_env(), "JIG_ORCH_FORK_WINDOW": FORK_WINDOW})
         pid = self.loop_pid()
         if pid:
             try:
@@ -132,6 +142,20 @@ class OrchTestCase(TempTestCase):
         socket = pathlib.Path(f"/tmp/tmux-{os.getuid()}") / self.socket
         if socket.is_socket():
             socket.unlink()
+
+    def loop_runs(self):
+        """Say whether a loop holds the lock, as jig orch tells it."""
+        try:
+            descriptor = os.open(self.reviews / "orch" / "loop.lock", os.O_RDWR)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(descriptor)
+        return False
 
     def loop_pid(self):
         try:
@@ -969,6 +993,73 @@ class TestForkWithinTheWindow(ForkTestCase):
         old = self.first_id()
         self.restart()
         fork = self.process("--fork-session", "--resume", f"/tmp/x/{old}.jsonl")
+        self.assert_ended(fork, old)
+
+
+class TestForksWhenTheLoopEnds(ForkTestCase):
+    """A loop that ends looks for forks of its last session twice, a window apart."""
+
+    fork_window = "3"
+
+    def first_look(self, session_id):
+        """Wait for the line of the loop's first look that names the session."""
+        self.until(lambda: any(line.split(" ", 1)[1].startswith("looked for forks of ")
+                               and session_id in line for line in self.log().splitlines()),
+                   what="the first look for forks")
+
+    def stop_in_background(self):
+        stop = subprocess.Popen([ORCH, PROJECT, "stop"], env=self.base_env(),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.end_process, stop)
+        return stop
+
+    def test_stop_ends_a_fork_that_shows_up_after_the_first_look(self):
+        # The loop is stopped while it runs. A fork of its last session starts only
+        # after the loop's first look; the loop's second look, a window later, still
+        # ends it, and stop waits for that before it returns.
+        self.start()
+        old = self.first_id()
+        stop = self.stop_in_background()
+        self.first_look(old)
+        fork = self.process("--resume", old)
+        out, err = stop.communicate(timeout=60)
+        self.assertEqual(stop.returncode, 0, err)
+        self.assertIn("jig orch: stopped the loop", out)
+        self.assertIsNotNone(fork.poll(), "the fork still ran when stop returned")
+        self.assert_ended(fork, old)
+        self.assertIn(f"looked again for forks of Claude Code session {old}\n", self.log())
+
+    def test_third_quick_exit_ends_a_fork_that_shows_up_after_the_first_look(self):
+        # Each Claude Code exits at once, so the loop stops at the third exit. A fork
+        # of the third session that starts after the first look is ended by the second.
+        (self.home / "claude-exit-now").write_text("", encoding="utf-8")
+        self.orch("start")
+        self.until(lambda: len(self.calls()) == 3, what="the third start")
+        last = self.session_ids()[2]
+        self.first_look(last)
+        fork = self.process("--fork-session", "--resume", f"/tmp/x/{last}.jsonl")
+        self.until(lambda: not self.loop_runs(), what="the end of the loop")
+        self.assertIsNotNone(fork.poll(), "the fork still ran when the loop ended")
+        self.assert_ended(fork, last)
+
+    def test_stop_of_a_dead_loop_ends_claude_and_a_fork_that_shows_up_later(self):
+        # The loop died, so Claude Code still runs and no loop will look for forks.
+        # Stop ends Claude Code and takes both looks itself; a fork that starts after
+        # the first look is ended by the second.
+        self.start()
+        old = self.first_id()
+        os.kill(self.loop_pid(), signal.SIGKILL)
+        self.until(lambda: not self.loop_runs(), what="the end of the killed loop")
+        stop = self.stop_in_background()
+        self.first_look(old)
+        fork = self.process("--resume", old)
+        out, err = stop.communicate(timeout=60)
+        self.assertEqual(stop.returncode, 0, err)
+        self.assertIn(f"looking for forks of Claude Code session {old} for 3 s", out)
+        self.assertIn("jig orch: no loop runs", out)
+        self.assertTrue(self.pane()["dead"])
+        self.assertIsNotNone(fork.poll(), "the fork still ran when stop returned")
         self.assert_ended(fork, old)
 
 

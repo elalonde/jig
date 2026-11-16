@@ -74,7 +74,11 @@ after the new session starts, the loop sends SIGTERM to each process of its own 
 that has the argument --resume followed by the old session's ID or by a path that ends
 in /<ID>.jsonl, and logs one line with its pid and the old ID. A process that ends
 before the signal is no failure. It touches no other process, also none that resumes
-another session.
+another session. When the loop itself ends (a stop, the third exit in 10 minutes, or a
+session that it may not start), it writes its state down, looks for forks of its last
+session at once and once more JIG_ORCH_FORK_WINDOW seconds later, and only then frees
+its lock. So jig orch stop waits for the lock that much longer before it sends SIGKILL;
+when no loop runs, stop takes the same two looks itself, after it has ended Claude Code.
 
 New files. The loop appends one event for each new file in
 <root>/in/<project>/ (inbox: <file> (<bytes>, sha256 <8 hex>)) and for each readback, the
@@ -299,6 +303,8 @@ QUICK_WINDOW_SECONDS = 600
 START_WAIT_SECONDS = 5.0
 # Long enough for a fork that Claude Code starts while the old session exits to show up.
 FORK_WINDOW_SECONDS = 60.0
+# How long jig orch stop waits for the loop's lock, beyond the fork window that the
+# stopping loop spends on its last look for forks.
 STOP_WAIT_SECONDS = 30.0
 # Claude Code gets this long after SIGTERM before SIGKILL; it is shorter than the wait of
 # jig orch stop for the loop's lock, so a loop that ends its session still frees the lock
@@ -1174,6 +1180,41 @@ class Orch:
         for session_id in self.fork_watch:
             self.end_forks(session_id)
 
+    def last_session(self):
+        """Return the Claude Code session ID that was started last, or None.
+
+        A loop whose first launch failed has started none, so the record of the loop
+        before it names the last one.
+        """
+        started = getattr(self, "claude_session", None)
+        if started:
+            return started
+        try:
+            recorded = self.ids_file.read_text(encoding="utf-8").split()
+        except OSError:
+            return None
+        return recorded[1] if len(recorded) == 2 else None
+
+    def last_looks(self, sessions, window):
+        """Look for forks of these sessions now and once more after the window.
+
+        A fork can start a while after its session has exited, and once the loop is
+        gone nothing else would end it; the next start would then run a second
+        orchestrator beside it.
+        """
+        sessions = [session_id for session_id in dict.fromkeys(sessions) if session_id]
+        if not sessions:
+            return
+        for session_id in sessions:
+            self.end_forks(session_id)
+        named = ("session " if len(sessions) == 1 else "sessions ") + ", ".join(sessions)
+        self.log(f"looked for forks of Claude Code {named}; looks again in {window:g} s")
+        # A plain sleep: a second stop signal must not cut the second look short.
+        time.sleep(window)
+        for session_id in sessions:
+            self.end_forks(session_id)
+        self.log(f"looked again for forks of Claude Code {named}")
+
     # The inbox and the readbacks.
 
     def files(self, directory):
@@ -1620,6 +1661,9 @@ class Orch:
             self.end_fetch()
             # Whatever ended the loop, no loop writes the file any more.
             self.write_activity("down")
+            # The sessions whose window is still open are looked at too: the loop
+            # that ends would no longer watch them.
+            self.last_looks([self.last_session(), *self.fork_watch], self.fork_window)
 
     def supervise(self, poll):
         exits = []
@@ -1778,17 +1822,20 @@ class Orch:
     def stop(self):
         self.state.mkdir(parents=True, exist_ok=True)
         descriptor = try_lock(self.lock)
-        pid = None
+        pid, killed = None, False
         if descriptor is None:
             pid = self.loop_pid()
             if pid:
                 os.kill(pid, signal.SIGTERM)
-            deadline = time.monotonic() + STOP_WAIT_SECONDS
+            # The stopping loop ends Claude Code and then looks for forks across the
+            # window before it frees the lock, so the wait covers both.
+            deadline = time.monotonic() + STOP_WAIT_SECONDS + self.fork_window
             while descriptor is None and time.monotonic() < deadline:
                 time.sleep(0.2)
                 descriptor = try_lock(self.lock)
             if descriptor is None and pid:
                 os.kill(pid, signal.SIGKILL)
+                killed = True
                 time.sleep(0.5)
                 descriptor = try_lock(self.lock)
         if descriptor is not None:
@@ -1799,6 +1846,15 @@ class Orch:
         own = pane is not None and self.ours(pane)
         if own and not pane.dead:
             self.end_claude(pane)
+        # A loop that ended on the signal has looked for forks itself; for a loop that
+        # was dead or had to be killed, stop takes both looks in its place.
+        if pid is None or killed:
+            self.ended_forks = set()
+            last = self.last_session()
+            if last:
+                print(f"jig orch: looking for forks of Claude Code session {last} for "
+                      f"{self.fork_window:g} s", flush=True)
+            self.last_looks([last], self.fork_window)
         if pane is None:
             left = f"no session {self.session}"
         elif own:
@@ -1911,6 +1967,7 @@ def main(argv):
         hourly = setting("JIG_ORCH_HOURLY", HOURLY_SECONDS)
         fork_window = setting("JIG_ORCH_FORK_WINDOW", FORK_WINDOW_SECONDS)
         orch = Orch(argv[0])
+        orch.fork_window = fork_window
         if hidden:
             # The descriptor holds the lock that start took; it stays open while this runs.
             descriptor = int(argv[2])
