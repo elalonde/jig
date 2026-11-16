@@ -18,6 +18,10 @@ from tests.test_jig_new import GITHUB, HOST, ORCH, OWNER, PLACEHOLDER, PROJECT, 
 
 # The URL that every product clone of the block ends with.
 PRODUCT_URL = f"github-{PROJECT}:{GITHUB}/{PROJECT}"
+# The ssh form of the same repo on GitHub, which the block repoints. GitHub's ssh
+# user is git; the block takes any user.
+SSH_USER = "git"
+SCP_URL = f"{SSH_USER}@github.com:{GITHUB}/{PROJECT}.git"
 # Replaces ssh in the cut steps: the command runs in the account's fixture home.
 FAKE_SSH = ('ssh() {\n  [ "$1" = -o ] && shift 2\n  local home="$FAKE/accounts/${1%@*}"\n'
             '  shift\n  (cd "$home" && HOME="$home" bash -c "$*")\n}\n')
@@ -154,7 +158,7 @@ class JigNewExistingTest(JigNewCase):
         # already. jig new --existing runs past them, and afterwards every path and
         # every file's hash under both clones is as it was.
         self.make_github()
-        clones = [self.clone_at(self.home, f"git@github.com:{GITHUB}/{PROJECT}.git"),
+        clones = [self.clone_at(self.home, SCP_URL),
                   self.clone_at(self.impl, str(self.tmp / "old" / "demo.git"))]
         (clones[0] / "notes.txt").write_text("untracked\n", encoding="utf-8")
         before = [tree_state(path) for path in clones]
@@ -205,7 +209,7 @@ class JigNewExistingTest(JigNewCase):
         # keeps both as they are.
         self.made_existing()
         self.make_github()
-        impl = self.clone_at(self.impl, f"git@github.com:{GITHUB}/{PROJECT}.git")
+        impl = self.clone_at(self.impl, SCP_URL)
         self.git("-C", impl, "config", "user.name", "Kept Name")
         self.git("-C", impl, "checkout", "-q", "phase-1")
         config = self.git("-C", impl, "config", "--local", "--list").splitlines()
@@ -214,7 +218,7 @@ class JigNewExistingTest(JigNewCase):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(first.stdout.splitlines(), [
             f"{ORCH} product cloned, head {head}",
-            f"implementer product repointed from git@github.com:{GITHUB}/{PROJECT}.git,"
+            f"implementer product repointed from {SCP_URL},"
             f" head {head}"])
         orch = self.home / "ws/src/demo"
         for clone in (orch, impl):
