@@ -1430,6 +1430,12 @@ class TestWatcherOfAnEndedSession(OrchTestCase):
         self.until(lambda: self.read(pid_file), what="the watcher")
         pid = int(self.read(pid_file))
         self.assertTrue(running(pid))
+        # The watcher notes its parent only once it has loaded and started to follow
+        # the file; a session killed before that, on a slow host, leaves no change of
+        # parent to see. A line that it prints shows that it follows.
+        with open(self.event_file(), "a", encoding="utf-8") as stream:
+            stream.write("inbox: ready\n")
+        self.until(lambda: "inbox: ready" in self.screen("fixture"), what="the first line")
         self.tmux("kill-session", "-t", "=fixture")
         self.until(lambda: not running(pid), seconds=5, what="the end of the watcher")
 
