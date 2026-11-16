@@ -121,6 +121,28 @@ section on its ROLE line, and `jig validate prompt` refuses such a prompt
 that does not. The product source holds no traceability: the link from a
 rule to the code is the trace in the `-dev` repo.
 
+## Commit message standard
+
+Every commit message in the product is written for the reader of the
+comment standard: a competent maintainer who has never seen the specs,
+the process or the `-dev` repo. The history of the product is public.
+
+- a. The subject says what the commit changes, in the imperative ("Add",
+  "Fix", "Read"), in at most 72 characters, with no period at the end.
+- b. When the reason is not plain from the subject, a blank line and then
+  a body: why the change was needed and which failure it prevents, in
+  full sentences, with lines of at most 72 characters.
+- c. No unit IDs, rule IDs, finding numbers, spec sections or process
+  words. The link from a rule to the commit lives in the `-dev` repo.
+- d. No padding: no praise of the change, no list of the tests that pass,
+  and no retelling of the diff line by line.
+- e. The trailers are the ones of the product repo rules, and nothing
+  hides that an AI wrote the code.
+
+Every prompt whose first line names the implementer account names this
+section on its ROLE line, beside "Comment standard", and `jig validate prompt`
+refuses such a prompt that does not.
+
 ## Branches and tags
 
 - One branch per version line (`0.1`, `0.2`, `1.0`), with the same names in

@@ -5,7 +5,8 @@ MODEL CHECK: this unit needs <model>. If not: report first line
   "NEEDS ERIC: model is <actual>, not <required>", commit, push, stop.
 EFFORT: <level>, set by jig start. Risk at a lower level: <one line>.
 ROLE: <role>. Rules: CLAUDE.md, the sections <names>; when the
-  first line names the implementer account, also Comment standard. Spec tag: <the approved tag>.
+  first line names the implementer account, also Comment standard and
+  Commit message standard. Spec tag: <the approved tag>.
   Prohibited sources: <from the kickoff record>. Never force-push,
   rewrite history, or delete tags or releases.
 STATE: <the expected state when this unit starts: the previous unit, the

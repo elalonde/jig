@@ -19,8 +19,9 @@ When there is no value to read, a line on stderr says so and the rule holds, as 
 the clean room on.
 
 A prompt whose first line names the implementer account must also name the
-section "Comment standard" of CLAUDE.md in its ROLE section: that session writes
-product code, and the section holds the rules its comments follow.
+sections "Comment standard" and "Commit message standard" of CLAUDE.md in its ROLE
+section: that session writes product code and its commit messages, and those
+sections hold the rules they follow.
 """
 
 import argparse
@@ -51,11 +52,15 @@ LAST_LINE = re.compile(r"# end (?P<id>\S+)")
 ROLE_IN_NAME = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 
 # The account in the first line's parentheses decides whether the prompt is for a
-# session that writes product code. The words may wrap onto the next line of the
-# ROLE section, so any run of whitespace may stand between them.
+# session that writes product code. Such a prompt names each section of CLAUDE.md in
+# IMPLEMENTER_SECTIONS, which hold the rules for its comments and commit messages.
+# The words of a name may wrap onto the next line of the ROLE section, so any run of
+# whitespace may stand between them.
 PARENTHESES = re.compile(r"\((?P<inside>[^)]*)\)")
 IMPLEMENTER = re.compile(r"(?<![A-Za-z0-9_-])implementer(?![A-Za-z0-9_-])")
-COMMENT_STANDARD = re.compile(r"Comment\s+standard")
+IMPLEMENTER_SECTIONS = tuple(
+    (name, re.compile(r"\s+".join(map(re.escape, name.split()))))
+    for name in ("Comment standard", "Commit message standard"))
 
 # Words of the READ section. Anything that can end a word in a shell or in a sentence
 # ends one here, so a path in quotes or after "tag:" is found. A part cut off this way
@@ -147,17 +152,21 @@ def section_text(lines, label):
     return start, "\n".join(text)
 
 
-def comment_standard_failures(lines):
-    """Check that a prompt for the implementer account names the comment rules."""
+def implementer_section_failures(lines):
+    """Check that a prompt for the implementer account names the sections of its rules.
+
+    Each section that the ROLE section does not name is one failure line.
+    """
     match = PARENTHESES.search(lines[0]) if lines else None
     if not match or not IMPLEMENTER.search(match["inside"]):
         return []
     number, text = section_text(lines, "ROLE")
     # A missing ROLE section is already a failure of its own.
-    if number is None or COMMENT_STANDARD.search(text):
+    if number is None:
         return []
     return [f"line {number}: a prompt for the implementer account must name the section "
-            f"Comment standard of CLAUDE.md in its ROLE section"]
+            f"{name} of CLAUDE.md in its ROLE section"
+            for name, pattern in IMPLEMENTER_SECTIONS if not pattern.search(text)]
 
 
 def read_section_lines(lines):
@@ -256,7 +265,7 @@ def prompt_failures(lines):
     failures, first_id = first_line_failures(first)
     failures += section_failures(lines)
     failures += read_failures(lines, clean_room_on(lines))
-    failures += comment_standard_failures(lines)
+    failures += implementer_section_failures(lines)
     failures += last_line_failures(max(len(lines), 1), last, first_id)
     return failures
 

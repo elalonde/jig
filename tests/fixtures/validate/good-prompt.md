@@ -4,9 +4,9 @@ UNATTENDED: Eric is not watching. Ask no questions; take the most
 MODEL CHECK: this unit needs Opus. If not: report first line
   "NEEDS ERIC: model is <actual>, not Opus", commit, push, stop.
 EFFORT: high, set by jig start. Risk at a lower level: a missed case.
-ROLE: implementer. Rules: CLAUDE.md, the section Comment standard.
-  Spec tag: spec-p0. Prohibited sources: none. Never force-push,
-  rewrite history, or delete tags or releases.
+ROLE: implementer. Rules: CLAUDE.md, the sections Comment standard and
+  Commit message standard. Spec tag: spec-p0. Prohibited sources: none.
+  Never force-push, rewrite history, or delete tags or releases.
 STATE: the previous unit is closed; its report is on origin; the premise
   check verifies it.
 READ: the spec, the part on the prompt form.

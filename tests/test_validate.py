@@ -323,7 +323,8 @@ class ValidatePromptTest(ValidateCase):
         role = " ".join(" ".join(blocks["ROLE"]).split())
         self.assertTrue(role.startswith(
             "ROLE: <role>. Rules: CLAUDE.md, the sections <names>; when the first line names "
-            "the implementer account, also Comment standard. Spec tag: <the approved tag>. "), role)
+            "the implementer account, also Comment standard and Commit message standard. "
+            "Spec tag: <the approved tag>. "), role)
         escalation = " ".join(" ".join(blocks["ESCALATION"]).split())
         self.assertTrue(escalation.endswith("for: <the escalation cases>."), escalation)
 
@@ -346,7 +347,8 @@ class ValidatePromptTest(ValidateCase):
     def test_validate_prompt_accepts_an_implementer_prompt_with_the_comment_standard(self):
         text = fixture("good-prompt.md")
         self.assertIn("(implementer, ", text.splitlines()[0])
-        self.assertIn("Rules: CLAUDE.md, the section Comment standard.", text)
+        self.assertIn("Rules: CLAUDE.md, the sections Comment standard and\n"
+                      "  Commit message standard.", text)
         self.assert_valid("prompt", text)
 
     def test_validate_prompt_accepts_the_comment_standard_wrapped_across_role_lines(self):
@@ -354,6 +356,55 @@ class ValidatePromptTest(ValidateCase):
         blocks["ROLE"] = ["ROLE: implementer. Rules: CLAUDE.md, the sections Unit rules and Comment",
                           "    standard. Spec tag: spec-p0.", *blocks["ROLE"][1:]]
         self.assert_valid("prompt", prompt_text(first, blocks, last))
+
+    def test_validate_prompt_refuses_an_implementer_prompt_without_the_commit_message_standard(
+            self):
+        # The ROLE section names the comment rules but not the commit message rules, so
+        # the prompt fails with exactly one line, which names the missing section.
+        first, blocks, last = prompt_parts()
+        blocks["ROLE"] = ["ROLE: implementer. Rules: CLAUDE.md, the section Comment standard.",
+                          "  Spec tag: spec-p0.", *blocks["ROLE"][2:]]
+        failures = self.assert_invalid("prompt", prompt_text(first, blocks, last),
+                                       "line 7: a prompt for the implementer account must name "
+                                       "the section Commit message standard of CLAUDE.md in its "
+                                       "ROLE section")
+        self.assertEqual(len(failures), 1, failures)
+
+    def test_validate_prompt_names_each_missing_section_of_an_implementer_prompt(self):
+        # A ROLE section that names neither section gives one failure line for each,
+        # both on the line of the ROLE label.
+        first, blocks, last = prompt_parts()
+        blocks["ROLE"] = ["ROLE: implementer. Rules: CLAUDE.md, the section Unit rules.",
+                          "  Spec tag: spec-p0.", *blocks["ROLE"][2:]]
+        failures = self.assert_invalid("prompt", prompt_text(first, blocks, last))
+        self.assertEqual(len(failures), 2, failures)
+        self.assertTrue(failures[0].endswith(
+            ": line 7: a prompt for the implementer account must name the section "
+            "Comment standard of CLAUDE.md in its ROLE section"), failures)
+        self.assertTrue(failures[1].endswith(
+            ": line 7: a prompt for the implementer account must name the section "
+            "Commit message standard of CLAUDE.md in its ROLE section"), failures)
+
+    def test_validate_prompt_does_not_take_the_commit_message_standard_from_state(self):
+        # The name in STATE does not stand in for the name in ROLE: the prompt still
+        # fails for the missing section.
+        first, blocks, last = prompt_parts()
+        blocks["ROLE"] = ["ROLE: implementer. Rules: CLAUDE.md, the section Comment standard.",
+                          "  Spec tag: spec-p0.", *blocks["ROLE"][2:]]
+        blocks["STATE"] = ["STATE: the Commit message standard section is in CLAUDE.md."]
+        self.assert_invalid("prompt", prompt_text(first, blocks, last),
+                            "must name the section Commit message standard")
+
+    def test_validate_prompt_accepts_the_commit_message_standard_wrapped_at_either_space(self):
+        # A ROLE section may break the name at either of its two spaces, with any
+        # indent on the next line, and the prompt still passes.
+        for head, tail in (("Commit", "message standard."), ("Commit message", "standard.")):
+            with self.subTest(head):
+                first, blocks, last = prompt_parts()
+                blocks["ROLE"] = [
+                    f"ROLE: implementer. Rules: CLAUDE.md, Comment standard and {head}",
+                    f"    {tail} Spec tag: spec-p0.", *blocks["ROLE"][2:]]
+                self.assert_valid("prompt", prompt_text(first, blocks, last))
 
     def test_validate_prompt_accepts_each_spec_tag_form_of_a_version_line(self):
         # A project that ships releases names spec-X.Y or spec-X.YrM where a project

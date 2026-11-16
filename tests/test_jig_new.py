@@ -525,6 +525,40 @@ class JigNewTest(JigNewCase):
         self.assertIn("The commit-msg hook checks messages with the patterns of the first "
                       "bullet only, not with these", rules)
 
+    def test_made_claude_md_has_the_commit_message_standard_after_the_comment_standard(self):
+        # A new project's CLAUDE.md holds the commit message rules a to e in full, in
+        # the section right after the comment rules, because the implementer's prompt
+        # names that section and jig validate prompt refuses one that does not.
+        self.made()
+        text = (self.home / "ws/src/demo-dev/CLAUDE.md").read_text(encoding="utf-8")
+        headings = [line for line in text.splitlines() if line.startswith("## ")]
+        self.assertIn("## Commit message standard", headings)
+        place = headings.index("## Comment standard")
+        self.assertEqual(headings[place + 1], "## Commit message standard", headings)
+        section = text.split("\n## Commit message standard\n", 1)[1].split("\n## ", 1)[0]
+        flat = " ".join(section.split())
+        self.assertTrue(flat.startswith(
+            "Every commit message in the product is written for the reader of the comment "
+            "standard: a competent maintainer who has never seen the specs, the process or "
+            "the `-dev` repo. The history of the product is public."), flat)
+        for rule in (
+                "- a. The subject says what the commit changes, in the imperative (\"Add\", "
+                "\"Fix\", \"Read\"), in at most 72 characters, with no period at the end.",
+                "- b. When the reason is not plain from the subject, a blank line and then a "
+                "body: why the change was needed and which failure it prevents, in full "
+                "sentences, with lines of at most 72 characters.",
+                "- c. No unit IDs, rule IDs, finding numbers, spec sections or process words. "
+                "The link from a rule to the commit lives in the `-dev` repo.",
+                "- d. No padding: no praise of the change, no list of the tests that pass, and "
+                "no retelling of the diff line by line.",
+                "- e. The trailers are the ones of the product repo rules, and nothing hides "
+                "that an AI wrote the code."):
+            self.assertIn(rule, flat)
+        self.assertTrue(flat.endswith(
+            "Every prompt whose first line names the implementer account names this section "
+            "on its ROLE line, beside \"Comment standard\", and `jig validate prompt` refuses "
+            "such a prompt that does not."), flat)
+
     def test_make_check_exits_0_in_both_repos_while_empty(self):
         # A new project has no trace and no ID classes yet, and both checks pass. The
         # jig on PATH is this tree's dispatcher, and the empty install root leaves it no
