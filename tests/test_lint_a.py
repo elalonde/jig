@@ -210,6 +210,54 @@ class LintATest(TempTestCase):
         self.assert_doc_line("// run Step 3.", refused=False, name="lib.rs")
         self.assert_doc_line('const A: &str = "Step 3.";', refused=False, name="lib.rs")
 
+    def test_lint_a_reads_c_comments_and_doc_comments(self):
+        # Each kind of C comment is read, in a source file and in a header, also
+        # a doc comment, the later line of a block comment and the line that a
+        # backslash carries a // comment on to.
+        for text in ("int main(void) { return 0; } // from someone@example.org\n",
+                     "/// Ask someone@example.org.\nint main(void);\n",
+                     "/**\n * from 172.16.4.9\n */\n",
+                     "// ask \\\n   someone@example.org\nint x;\n"):
+            for name in ("src/sig.c", "include/sig.h"):
+                self.write(name, text)
+                self.assert_refused(f"{name}:")
+                (self.product / name).unlink()
+
+    def test_lint_a_generic_patterns_skip_c_strings_and_code(self):
+        # An address, a host, a record ID and a section number pass in a string
+        # of a C file, with comment signs inside it, in a character constant and
+        # on a preprocessor line; the same text in a comment is refused.
+        words = "someone@example.org at 172.16.4.9, by R-12, see section 4"
+        self.write("src/sig.c", f'const char *a = "// {words} /*";\n'
+                                "int c = '//';\n"
+                                f"#error {words}\n")
+        self.assert_clean()
+        self.write("src/sig.c", f"int c; // {words}\n")
+        result = self.lint()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for problem in ("e-mail address", "R-12", "172.16.4.9", "section"):
+            self.assertIn(problem, result.stderr)
+
+    def test_lint_a_reads_every_line_of_a_c_file_it_cannot_read(self):
+        # A block comment that is never closed leaves every line to be read,
+        # strings included, and a step label after the // sign of such a file is
+        # still at the start of its line.
+        self.write("src/sig.c", '// Step 3\nconst char *a = "someone@example.org";\n'
+                                "/* never closed\n")
+        result = self.lint()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("src/sig.c:1: step or case label", result.stderr)
+        self.assertIn("src/sig.c:2: e-mail address", result.stderr)
+
+    def test_lint_a_reads_step_labels_after_c_comment_signs(self):
+        self.assert_doc_line("/// Step 3.", refused=True, name="sig.c")
+        self.assert_doc_line("//! Step 3.", refused=True, name="sig.h")
+        self.assert_doc_line("int a; /* Case 2 */", refused=True, name="sig.c")
+        self.assert_doc_line("/*! Step 3: */", refused=True, name="sig.c")
+        self.assert_doc_line("/*\n * Step 3:\n */", refused=True, name="sig.c")
+        self.assert_doc_line("// run Step 3.", refused=False, name="sig.c")
+        self.assert_doc_line('const char *a = "Step 3.";', refused=False, name="sig.c")
+
     def test_lint_a_reads_yaml_and_makefile_comments(self):
         for name in ("flow.yml", "Makefile"):
             self.write(name, "# from 172.16.4.9\n")

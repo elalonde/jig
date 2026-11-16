@@ -63,17 +63,18 @@ Each failure of coverage is the one line <path>:<line>: <ID>: <problem>. A
 broken specs/ids.tsv gives its one line and nothing else.
 
 gen reads the comments of the named product files, with the comment signs lint A
-uses, and adds one entry to trace/<product path>.json for each comment that cites
-IDs of the general form. It reads Python and shell files, with their # comments,
-and Rust files, the files named *.rs, with their // and /* */ comments, doc
-comments included; any other file fails with one line, and so does a file whose
-comments or strings cannot be read to their end. A block of full-line comments
-is one comment and is tied to the next code line; a comment on a code line,
-before or after its code, is tied to that line; a comment with no code line
-before or after it is file-level. A Rust block comment that starts on a line of
-its own and ends on code is tied to the line where it ends. An entry with the
-same text, occurrence and comment lines as one already in the file replaces it in
-place, so running gen again adds nothing. gen never writes to the product.
+uses, and adds one entry to trace/<product path>.json for each comment that
+cites IDs of the general form. It reads Python and shell files, with their #
+comments, Rust files, the files named *.rs, and C files, the files named *.c or
+*.h, with their // and /* */ comments, doc comments included; any other file
+fails with one line, and so does a file whose comments or strings cannot be read
+to their end. A block of full-line comments is one comment and is tied to the
+next code line; a comment on a code line, before or after its code, is tied to
+that line; a comment with no code line before or after it is file-level. A Rust
+or C block comment that starts on a line of its own and ends on code is tied to
+the line where it ends. An entry with the same text, occurrence and comment
+lines as one already in the file replaces it in place, so running gen again adds
+nothing. gen never writes to the product.
 
 When the ID map specs/id-map.tsv exists, gen finds and reads a comment's IDs as
 check does in the pre-import tree, with the general ID form in place of the
@@ -116,7 +117,7 @@ from jig_trace import FormError  # noqa: E402
 FILL = "<fill>"
 # The subject of the commit that jig release prepare makes.
 RELEASE_SUBJECT = re.compile(r"Release [0-9]+\.[0-9]+\.[0-9]+")
-# The attributes that make git name Python, bash and Rust functions in hunk headers.
+# The attributes that make git name Python, bash, Rust and C functions in hunk headers.
 DIFF_ATTRIBUTES = pathlib.Path(ROOT) / "share" / "trace-diff.gitattributes"
 USAGE = "jig trace check | coverage | gen <product path> ... | form <commit>"
 # The kinds of object that git cat-file --batch can find; only a blob is a file.

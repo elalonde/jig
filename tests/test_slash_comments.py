@@ -1,4 +1,4 @@
-"""The reader of // and /* */ comments in lib/lint_a.py, on Rust text."""
+"""The reader of // and /* */ comments in lib/lint_a.py, on Rust and C text."""
 
 import pathlib
 import sys
@@ -11,17 +11,18 @@ sys.path.insert(0, str(ROOT / "lib"))
 import lint_a  # noqa: E402
 
 RUST = lint_a.slash_language(pathlib.Path("src/lib.rs"))
+C = lint_a.slash_language(pathlib.Path("src/sig.c"))
 
 
-def comments(text):
-    """The comments of a Rust text as (first line, last line, [words of each line])."""
-    read = lint_a.slash_comments(text, RUST)
+def comments(text, language=RUST):
+    """The comments of a text as (first line, last line, [words of each line])."""
+    read = lint_a.slash_comments(text, language)
     return [(found.first, found.last, [words for _number, words in found.pieces])
             for found in read.comments]
 
 
-def code(text):
-    return sorted(lint_a.slash_comments(text, RUST).code)
+def code(text, language=RUST):
+    return sorted(lint_a.slash_comments(text, language).code)
 
 
 class FileKindTest(unittest.TestCase):
@@ -188,6 +189,120 @@ class UnreadableTest(unittest.TestCase):
             with self.assertRaises(lint_a.UnreadableText) as caught:
                 lint_a.slash_comments(text, RUST)
             self.assertEqual(str(caught.exception), message)
+
+
+def c_comments(text):
+    return comments(text, C)
+
+
+def c_code(text):
+    return code(text, C)
+
+
+class CFileKindTest(unittest.TestCase):
+
+    def test_a_file_named_c_or_h_is_c_whatever_its_first_line(self):
+        # A source file and a header are both C, and a first line that names an
+        # interpreter does not make either of them a script.
+        for name in ("src/sig.c", "include/sig.h"):
+            self.assertEqual(lint_a.slash_language(pathlib.Path(name)).name, "C", name)
+        self.assertFalse(lint_a.is_shell(pathlib.Path("include/run.h"), "#!/bin/sh\n"))
+        self.assertFalse(lint_a.is_python(pathlib.Path("src/run.c"), "#!/usr/bin/python3\n"))
+
+    def test_names_that_only_look_like_c_have_no_slash_language(self):
+        for name in ("sig.cc", "sig.hpp", "sig.c.orig", "notes.ch"):
+            self.assertIsNone(lint_a.slash_language(pathlib.Path(name)), name)
+
+
+class CLineCommentTest(unittest.TestCase):
+
+    def test_line_comments_and_doc_comments_lose_their_signs(self):
+        # More slashes or one ! after // go with the sign, as in the Doxygen
+        # forms, and a line with only the sign gives an empty line.
+        text = "// plain\n/// three\n//! bang\n//// four  \n//\n"
+        self.assertEqual(c_comments(text), [(1, 1, ["plain"]), (2, 2, ["three"]),
+                                            (3, 3, ["bang"]), (4, 4, ["four"]), (5, 5, [""])])
+
+    def test_a_backslash_at_the_end_carries_a_line_comment_on(self):
+        # The backslash stays in the text of the first line, and the next line is
+        # comment text as it stands, its own // included; the line after is code.
+        text = "// tail \\\n// cont\nint x;\n"
+        self.assertEqual(c_comments(text), [(1, 2, ["tail \\", "// cont"])])
+        self.assertEqual(c_code(text), [3])
+
+
+class CBlockCommentTest(unittest.TestCase):
+
+    def test_a_block_comment_on_one_line(self):
+        self.assertEqual(c_comments("/* one line */\n"), [(1, 1, ["one line"])])
+
+    def test_a_block_comment_over_several_lines_in_the_star_style(self):
+        # The leading star of each later line goes, and the lines with only the
+        # opening or the closing sign give empty lines.
+        text = "/*\n * first\n *   second\n */\nint x;\n"
+        self.assertEqual(c_comments(text), [(1, 4, ["", "first", "second", ""])])
+        self.assertEqual(c_code(text), [5])
+
+    def test_doc_comments_lose_their_extra_stars_and_bang(self):
+        text = "/** Doc. */\n/**\n * Doc over lines.\n **/\n/*! Bang. */\n"
+        self.assertEqual(c_comments(text), [(1, 1, ["Doc."]), (2, 4, ["", "Doc over lines.", ""]),
+                                            (5, 5, ["Bang."])])
+
+    def test_block_comments_do_not_nest(self):
+        # The first */ closes the comment, so the code after it is code and the
+        # next /* opens a comment of its own.
+        text = "/* a /* b */ int x; /* c */\n"
+        self.assertEqual(c_comments(text), [(1, 1, ["a /* b"]), (1, 1, ["c"])])
+        self.assertEqual(c_code(text), [1])
+
+    def test_a_quote_inside_a_comment_starts_no_string(self):
+        # Were the apostrophe or the double quote read as opening a literal, the
+        # comment on the next line would be lost inside it.
+        text = "/* it's \" */ int a;\n// don't \"\nint b; // end\n"
+        self.assertEqual(c_comments(text), [(1, 1, ['it\'s "']), (2, 2, ["don't \""]),
+                                            (3, 3, ["end"])])
+
+
+class CLiteralTest(unittest.TestCase):
+
+    def test_comment_signs_inside_strings_and_character_constants_are_text(self):
+        # An escaped quote does not end the string, and an escaped apostrophe
+        # does not end the character constant, so the signs after them are text.
+        text = ('char *s = "a \\" // no /* no"; '
+                "char q = '\\'', m = '//', n = '/*'; // yes\n")
+        self.assertEqual(c_comments(text), [(1, 1, ["yes"])])
+
+    def test_a_string_carried_on_by_a_backslash_makes_both_code_lines(self):
+        text = 'const char *s = "first \\\n// still the string"; // yes\n'
+        self.assertEqual(c_comments(text), [(2, 2, ["yes"])])
+        self.assertEqual(c_code(text), [1, 2])
+
+    def test_a_stray_apostrophe_ends_at_its_own_line(self):
+        # The apostrophe of an #error line, or of the text of an #if 0 block,
+        # opens a character constant that the end of the line closes, so the
+        # comment sign after it is text and the comments below are still read.
+        text = ("#error can't build\n// later\n#if 0\nit's off /* not a comment\n"
+                "#endif\n// after\nint x;\n")
+        self.assertEqual(c_comments(text), [(2, 2, ["later"]), (6, 6, ["after"])])
+        self.assertEqual(c_code(text), [1, 3, 4, 5, 7])
+
+    def test_a_string_left_open_ends_at_its_own_line(self):
+        text = 'char *s = "open;\n// next\n'
+        self.assertEqual(c_comments(text), [(2, 2, ["next"])])
+        self.assertEqual(c_code(text), [1])
+
+    def test_preprocessor_lines_are_code(self):
+        text = "#include <stdio.h> // why\n#define TWO 2 /* two */\n"
+        self.assertEqual(c_comments(text), [(1, 1, ["why"]), (2, 2, ["two"])])
+        self.assertEqual(c_code(text), [1, 2])
+
+
+class CUnreadableTest(unittest.TestCase):
+
+    def test_a_block_comment_left_open_at_the_end_cannot_be_read(self):
+        with self.assertRaises(lint_a.UnreadableText) as caught:
+            lint_a.slash_comments("int a;\n/* never closed\n", C)
+        self.assertEqual(str(caught.exception), "line 2: a /* comment is not closed")
 
 
 if __name__ == "__main__":

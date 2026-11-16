@@ -289,10 +289,15 @@ class SlashLanguage:
         self.multiline = multiline
 
 
-# The languages that slash_comments reads, one row each.
+# The languages that slash_comments reads, one row each. In C a string or a
+# character constant ends at the end of its line, unless a backslash carries it
+# on, so one stray apostrophe, as in an #error line or an #if 0 block, ends at
+# its own line and leaves the rest of the file readable.
 SLASH_LANGUAGES = (
     SlashLanguage("Rust", suffixes=(".rs",), nested=True, continued=False,
                   raw_prefixes=("r", "br", "cr"), quote="char", multiline=True),
+    SlashLanguage("C", suffixes=(".c", ".h"), nested=False, continued=True,
+                  raw_prefixes=(), quote="string", multiline=False),
 )
 
 # A Rust character literal: one character, or one escape such as \n, \', a \x escape
@@ -311,8 +316,9 @@ SLASH_LINE_START = re.compile(r"\s*(?:(?://|/\*|\*)+/*!?)?\s*")
 def slash_language(path):
     """Return the SlashLanguage of a file by its name, or None for another kind of file.
 
-    The name decides alone: the first line of a Rust file may look like a
-    shebang, and the file is still Rust.
+    A file named *.rs is Rust, and a file named *.c or *.h is C. The name
+    decides alone: the first line of a Rust file may look like a shebang, and
+    the file is still Rust.
     """
     for language in SLASH_LANGUAGES:
         if path.suffix in language.suffixes:
@@ -386,6 +392,16 @@ def slash_comments(text, language):
     right, each character used once: /**/ is a whole empty comment, and /*/
     opens a comment and does not close it. Raise UnreadableText when a /*
     comment, a string or a raw string is still open at the end of the text.
+
+    Preprocessor lines and the lines of an #if 0 block are code like any other.
+    With the C rules, these cases are known to be read differently from a C
+    compiler: a header name such as <a//b.h> is read as code followed by a //
+    comment; a backslash at the end of a line joins it to the next only inside a
+    string, a character constant or a // comment, so a /* or */ split by such a
+    backslash is not seen; a backslash followed by spaces or a carriage return
+    before the end of the line does not carry anything on, which leaves a //
+    comment or a string of a file with CRLF line ends to end at its own line;
+    and the trigraph ??/ is not read as a backslash.
     """
     lines = text.split("\n")
     shebang = text.startswith("#!") and not text.startswith("#![")
@@ -517,8 +533,8 @@ def slash_doc_lines(text, language):
 def doc_lines(path, text):
     """Return (line number, text, start) for the part of a file the generic patterns read.
 
-    A Python file gives its comments and docstrings, a Rust file its // and /*
-    */ comments and its shebang line, a shell, YAML or make file its '#'
+    A Python file gives its comments and docstrings, a Rust or C file its //
+    and /* */ comments and its shebang line, a shell, YAML or make file its '#'
     comments, and any other file every line. The start is the line from where
     its words begin, which the step and case labels are matched against: after
     the '#' signs and spaces of a comment, after the signs of a // or /* */

@@ -1,6 +1,6 @@
 # Git attributes that jig trace form passes to git show, so that the header of
-# each hunk names the Python, bash or Rust function it falls in. Without them git
-# names the nearest line that starts with a letter, which is often a class or
+# each hunk names the Python, bash, Rust or C function it falls in. Without them
+# git names the nearest line that starts with a letter, which is often a class or
 # an import, not the function that changed.
 *.py diff=python
 *.sh diff=bash
@@ -8,3 +8,7 @@
 # The methods of a Rust impl block are indented, so without this rule git would
 # name the impl line for a change inside any of them.
 *.rs diff=rust
+# A label of a C function, such as the target of a goto, starts at column 0, so
+# without this rule git would name the label for a change below it.
+*.c diff=cpp
+*.h diff=cpp

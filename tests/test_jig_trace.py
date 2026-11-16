@@ -754,7 +754,7 @@ class GenTest(TraceCase):
         self.assertEqual(len(lines), 3, result.stderr)
         self.assertIn("jig trace gen: src/gone.py: the product has no file", lines[0])
         self.assertIn("jig trace gen: ../outside.py: is outside the product", lines[1])
-        self.assertIn("jig trace gen: README.md: is not Python, shell or Rust", lines[2])
+        self.assertIn("jig trace gen: README.md: is not Python, shell, Rust or C", lines[2])
         self.assertFalse((self.dev / "trace" / "README.md.json").exists())
         self.assertEqual(self.entries("src/count.py"), COUNT_ENTRIES)
 
@@ -1050,7 +1050,7 @@ class RustGenTest(TraceCase):
             "(line 2: a /* comment is not closed)",
             "jig trace gen: src/string.rs: cannot be read as Rust (line 1: a string is not closed)",
             "jig trace gen: src/raw.rs: cannot be read as Rust (line 1: a raw string is not closed)",
-            "jig trace gen: src/tool.go: is not Python, shell or Rust, so it has no comment "
+            "jig trace gen: src/tool.go: is not Python, shell, Rust or C, so it has no comment "
             "signs to read",
         ])
         for name in open_files:
@@ -1066,6 +1066,187 @@ def shapes(value):
             "        e = 5", "        f = 6", "        return a"]
     return "\n".join(["class Box:", "    def width(self):", *body, "",
                       "    def height(self):", *body]) + "\n"
+
+
+# A C product file with full-line comments: a header with no code before it, a
+# run that mixes // and /* */ lines, two blocks split by a blank line, a block
+# comment with a blank line inside, and a last comment with no code after it.
+C_RUNS_LINES = [
+    "// Reads the counts, after R-1.",
+    "#include <stddef.h>",
+    "",
+    "/// Counts the lines, R-1;",
+    "/* the old name R-1a is gone. */",
+    "size_t count(const char **lines)",
+    "{",
+    "    return lines != NULL;",
+    "}",
+    "",
+    "// First block, R-1.",
+    "",
+    "// Second block, C-core-2.",
+    "int first(void)",
+    "{",
+    "    /* A note with a gap, R-1.",
+    "",
+    "       still the same note. */",
+    "    return 0;",
+    "}",
+    "/*",
+    " * Nothing follows this note on R-1.",
+    " */",
+]
+C_RUNS_ENTRIES = [
+    entry(0, "", ["R-1"], comments=["Reads the counts, after R-1."]),
+    entry(6, "size_t count(const char **lines)", ["R-1"],
+          comments=["Counts the lines, R-1;", "the old name R-1a is gone."]),
+    entry(14, "int first(void)", ["R-1"], comments=["First block, R-1."]),
+    entry(14, "int first(void)", ["C-core-2"], comments=["Second block, C-core-2."]),
+    entry(19, "return 0;", ["R-1"], comments=["A note with a gap, R-1.", "", "still the same note."]),
+    entry(0, "", ["R-1"], comments=["", "Nothing follows this note on R-1.", ""]),
+]
+# A C product file with comments on code lines: after the code, before it, both,
+# a block comment that goes on to a line with a comment of its own, a block
+# comment that starts on a comment line and ends on a code line, and comment
+# signs and quotes inside strings and character constants.
+C_MIXED_LINES = [
+    "int main(void)",
+    "{",
+    "    int x = 1; // After code, R-1.",
+    "    /* Before code, R-1. */ int y = 2;",
+    "    /* Both sides, R-1 */ f(); // and after.",
+    "    g(); /* Over two lines, R-1,",
+    "       then more */ // and one more.",
+    "    // Below the trailing note, C-core-2.",
+    "    h();",
+    "    /* Ends on code, R-1,",
+    "       here. */ k();",
+    "    puts(\"it's // not a comment\"); char q = '\"'; // After the literals, R-1.",
+    "    return x + y;",
+    "}",
+]
+C_MIXED_ENTRIES = [
+    entry(3, "int x = 1; // After code, R-1.", ["R-1"], comments=["After code, R-1."]),
+    entry(4, "/* Before code, R-1. */ int y = 2;", ["R-1"], comments=["Before code, R-1."]),
+    entry(5, "/* Both sides, R-1 */ f(); // and after.", ["R-1"],
+          comments=["Both sides, R-1", "and after."]),
+    entry(6, "g(); /* Over two lines, R-1,", ["R-1"],
+          comments=["Over two lines, R-1,", "then more", "and one more."]),
+    entry(9, "h();", ["C-core-2"], comments=["Below the trailing note, C-core-2."]),
+    entry(11, "here. */ k();", ["R-1"], comments=["Ends on code, R-1,", "here."]),
+    entry(12, C_MIXED_LINES[11].strip(), ["R-1"], comments=["After the literals, R-1."]),
+]
+# The first lines of C files: a block comment at the top that ends on code is
+# still file-level, as nothing comes before it, and so is the doc comment at the
+# top of a header; an #error line with an apostrophe in it leaves the comment
+# below it to be read and tied to the code after it.
+C_TOP_FILES = {
+    "src/top.c": "/* Header, R-1,\n   ends on code. */ int x;\nint main(void) { return x; }\n",
+    "include/count.h": "/**\n * Declares the counter, R-1.\n */\nint count(void);\n",
+    "src/old.c": "#if 0\n#error can't build\n#endif\n// Below the error, R-1.\nint y;\n",
+}
+C_TOP_ENTRIES = {
+    "src/top.c": [entry(0, "", ["R-1"], comments=["Header, R-1,", "ends on code."])],
+    "include/count.h": [entry(0, "", ["R-1"], comments=["", "Declares the counter, R-1.", ""])],
+    "src/old.c": [entry(5, "int y;", ["R-1"], comments=["Below the error, R-1."])],
+}
+
+
+class CGenTest(TraceCase):
+    """jig trace gen on the C files of the fixture product."""
+
+    def setUp(self):
+        super().setUp()
+        self.files = {"src/runs.c": "\n".join(C_RUNS_LINES) + "\n",
+                      "src/mixed.c": "\n".join(C_MIXED_LINES) + "\n", **C_TOP_FILES}
+        for name, text in self.files.items():
+            self.write(self.product / name, text)
+        self.git_commit_all(self.product)
+
+    def gen(self, *paths):
+        return run([TRACE, "gen", *(paths or self.files)], env=self.env(), cwd=self.dev)
+
+    def entries(self, product_path):
+        path = self.dev / "trace" / f"{product_path}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_gen_ties_full_line_c_comments_to_the_next_code_line_or_the_file(self):
+        # Consecutive comment lines are one comment whatever signs they use, a
+        # blank line outside a comment splits two, and the first and the last
+        # comment, with no code before or after them, are file-level.
+        result = self.gen("src/runs.c")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.entries("src/runs.c"), C_RUNS_ENTRIES)
+
+    def test_gen_ties_c_comments_on_a_code_line_to_that_line(self):
+        # Every comment that starts on a code line, before or after the code,
+        # belongs to that line, with the later lines of a block comment and a
+        # comment that starts on them; a block comment that starts on a comment
+        # line and ends on code is tied to the line where it ends. The comment
+        # signs inside a string are not a comment.
+        result = self.gen("src/mixed.c")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.entries("src/mixed.c"), C_MIXED_ENTRIES)
+
+    def test_gen_reads_the_first_lines_of_c_files_and_headers(self):
+        result = self.gen(*C_TOP_FILES)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual({name: self.entries(name) for name in C_TOP_FILES}, C_TOP_ENTRIES)
+
+    def test_gen_on_c_files_then_check_passes_and_a_second_run_changes_no_byte(self):
+        self.assertEqual(self.gen().returncode, 0)
+        self.assert_passes()
+        before = {name: (self.dev / "trace" / f"{name}.json").read_bytes() for name in self.files}
+        result = self.gen()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual({name: (self.dev / "trace" / f"{name}.json").read_bytes()
+                          for name in self.files}, before)
+
+    def test_gen_with_a_map_on_c_files_then_the_pre_import_search_passes(self):
+        # The C comments of a product file still cite the old IDs of the map, in
+        # each kind of comment, and its commit is the pre-import tree. gen writes
+        # the new IDs, so the search of that tree for IDs left out passes too.
+        self.write(self.dev / "specs/jig-spec.md",
+                   SPEC_TEXT + "Then R-3, R-5, R-7, R-40, R-90 and R-91.\n")
+        self.write(self.dev / "specs/id-map.tsv", ID_MAP_HEADER + MAP_ROWS)
+        self.write(self.product / "src/mapped.c", "\n".join([
+            "/* Keeps F-7 in mind. */",
+            "int step1(void) { return 0; }",
+            "// R-8 gave way to R-5.",
+            "int step2(void) { return '\"'; }",
+            'static const char *name = "plain"; /* Follows OLD.3 here. */',
+            "/**",
+            " * Both F-1 and F-2 apply.",
+            " */",
+            "int step4(void) { return 0; }",
+        ]) + "\n")
+        self.git_commit_all(self.product)
+        self.write(self.dev / "trace/pre-import", self.head() + "\n")
+        result = self.gen(*self.files, "src/mapped.c")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual([item["ids"] for item in self.entries("src/mapped.c")],
+                         [["R-7", "R-40"], ["R-5"], ["R-3"], ["R-1"]])
+        self.assert_passes()
+
+    def test_gen_fails_one_line_for_a_c_file_left_open(self):
+        # A block comment that never closes fails its file with one line and no
+        # trace file, and the good file is still written; a file of a kind gen
+        # does not know fails too.
+        open_files = {"src/comment.c": "int a;\n/* never closed, R-1.\n",
+                      "src/tool.go": "// R-1\npackage main\n"}
+        for name, text in open_files.items():
+            self.write(self.product / name, text)
+        result = self.gen(*open_files, "src/runs.c")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.splitlines(), [
+            "jig trace gen: src/comment.c: cannot be read as C "
+            "(line 2: a /* comment is not closed)",
+            "jig trace gen: src/tool.go: is not Python, shell, Rust or C, so it has no comment "
+            "signs to read",
+        ])
+        for name in open_files:
+            self.assertFalse((self.dev / "trace" / f"{name}.json").exists(), name)
+        self.assertEqual(self.entries("src/runs.c"), C_RUNS_ENTRIES)
 
 
 class FormTest(TraceCase):
@@ -1168,6 +1349,31 @@ class RustFormTest(TraceCase):
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertEqual(result.stdout.splitlines()[5:],
                          ["| src/meter.rs | pub fn width(&self) -> u32 { | <fill> |"])
+
+
+# A C function with a goto label at column 0, whose body changes four lines below
+# the label. git's default rule would name the label, as it starts with a letter
+# at column 0; the C rule that form turns on skips labels and names the function.
+def work(value):
+    return "\n".join(["int work(int n)", "{", "    int a = 1;", "    if (n < 0)",
+                      "        goto out;", "    a = 2;", "out:", "    a += 1;", "    a += 2;",
+                      "    a += 3;", f"    a += {value};", "    a += 5;", "    a += 6;",
+                      "    a += 7;", "    return a + n;", "}"]) + "\n"
+
+
+class CFormTest(TraceCase):
+
+    def test_form_names_the_c_function_and_not_the_label_a_change_falls_below(self):
+        # A commit that changes the body below the label gives one row, which
+        # names the function and not the label.
+        self.write(self.product / "src/work.c", work(4))
+        self.git_commit_all(self.product)
+        self.write(self.product / "src/work.c", work(40))
+        self.git_commit_all(self.product)
+        result = run([TRACE, "form", "HEAD"], env=self.env(), cwd=self.dev)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(result.stdout.splitlines()[5:],
+                         ["| src/work.c | int work(int n) | <fill> |"])
 
 
 # The records of a fixture project with one class for each coverage check, all of
