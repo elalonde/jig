@@ -298,11 +298,13 @@ class WaitsTestCase(TempTestCase):
         self.theirs.mkdir(parents=True)
         self.fresh()
 
-    def fresh(self, state="busy", since=None):
+    def fresh(self, state="busy", since=None, written=None):
         """Write the other project's activity file as its running loop does."""
         now = datetime.datetime.now().astimezone()
+        written = written or now
         (self.theirs / "activity").write_text(
-            f"{state}\t{orch.stamp(since or now)}\t{orch.stamp(now)}\n", encoding="utf-8")
+            f"{state}\t{orch.stamp(since or written)}\t{orch.stamp(written)}\n",
+            encoding="utf-8")
 
     def wait_on(self, *args, **extra):
         return run([ORCH, PROJECT, "wait-on", *args], env=self.env(**extra))
@@ -391,12 +393,16 @@ class TestWaitOn(WaitsTestCase):
         warning = [line for line in result.stdout.splitlines() if "warning" in line]
         self.assertEqual(len(warning), 1)
         self.assertIn("older than 0.8.0 or no loop runs", warning[0])
+        # With polls of a minute, a file written just now is fresh however slowly the
+        # command starts, and one written an hour ago is stale; no test waits on a clock.
         self.fresh()
-        result = self.wait_on(OTHER, "a block", JIG_ORCH_ACTIVITY="0.5")
+        result = self.wait_on(OTHER, "a block", JIG_ORCH_ACTIVITY="60")
         self.assertNotIn("warning", result.stdout)
-        time.sleep(1.6)
-        result = self.wait_on(OTHER, "a block", JIG_ORCH_ACTIVITY="0.5")
-        self.assertIn("warning: other has no activity file since", result.stdout)
+        hour_ago = datetime.datetime.now().astimezone() - datetime.timedelta(hours=1)
+        self.fresh(written=hour_ago)
+        result = self.wait_on(OTHER, "a block", JIG_ORCH_ACTIVITY="60")
+        self.assertIn(f"warning: other has no activity file since {orch.stamp(hour_ago)}",
+                      result.stdout)
 
 
 class TestStatusLines(OrchTestCase):
@@ -461,6 +467,9 @@ class TestLoopStall(LoopWaitsCase):
         # logs once. The stall line comes after the stall time; then the other loop
         # writes busy, and the resumed line comes after 3 busy polls.
         (self.srv / "host.conf").write_text("ORCH_STALL_MINUTES=soon\n", encoding="utf-8")
+        # The wait is written before the first start, so the project's own orch
+        # directory is made here, as an earlier start of its loop would have made it.
+        (self.reviews / "orch").mkdir(parents=True)
         (self.home / "ws" / "reviews" / OTHER / "orch").mkdir(parents=True)
         result = run([ORCH, PROJECT, "wait-on", OTHER, "the step 10 block"],
                      env=self.base_env())
@@ -488,13 +497,15 @@ class TestLoopStall(LoopWaitsCase):
         writer.start()
         try:
             self.until(lambda: "resumed: other busy" in self.events(), what="the resumed line")
+            resumed = time.monotonic() - busy
+            # Read while the other loop still writes: once it stops, its file goes stale
+            # and a second stall line follows, as it should.
+            lines = [line for line in self.events() if line.startswith(("stall", "resumed"))]
         finally:
             done.set()
             writer.join()
-        resumed = time.monotonic() - busy
         self.assertGreaterEqual(resumed, 2 * float(self.activity))
-        self.assertEqual([line for line in self.events() if line.startswith(("stall", "resumed"))],
-                         [stall, "resumed: other busy"])
+        self.assertEqual(lines, [stall, "resumed: other busy"])
         self.assertEqual(self.log().count("ORCH_STALL_MINUTES='soon' is not a whole number"), 1)
         print(f"\nstall line {stalled:.1f} s after the start, stall time {self.stall} s; "
               f"resumed line {resumed:.1f} s after the other turned busy, "

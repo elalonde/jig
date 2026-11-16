@@ -312,9 +312,10 @@ class PrepareHeavyTest(ReleaseCase):
     """The host allows one heavy row at a time, and prepare runs one."""
 
     def test_prepare_waits_for_a_held_heavy_slot_and_then_passes(self):
-        # The test holds the only slot for about two seconds. The heavy row waits in jig
-        # run-check, its wait lines show in prepare's output while it waits, and prepare
-        # then passes.
+        # The test holds the only slot until prepare prints that it waits for it, so
+        # the wait is seen however slowly prepare reaches its heavy row. The heavy row
+        # waits in jig run-check, its wait lines show in prepare's output while it
+        # waits, and prepare then passes.
         heavy = self.tmp / "heavy"
         heavy.mkdir()
         (self.srv / "host.conf").write_text("HEAVY_SLOTS=1\n", encoding="utf-8")
@@ -324,9 +325,24 @@ class PrepareHeavyTest(ReleaseCase):
         slot = release.jig_checks.Slot(1, release.jig_checks.try_slot(heavy / "1"))
         self.addCleanup(slot.release)
         os.write(slot.descriptor, b"other\tab12\tbuild\tsomeone\t-\t1\n")
-        timer = threading.Timer(2, slot.release)
-        timer.start()
-        self.addCleanup(timer.cancel)
+        output = self.tmp / f"run{self.runs + 1}.out"
+        stop = threading.Event()
+
+        def release_when_waiting():
+            # A minute at most, so that a prepare that never prints the line still ends
+            # and the assertion below names what is missing.
+            deadline = time.monotonic() + 60
+            while not stop.is_set() and time.monotonic() < deadline:
+                if output.exists() and "every heavy slot is held, waiting" in \
+                        output.read_text(encoding="utf-8"):
+                    break
+                time.sleep(0.05)
+            slot.release()
+
+        watcher = threading.Thread(target=release_when_waiting)
+        watcher.start()
+        self.addCleanup(watcher.join)
+        self.addCleanup(stop.set)
         result = self.prepare()
         self.assertEqual(result[0], 0, result)
         self.assertIn("every heavy slot is held, waiting: slot 1: project other, unit ab12, "

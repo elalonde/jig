@@ -343,6 +343,55 @@ class JigNewExistingTest(JigNewCase):
         self.assertEqual(self.git("-C", clone, "remote", "get-url", "origin").strip(),
                          str(local))
 
+    def commit_on_master(self, repo):
+        """Make a commit on top of master in the repo, with no branch on it; return it."""
+        return self.git("-C", repo, "commit-tree", "master^{tree}", "-p", "master",
+                        "-m", "later").strip()
+
+    def test_step_one_stops_at_a_tag_that_only_github_holds(self):
+        # GitHub holds a tag that the local repo lacks, so the clone would gain a ref
+        # it never had from its origin: step 1 stops and names that tag.
+        self.made_existing()
+        self.make_github()
+        local, clone = self.local_origin()
+        master = self.git("-C", self.bare, "rev-parse", "master").strip()
+        self.git("-C", self.bare, "update-ref", "refs/tags/github-only", master)
+        self.assert_step_one_stops(
+            f"new: implementer: refs/tags/github-only differs between {local} and GitHub; "
+            "nothing changed")
+        self.assertEqual(self.git("-C", clone, "remote", "get-url", "origin").strip(),
+                         str(local))
+
+    def test_step_one_stops_at_a_branch_at_another_commit_on_each_side(self):
+        # Both sides hold the branch phase-1, but the local repo has it one commit
+        # further: step 1 stops and names that branch.
+        self.made_existing()
+        self.make_github()
+        local, clone = self.local_origin()
+        self.git("-C", local, "update-ref", "refs/heads/phase-1",
+                 self.commit_on_master(local))
+        self.assert_step_one_stops(
+            f"new: implementer: refs/heads/phase-1 differs between {local} and GitHub; "
+            "nothing changed")
+        self.assertEqual(self.git("-C", clone, "remote", "get-url", "origin").strip(),
+                         str(local))
+
+    def test_clone_part_repoints_when_the_local_head_names_another_branch(self):
+        # The branch phase-1 is a commit ahead of master on both sides, and the local
+        # repo's HEAD names phase-1 while GitHub's names master. HEAD is no branch of
+        # its own, so the refs still match and the clone is repointed.
+        self.made_existing()
+        self.make_github()
+        self.git("-C", self.bare, "update-ref", "refs/heads/phase-1",
+                 self.commit_on_master(self.bare))
+        local, clone = self.local_origin()
+        self.git("-C", local, "symbolic-ref", "HEAD", "refs/heads/phase-1")
+        result = self.run_block_part('product "$IMPL"\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"implementer product repointed from {local},", result.stdout)
+        self.assertEqual(self.git("-C", clone, "remote", "get-url", "origin").strip(),
+                         PRODUCT_URL)
+
     def test_step_one_stops_at_a_place_that_is_not_a_clone(self):
         self.made_existing()
         self.make_github()
