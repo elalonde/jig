@@ -146,6 +146,11 @@ IDs (separated by commas, `-` for none) and, with 5 columns, the kind: `unit`,
 `pre-check` or `review`. A file with 4 columns has only rows of kind `unit`.
 Rows of kind `pre-check` and `review` do not count toward the 6 units.
 
+Start `jig batch` detached, on a line of its own, so that it is no background
+shell of this session and a rollover does not stop it:
+`setsid nohup jig batch @PROJECT@ <batch file> > ~/ws/reviews/@PROJECT@/orch/<batch name>.out 2>&1 < /dev/null &`
+Its lines go to that output file; `pgrep -f 'jig-batch @PROJECT@ '` prints its pid.
+
 When `log: <ID>` reaches origin, `jig batch` runs `jig report @PROJECT@ <ID>`,
 and starts the next row only when the report's status is `OK` and the
 validation passed. It closes the reporting worker with `jig close` before the
@@ -220,20 +225,26 @@ the exit code.
   - 0: go on.
   - 3, at about 250k tokens: roll over. Start no new step. Finish the step in
     hand, write `state.md` and `handoff.md`, commit them, and end the session:
-    stop every background shell and the watcher, then run
-    `jig orch @PROJECT@ rollover`. The supervisor starts a fresh session.
+    stop every background shell and the watcher, but not a detached
+    `jig batch`, then run `jig orch @PROJECT@ rollover`. The supervisor starts a fresh session.
   - 4, at about 280k tokens: exit after the current tool call. Stop every
-    background shell and the watcher, then run `jig orch @PROJECT@ rollover`.
+    background shell and the watcher, but not a detached `jig batch`, then
+    run `jig orch @PROJECT@ rollover`.
   - 2, no size: go on. A fresh session has none until its status line first
     writes, within about a minute. When it lasts longer, name it in the next
     hourly update.
 - Roll over also at every batch boundary, in the same way.
 - End the session only with `jig orch @PROJECT@ rollover`, never by asking
   Eric to type `/exit`. It ends the session at once, so stop every background
-  shell and the watcher first: a shell that still runs can carry the old
-  session on beside the new one.
+  shell and the watcher first (a detached `jig batch` is neither): a shell that
+  still runs can carry the old session on beside the new one.
 - A running unit is a separate session in a worker account, and a rollover
-  does not affect it. Name it in `handoff.md`.
+  does not affect it. Name it in `handoff.md`; in a batch also the batch file,
+  the output file and the pid of `jig batch`. The fresh session reads the tail
+  of the output file, runs `jig wait` on the running unit and starts no second
+  `jig batch` while that pid lives; when `jig batch` was stopped, it waits for
+  the running unit, runs `jig report` and `jig close`, then runs the same batch
+  file again.
 - A fresh session reads this file, `state.md`, `handoff.md`, the jig change
   log since the pinned version, the newest report if a unit runs, and the
   events of the old session (`jig orch @PROJECT@ events --old`); nothing

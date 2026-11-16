@@ -401,7 +401,10 @@ def slash_comments(text, language):
     backslash is not seen; a backslash followed by spaces or a carriage return
     before the end of the line does not carry anything on, which leaves a //
     comment or a string of a file with CRLF line ends to end at its own line;
-    and the trigraph ??/ is not read as a backslash.
+    a digit separator of C23, as in 1'000, opens a character constant, so with
+    an odd number of apostrophes on a line the rest of that line is read as
+    the constant, and a comment after it on the same line is not seen; and the
+    trigraph ??/ is not read as a backslash.
     """
     lines = text.split("\n")
     shebang = text.startswith("#!") and not text.startswith("#![")

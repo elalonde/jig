@@ -35,7 +35,8 @@ usage: jig orch <project> start | stop | status | events [--old] | rollover
   wait-on <other> <what>...
           writes the line of <other> in orch/waits: the project waits on <other> for
           <what>; the since of the line is kept when the line holds the same <what>.
-          It refuses when ~/ws/reviews/<other>/orch/ does not exist, and warns when
+          It refuses when ~/ws/reviews/<project>/orch/ or ~/ws/reviews/<other>/orch/
+          does not exist, and makes neither; it warns when
           the activity file of <other> is missing or stale: its loop then writes
           none, because it runs a jig older than 0.8.0 or no loop runs
   wait-on <other> --clear
@@ -898,10 +899,13 @@ def wait_on(project, words, poll):
         print("jig orch: usage: wait-on <other> takes the thing it waits for, or --clear",
               file=sys.stderr)
         return USAGE
-    if not clear and not orch_dir(other).is_dir():
-        print(f"jig orch: refused: wait-on: {orch_dir(other)} does not exist: no "
-              f"orchestrator of {other} runs on this host", file=sys.stderr)
-        return REFUSED
+    # A mistyped name on either side would leave a wait that no loop reads, so both
+    # orch directories must exist already; the command makes neither.
+    for name in (project, other):
+        if not clear and not orch_dir(name).is_dir():
+            print(f"jig orch: refused: wait-on: {orch_dir(name)} does not exist: no "
+                  f"orchestrator of {name} runs on this host", file=sys.stderr)
+            return REFUSED
     try:
         old = waits_file.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -920,7 +924,6 @@ def wait_on(project, words, poll):
         fields = line.split("\t")
         if len(fields) == 3 and fields[2] == what and parse_stamp(fields[1]):
             since = fields[1]
-    waits_file.parent.mkdir(parents=True, exist_ok=True)
     lines = [*kept, f"{other}\t{since}\t{what}"]
     write_whole(waits_file, "".join(f"{line}\n" for line in lines))
     print(f"jig orch: {project} waits on {other} since {since}: {what}")

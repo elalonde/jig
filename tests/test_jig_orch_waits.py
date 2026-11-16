@@ -372,6 +372,17 @@ class TestWaitOn(WaitsTestCase):
         self.assertIn("no orchestrator of nobody", result.stderr)
         self.assertEqual(self.waits(), [])
 
+    def test_refusal_when_the_project_itself_has_no_orch_directory(self):
+        # The first name is mistyped, so its orch directory does not exist. The wait
+        # would sit in a file that no loop reads; the command refuses in one line that
+        # names the directory, and makes nothing.
+        result = run([ORCH, "nobody", "wait-on", OTHER, "a block"], env=self.env())
+        missing = self.home / "ws" / "reviews" / "nobody"
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stderr.count("\n"), 1, result.stderr)
+        self.assertIn(f"{missing / 'orch'} does not exist", result.stderr)
+        self.assertFalse(missing.exists())
+
     def test_missing_or_stale_activity_file_gives_a_warning_after_the_write(self):
         (self.theirs / "activity").unlink()
         result = self.wait_on(OTHER, "a block")
