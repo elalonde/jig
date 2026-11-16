@@ -8,7 +8,9 @@ closes it as a dead unit. The hook test starts a fixture project twice, with and
 without the term check on origin, and reads jig's pre-commit hook in its product
 clone; a second hook test starts it with a pre-commit hook that the product tracks. The version line test reads a spec tag of a version line from a fixture
 prompt with jig start's own readers, and starts the fixture project with it. The
-tests use their own test IDs, which no real unit uses.
+kickoff tag test does the same with the tag of the kickoff record, annotated, on an
+origin with no spec tag, and is refused once a spec tag reaches origin. The tests
+use their own test IDs, which no real unit uses.
 """
 
 import getpass
@@ -56,6 +58,8 @@ HOOK_SESSION = f"{HOOK_PROJECT}-impl-{HOOK_UNIT}"
 HOOK_TAG = "spec-p0"
 # The approval tag of the specs of the version line 1.2.
 LINE_TAG = "spec-1.2"
+# The approval tag of the kickoff record, which a project has before any spec tag.
+KICKOFF_TAG = "kickoff-r1"
 HOOK_CONF = HOME / ".config" / "jig" / f"{HOOK_PROJECT}.conf"
 HOOK_PROMPTS = HOME / "ws" / "prompts" / HOOK_PROJECT
 # Where a fixture case with clones in this account's ~/ws/src puts them: the -dev
@@ -261,6 +265,9 @@ class FixtureProjectCase(unittest.TestCase):
 
     IN_HOME = False
     PRODUCT_HOOKS = ("commit-msg",)
+    # Whether origin of the fixture -dev clone gets the phase tag HOOK_TAG. A case
+    # without it has an origin with no spec tag, as a project before its first spec.
+    PHASE_TAG_ON_ORIGIN = True
 
     def setUp(self):
         places = (HOOK_CONF, HOOK_PROMPTS, HOOK_REVIEWS,
@@ -298,8 +305,9 @@ class FixtureProjectCase(unittest.TestCase):
         # The -dev clone ignores the local settings that the start writes.
         (self.seed / ".gitignore").write_text(".claude/settings.local.json\n", encoding="utf-8")
         self.push_checks(terms=True)
-        self.git("-C", str(self.seed), "tag", HOOK_TAG)
-        self.git("-C", str(self.seed), "push", "-q", "origin", HOOK_TAG)
+        if self.PHASE_TAG_ON_ORIGIN:
+            self.git("-C", str(self.seed), "tag", HOOK_TAG)
+            self.git("-C", str(self.seed), "push", "-q", "origin", HOOK_TAG)
         self.git("clone", "-q", "-b", "master", str(dev_origin), str(self.dev))
 
         self.git("init", "-q", "-b", "master", str(self.product))
@@ -501,6 +509,70 @@ class RealVersionLineTagTest(FixtureProjectCase):
                                       f"{LINE_TAG}^{{commit}}"))
         self.assertEqual((worktree / "specs" / "spec.md").read_text(encoding="utf-8"),
                          "the spec of the line\n")
+
+
+
+class RealKickoffTagTest(FixtureProjectCase):
+    """jig start with the kickoff record's tag on the ROLE line, before any spec tag.
+
+    The fixture's origin holds no spec tag, and the kickoff tag is annotated, as the
+    tags that jig tag makes are: git ls-remote then lists it a second time with ^{},
+    and the worker reads that output to see whether origin holds a spec tag. As in the
+    version line test, jig start's own readers take the tags from the prompt, and the
+    worker part runs for real on the fixture project. Then an annotated spec tag
+    reaches origin, and the same start is refused.
+    """
+
+    PHASE_TAG_ON_ORIGIN = False
+
+    def test_real_start_puts_the_approved_worktree_at_a_kickoff_tag(self):
+        (self.seed / "specs").mkdir()
+        (self.seed / "specs" / "00-kickoff.md").write_text("the kickoff record\n",
+                                                           encoding="utf-8")
+        self.git("-C", str(self.seed), "add", "-A")
+        self.git("-C", str(self.seed), "commit", "-q", "--no-verify", "-m", "kickoff record")
+        self.git("-C", str(self.seed), "push", "-q", "origin", "master")
+        self.git("-C", str(self.seed), "tag", "-a", "-m", "approve the kickoff record",
+                 KICKOFF_TAG)
+        self.git("-C", str(self.seed), "push", "-q", "origin", KICKOFF_TAG)
+        listed = self.git("-C", str(self.dev), "ls-remote", "--tags", "origin")
+        print(f"origin of the fixture lists: {' '.join(listed.split()[1::2])}")
+        self.prompt.write_text("ROLE: implementer. Rules: CLAUDE.md, the section Comment\n"
+                               f"  standard. Spec tag: {KICKOFF_TAG}. Prohibited sources: none.\n"
+                               "STATE: Say OK, then stop.\n", encoding="utf-8")
+
+        start = load_script("jig_start", START)
+        role_line = start.role_section(self.prompt.read_text(encoding="utf-8"))
+        tags = list(dict.fromkeys(start.ROLE_TAG.findall(role_line)))
+        approved = start.SPEC_TAG.search(role_line)
+        print(f"jig start reads the tags {tags} and the approved tag "
+              f"{approved[1] if approved else None}")
+        self.assertEqual(tags, [KICKOFF_TAG])
+        self.assertEqual(approved[1], KICKOFF_TAG)
+
+        self.run_worker(*[word for tag in tags for word in ("--tag", tag)],
+                        "--approved-tag", approved[1])
+        worktree = pathlib.Path(f"{self.dev}-approved")
+        at = self.git("-C", str(worktree), "rev-parse", "HEAD")
+        named = self.git("-C", str(worktree), "describe", "--tags", "--exact-match")
+        print(f"approved worktree of the fixture: at {named} {at}")
+        self.assertEqual(named, KICKOFF_TAG)
+        self.assertEqual(at, self.git("-C", str(self.dev_origin), "rev-parse",
+                                      f"{KICKOFF_TAG}^{{commit}}"))
+        self.assertEqual((worktree / "specs" / "00-kickoff.md").read_text(encoding="utf-8"),
+                         "the kickoff record\n")
+
+        # Once an annotated spec tag reaches origin, the same start is refused.
+        self.stop_session()
+        self.git("-C", str(self.seed), "tag", "-a", "-m", "approve the specs", HOOK_TAG)
+        self.git("-C", str(self.seed), "push", "-q", "origin", HOOK_TAG)
+        refused = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
+                          "--expected", EXPECTED, "--model", MODEL, "--tag", KICKOFF_TAG,
+                          "--approved-tag", KICKOFF_TAG, env=self.env)
+        print(f"worker with a spec tag on origin: {refused.stderr.strip()}")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("refused: tag:", refused.stderr)
+        self.assertIn(f"origin holds the spec tag {HOOK_TAG}", refused.stderr)
 
 
 if __name__ == "__main__":

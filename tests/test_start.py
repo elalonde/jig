@@ -1,4 +1,6 @@
 import grp
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pwd
@@ -19,6 +21,7 @@ import jig_ids  # noqa: E402
 
 JIG = ROOT / "bin" / "jig"
 WORKER = ROOT / "libexec" / "jig-start-worker"
+START = ROOT / "libexec" / "jig-start"
 HOOK = ROOT / "hooks" / "pre-commit"
 GOOD_PROMPT = ROOT / "tests" / "fixtures" / "validate" / "good-prompt.md"
 TEMPLATE = ROOT / "templates" / "project.conf"
@@ -74,6 +77,15 @@ Back\\slash, \\n, 100% of it; a & b | c > d * ? ~ # ! end
 After an empty line.
   An indented line.
 """
+
+
+def load_start():
+    """Load jig start, which has no .py name, as a module."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("jig_start", str(START))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
 
 
 class StartCase(TempTestCase):
@@ -203,6 +215,27 @@ class StartCase(TempTestCase):
         (self.seed / name).write_text("more\n", encoding="utf-8")
         self.git_commit_all(self.seed)
         self.ok(["git", "-C", self.seed, "push", "-q", "origin", "master"])
+
+    def push_annotated_tag(self, tag):
+        """Tag the seed's head with an annotated tag, as jig tag makes them, and push it."""
+        self.ok(["git", "-C", self.seed, "tag", "-a", "-m", f"approve {tag}", tag])
+        self.ok(["git", "-C", self.seed, "push", "-q", "origin", tag])
+
+    def drop_spec_tag_from_origin(self):
+        """Leave origin with no spec tag, as a project has before its first spec is approved.
+
+        The clones keep their local copy, which must not count: origin decides.
+        """
+        self.ok(["git", "-C", self.origin, "tag", "-d", "spec-p0"])
+
+    def push_kickoff_record(self, tag):
+        """Put a kickoff record on origin with no spec tag, approved by an annotated tag."""
+        self.drop_spec_tag_from_origin()
+        (self.seed / "specs" / "00-kickoff.md").write_text("the kickoff record\n",
+                                                           encoding="utf-8")
+        self.git_commit_all(self.seed)
+        self.ok(["git", "-C", self.seed, "push", "-q", "origin", "master"])
+        self.push_annotated_tag(tag)
 
     def track_update_log(self):
         """Put the orchestrator's update log on origin and in the orchestrator's clone.
@@ -384,6 +417,42 @@ class StartPreconditionTest(StartCase):
     def test_start_refuses_an_implementer_prompt_without_a_spec_tag(self):
         self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: none.")
         self.assert_refused(self.start(), "tag")
+
+    def test_start_refuses_a_kickoff_tag_as_the_approved_tag_once_origin_has_a_spec_tag(self):
+        # The kickoff tag is on origin, so only the spec tag beside it can refuse it: first
+        # the fixture's plain phase tag, then an annotated version-line tag alone.
+        self.push_annotated_tag("kickoff-r1")
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: kickoff-r1.")
+        result = self.start()
+        self.assert_refused(result, "tag")
+        self.assertIn("origin holds the spec tag spec-p0: the project has an approved spec",
+                      result.stderr)
+        self.drop_spec_tag_from_origin()
+        self.push_annotated_tag("spec-1.2r1")
+        result = self.start()
+        self.assert_refused(result, "tag")
+        self.assertIn("origin holds the spec tag spec-1.2r1", result.stderr)
+        self.assertFalse((self.worker_home / "ws" / "src" / "jig-dev-approved").exists())
+
+    def test_start_refuses_a_kickoff_tag_as_the_approved_tag_in_a_review_too(self):
+        # A review in the implementer account gets the approved worktree, so the same
+        # rule holds for it.
+        self.push_annotated_tag("kickoff-r1")
+        self.replace_in_prompt("jig-impl-demo (implementer,", "jig-rev-demo (implementer,")
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: kickoff-r1.")
+        result = self.start(role="rev")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refused: tag:", result.stderr)
+        self.assertIn("the project has an approved spec", result.stderr)
+
+    def test_start_refuses_a_kickoff_tag_missing_on_origin(self):
+        # With no spec tag on origin the kickoff tag would be taken, but it must exist there.
+        self.drop_spec_tag_from_origin()
+        self.ok(["git", "-C", self.worker_clone, "tag", "kickoff-r4"])
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: kickoff-r4.")
+        result = self.start()
+        self.assert_refused(result, "tag")
+        self.assertIn("kickoff-r4 is not on origin", result.stderr)
 
     def test_start_refuses_a_model_other_than_the_prompts(self):
         self.assert_refused(self.start("--model", "claude-sonnet-5-5"), "model")
@@ -614,6 +683,61 @@ git push -q origin master
                 self.assertTrue((worktree / f"{tag}.md").is_file())
                 self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
                 self.lock().unlink()
+
+    def test_start_puts_the_approved_worktree_at_a_kickoff_tag_before_any_spec_tag(self):
+        # Origin holds the kickoff record's tag and no spec tag, so the implementer unit
+        # starts with the read-only worktree at the kickoff tag.
+        self.push_kickoff_record("kickoff-r1")
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: kickoff-r1.")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.worker_home / "ws" / "src" / "jig-dev-approved"
+        record = worktree / "specs" / "00-kickoff.md"
+        self.assertEqual(record.read_text(encoding="utf-8"), "the kickoff record\n")
+        self.assertEqual(self.ok(["git", "-C", worktree, "rev-parse", "HEAD"]),
+                         self.ok(["git", "-C", self.origin, "rev-parse", "kickoff-r1^{commit}"]))
+        for path in (record, record.parent, worktree):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o222, 0, path)
+
+    def test_start_gives_a_review_in_the_implementer_account_the_kickoff_worktree(self):
+        self.push_kickoff_record("kickoff-r1")
+        self.replace_in_prompt("jig-impl-demo (implementer,", "jig-rev-demo (implementer,")
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: kickoff-r1.")
+        result = self.start(role="rev")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.worker_home / "ws" / "src" / "jig-dev-approved"
+        self.assertEqual(self.ok(["git", "-C", worktree, "rev-parse", "HEAD"]),
+                         self.ok(["git", "-C", self.origin, "rev-parse", "kickoff-r1^{commit}"]))
+
+    def test_start_keeps_the_spec_tag_as_the_approved_tag_beside_a_kickoff_tag(self):
+        # A ROLE line that names a spec tag starts as before when origin also holds a
+        # kickoff tag, named on the line or not: the worktree goes to the spec tag. The
+        # kickoff tag sits on a later commit, so the worktree shows which tag it took.
+        self.push_from_seed()
+        self.push_annotated_tag("kickoff-r1")
+        for line in ("Spec tag: spec-p0.", "Spec tag: spec-p0, kickoff-r1."):
+            with self.subTest(line=line):
+                self.prompt.write_text(GOOD_PROMPT.read_text(encoding="utf-8").replace(
+                    "Spec tag: spec-p0.", line), encoding="utf-8")
+                result = self.start()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                worktree = self.worker_home / "ws" / "src" / "jig-dev-approved"
+                self.assertEqual(self.ok(["git", "-C", worktree, "rev-parse", "HEAD"]),
+                                 self.ok(["git", "-C", self.origin, "rev-parse",
+                                          "spec-p0^{commit}"]))
+                self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+                self.lock().unlink()
+
+    def test_start_lets_a_spec_unit_name_the_kickoff_tag_while_origin_has_a_spec_tag(self):
+        # Outside the implementer account the kickoff tag is no approved tag: it only has
+        # to be on origin, so a spec tag there does not refuse the start.
+        self.push_annotated_tag("kickoff-r3")
+        self.replace_in_prompt("jig-impl-demo (implementer,", "jig-spec-demo (specwriter,")
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: kickoff-r3.")
+        result = self.start(role="spec")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.worker_home / "ws" / "src" / "jig-dev-approved").exists())
+        self.assertEqual(self.tmux("has-session", "-t", "=jig-spec-demo").returncode, 0)
 
     def test_start_gives_a_spec_unit_no_worktree(self):
         self.replace_in_prompt("jig-impl-demo (implementer,", "jig-spec-demo (specwriter,")
@@ -954,6 +1078,13 @@ class StartWorkerAloneTest(StartCase):
         for line in WORKER.read_text(encoding="utf-8").splitlines():
             if line.startswith(("import ", "from ")):
                 self.assertIn(line.split()[1].split(".")[0], sys.stdlib_module_names, line)
+
+    def test_start_worker_agrees_with_start_on_the_spec_tag_form(self):
+        # The worker keeps its own copy of the form, because it cannot import jig start.
+        # jig start loads the worker as a module, which gives both values here.
+        start = load_start()
+        self.assertEqual(start.worker.SPEC_FORM, start.SPEC_FORM)
+        self.assertEqual(start.worker.KICKOFF_FORM, start.KICKOFF_FORM)
 
     def test_start_worker_agrees_with_the_shared_id_module(self):
         for unit in ("demo", "p0st0", "abcdef", "abcdefg", "Demo", "a-b", "a/b", "../x", ""):

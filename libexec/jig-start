@@ -9,10 +9,20 @@ validate prompt and matches the arguments; no lock; the role's account in the
 conf file equals the prompt's; the spec tag of the ROLE line, when it names one,
 is of a spec tag form; then, in the worker account: origin fetched and the branch
 checked out, a clean tree, a fast-forward to origin, HEAD equal to it, every tag of
-the ROLE line on origin, no pre-commit hook other than jig's and no hook path outside
-the clone in the worker's product clone; last, the model the prompt names. A change
+the ROLE line on origin, no spec tag on origin when the approved tag is a kickoff tag
+(below), no pre-commit hook other than jig's and no hook path outside the clone in the
+worker's product clone; last, the model the prompt names. A change
 to impl/orch/updates.log alone does not make the tree unclean: jig orch appends its
 idle lines there, and the orchestrator commits them with its next commit.
+
+In the implementer account, whatever the role, the tag after "Spec tag:" on the ROLE
+line is the approved tag, at which the worker puts the read-only worktree
+~/ws/src/<project>-dev-approved. It is a spec tag, or kickoff-rN, the tag of the
+kickoff record, for a unit that must run before the project has any spec tag. The
+kickoff tag serves only until then: once origin holds a tag of a spec form, the worker
+refuses it, so that no implementer unit works from the kickoff record while an
+approved spec exists. In the other accounts a kickoff tag on the ROLE line is only
+checked to be on origin, as every tag there is.
 
 Only then the status commit goes to origin, committed alone in this account's clone;
 a refused push gets one fetch and one rebase with --autostash, so an uncommitted
@@ -72,9 +82,13 @@ SECTION = re.compile(r"[A-Z][A-Z ]*:(?: |$)")
 # and the suffix rM marks a revision. A tag ends at a character that cannot continue
 # it, so spec-1.2.3 is not read as spec-1.2.
 SPEC_FORM = r"spec-p[0-9]+(?:r[0-9]+)?|spec-[0-9]+\.[0-9]+(?:r[0-9]+)?"
+# The tag that approves the kickoff record. After "Spec tag:" it stands in for a spec
+# tag until the project has one; the worker refuses it after that.
+KICKOFF_FORM = r"kickoff-r[0-9]+"
 TAG_END = r"(?![\w-]|\.[0-9])"
-ROLE_TAG = re.compile(rf"(?<![\w-])(?:{SPEC_FORM}|(?:impl-p|kickoff-r)[0-9]+){TAG_END}")
-SPEC_TAG = re.compile(rf"Spec tag:\s*({SPEC_FORM}){TAG_END}")
+ROLE_TAG = re.compile(rf"(?<![\w-])(?:{SPEC_FORM}|impl-p[0-9]+|{KICKOFF_FORM}){TAG_END}")
+# The approved tag, which jig start passes on only in the implementer account.
+SPEC_TAG = re.compile(rf"Spec tag:\s*({SPEC_FORM}|{KICKOFF_FORM}){TAG_END}")
 # The word after "Spec tag:" when it starts like a tag, to refuse one of no spec form.
 SPEC_TAG_WORD = re.compile(r"Spec tag:\s*(spec-[\w.-]*)")
 SPEC_FORM_NAMES = "spec-pN, spec-p<N>r<M>, spec-X.Y or spec-X.YrM"

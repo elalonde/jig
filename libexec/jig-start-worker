@@ -8,8 +8,11 @@ usage: jig-start-worker <project> <role> <ID> <prompt> --expected <minutes> --mo
 
 The check stage refuses, in order: a lock, a live session of that name, a role
 account that differs, no fetch or the wrong branch, a dirty tree, a failed
-fast-forward, a HEAD other than origin, a tag missing on origin, and another
-pre-commit hook than jig's, or a hook path outside the clone, in the product clone.
+fast-forward, a HEAD other than origin, a tag missing on origin, a kickoff tag
+as the approved tag while origin holds a spec tag, and another pre-commit hook than
+jig's, or a hook path outside the clone, in the product clone. The approved tag is the
+tag of --approved-tag, which jig start passes in the implementer account: a spec tag,
+or kickoff-rN, the tag of the kickoff record, before the project has any spec tag.
 A change to
 impl/orch/updates.log alone does not make the tree dirty, because jig orch appends
 idle lines there between the orchestrator's commits. The launch
@@ -73,6 +76,12 @@ import time
 # Copied from lib/jig_ids.py, which this script cannot import; a test holds them equal.
 UNIT_ID = re.compile(r"[a-z0-9]{1,6}")
 PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+# Copied from SPEC_FORM of jig start, which this script cannot import; a test holds them
+# equal. A tag of this form on origin means that the project has an approved spec.
+SPEC_FORM = r"spec-p[0-9]+(?:r[0-9]+)?|spec-[0-9]+\.[0-9]+(?:r[0-9]+)?"
+# The tag that approves the kickoff record.
+KICKOFF_FORM = r"kickoff-r[0-9]+"
 
 # The one file of the clone that may hold a change when a unit starts.
 UPDATES_LOG = "impl/orch/updates.log"
@@ -210,6 +219,39 @@ def check_clone(conf, tags):
     for tag in tags:
         if not git_out(clone, "ls-remote", "--tags", "origin", f"refs/tags/{tag}"):
             refuse("tag", f"{tag} is not on origin")
+
+
+def origin_spec_tags(clone):
+    """Return the tags on origin that are of a spec tag form, sorted.
+
+    git ls-remote lists an annotated tag twice, the second time with the suffix ^{},
+    for the commit it points to; both name the same tag.
+    """
+    listed = git(clone, "ls-remote", "--tags", "origin")
+    if listed.returncode != 0:
+        refuse("fetch", f"cannot list the tags of origin in {clone}: {last_line(listed)}")
+    names = set()
+    for line in listed.stdout.splitlines():
+        ref = line.partition("\t")[2]
+        name = ref.removeprefix("refs/tags/").removesuffix("^{}")
+        if re.fullmatch(SPEC_FORM, name):
+            names.add(name)
+    return sorted(names)
+
+
+def check_kickoff_tag(clone, tag):
+    """Refuse the kickoff tag as the approved tag once the project has a spec tag.
+
+    The kickoff tag lets an implementer unit start before the first spec is approved.
+    After that the unit must read an approved spec, so the prompt has to name its tag.
+    """
+    if not re.fullmatch(KICKOFF_FORM, tag):
+        return
+    found = origin_spec_tags(clone)
+    if found:
+        refuse("tag", f"the approved tag {tag} is the kickoff record's, but origin holds the "
+                      f"spec tag {found[-1]}: the project has an approved spec, so the ROLE "
+                      "line names its tag (spec-pN, spec-p<N>r<M>, spec-X.Y or spec-X.YrM)")
 
 
 def bring_to_origin(conf, head):
@@ -635,11 +677,14 @@ def check(args, conf, session):
     check_session(session)
     check_account(conf, args.role, args.account)
     check_clone(conf, [*args.tag, *([args.approved_tag] if args.approved_tag else [])])
+    if args.approved_tag:
+        check_kickoff_tag(conf["REPO"], args.approved_tag)
     product = product_clone(conf)
     set_hooks_path(product)
     check_hook(product)
     if args.role == "impl" and not args.approved_tag:
-        refuse("tag", "an implementer unit needs a spec tag for its approved worktree")
+        refuse("tag", "an implementer unit needs a spec tag for its approved worktree, "
+                      "or a kickoff tag before the project has a spec tag")
 
 
 def launch(args, conf, session):
