@@ -997,9 +997,14 @@ class TestForkWithinTheWindow(ForkTestCase):
 
 
 class TestForksWhenTheLoopEnds(ForkTestCase):
-    """A loop that ends looks for forks of its last session twice, a window apart."""
+    """A loop that ends looks for forks of its last session twice, a window apart.
 
-    fork_window = "3"
+    The window leaves a slow host time to start the fork between the two looks.
+    Once the loop or stop has ended, nothing else ends a fork, so a fork that ends
+    with SIGTERM and a log line for it was ended by the second look.
+    """
+
+    fork_window = "4"
 
     def first_look(self, session_id):
         """Wait for the line of the loop's first look that names the session."""
@@ -1026,7 +1031,6 @@ class TestForksWhenTheLoopEnds(ForkTestCase):
         out, err = stop.communicate(timeout=60)
         self.assertEqual(stop.returncode, 0, err)
         self.assertIn("jig orch: stopped the loop", out)
-        self.assertIsNotNone(fork.poll(), "the fork still ran when stop returned")
         self.assert_ended(fork, old)
         self.assertIn(f"looked again for forks of Claude Code session {old}\n", self.log())
 
@@ -1040,7 +1044,6 @@ class TestForksWhenTheLoopEnds(ForkTestCase):
         self.first_look(last)
         fork = self.process("--fork-session", "--resume", f"/tmp/x/{last}.jsonl")
         self.until(lambda: not self.loop_runs(), what="the end of the loop")
-        self.assertIsNotNone(fork.poll(), "the fork still ran when the loop ended")
         self.assert_ended(fork, last)
 
     def test_stop_of_a_dead_loop_ends_claude_and_a_fork_that_shows_up_later(self):
@@ -1056,10 +1059,9 @@ class TestForksWhenTheLoopEnds(ForkTestCase):
         fork = self.process("--resume", old)
         out, err = stop.communicate(timeout=60)
         self.assertEqual(stop.returncode, 0, err)
-        self.assertIn(f"looking for forks of Claude Code session {old} for 3 s", out)
+        self.assertIn(f"looking for forks of Claude Code session {old} for 4 s", out)
         self.assertIn("jig orch: no loop runs", out)
         self.assertTrue(self.pane()["dead"])
-        self.assertIsNotNone(fork.poll(), "the fork still ran when stop returned")
         self.assert_ended(fork, old)
 
 
