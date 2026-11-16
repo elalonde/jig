@@ -53,7 +53,8 @@ def pattern_file_differences(path):
     return differences
 
 
-class JigNewTest(TempTestCase):
+class JigNewCase(TempTestCase):
+    """The fixture layout of jig new: a srv root, an ssh double and fixture accounts."""
 
     def setUp(self):
         super().setUp()
@@ -109,6 +110,9 @@ class JigNewTest(TempTestCase):
         result = self.new(PROJECT)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
+
+
+class JigNewTest(JigNewCase):
 
     def test_new_project_makes_every_path(self):
         self.made()

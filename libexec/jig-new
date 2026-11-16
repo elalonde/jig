@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Make a new project: directories, conf files, seed repos and the owner's block.
 
-usage: jig new <project>
+usage: jig new <project> [--existing]
 
 Run as the orchestrator account. In each role account it makes ~/ws/src,
 ~/ws/prompts/<project>, ~/ws/reviews/<project>, the conf file and the deploy
@@ -28,6 +28,21 @@ come from <srv>/host.conf, so they never appear in this tree. A file that exists
 changed: a second run changes nothing and exits 0. A project that exists and
 that jig new did not make is refused, and so is a bad name. Exits 1 on a
 refusal, 2 on a usage error.
+
+With --existing, the product repository already exists on GitHub, under the
+GitHub owner of host.conf and with the project's name, and jig new writes no
+file into it. It makes everything of the -dev side as above, and no product
+clone, product seed or product hook. Its block, of its own form, first checks
+that the product repository exists and what stands at ~/ws/src/<project> in
+the orchestrator and implementer accounts, and stops before any change when a
+place holds something it may not keep. Then it makes only the -dev repository,
+adds the read-only product deploy keys, and in each of those two accounts
+clones the product, keeps a clone that already uses the block's URL, or
+points a clone of the same repository at that URL. jig start installs the
+pre-commit hook in each product clone it uses. The option is explicit because
+the orchestrator account has no deploy key for the product before the block
+runs, so jig new cannot test the repository itself. A run of either form for
+a project that the other form made keeps what exists.
 """
 
 import getpass
@@ -142,19 +157,24 @@ def project_paths(srv, project):
     return [srv / part / project for part in ("blocks", "in", "out")]
 
 
-def check_not_foreign(srv, project, home):
-    """Refuse a project that exists and that jig new did not start."""
+def check_not_foreign(srv, project, home, existing=False):
+    """Refuse a project that exists and that jig new did not start.
+
+    For a product that exists already, a clone of it at ~/ws/src/<project> is
+    expected and is not a sign of a foreign project: the block decides whether it
+    keeps that clone, so it is left out here.
+    """
     marker = srv / "blocks" / project / ".jig-new"
     for path in project_paths(srv, project):
         if path.exists() and not path.is_dir():
             raise Refusal(f"{path} exists and is not a directory; not overwritten")
     if marker.is_file():
         return
-    found = [path for path in (*project_paths(srv, project),
-                               home / ".config" / "jig" / f"{project}.conf",
-                               home / "ws" / "src" / f"{project}-dev",
-                               home / "ws" / "src" / project)
-             if path.exists() or path.is_symlink()]
+    places = [*project_paths(srv, project), home / ".config" / "jig" / f"{project}.conf",
+              home / "ws" / "src" / f"{project}-dev"]
+    if not existing:
+        places.append(home / "ws" / "src" / project)
+    found = [path for path in places if path.exists() or path.is_symlink()]
     if found:
         raise Refusal(f"project {project} exists ({found[0]}) and jig new did not make "
                       "it; nothing is overwritten")
@@ -314,19 +334,21 @@ def install_pre_commit(product):
         raise Refusal(str(error)) from None
 
 
-def seed_repos(project, host, values, home):
+def seed_repos(project, host, values, home, existing=False):
     """Make the sidecar and the product clone beside it, both moved in place last.
 
     Both are built in one scratch directory next to their places. The product moves
     first, so that an existing sidecar always means that both are there; a product
-    clone with no sidecar beside it is refused rather than overwritten.
+    clone with no sidecar beside it is refused rather than overwritten. For a
+    product that exists already, only the sidecar is made, and whatever stands at
+    the product's place is left to the block.
     """
     target = home / "ws" / "src" / f"{project}-dev"
     product_target = home / "ws" / "src" / project
     if target.exists():
         say(f"kept {target}")
         return
-    if product_target.exists() or product_target.is_symlink():
+    if not existing and (product_target.exists() or product_target.is_symlink()):
         raise Refusal(f"{product_target} exists with no {target.name} beside it; "
                       "nothing is overwritten (if a stopped jig new left it, remove it "
                       "and run jig new again)")
@@ -338,30 +360,37 @@ def seed_repos(project, host, values, home):
         terms = sorted({host["OWNER"], host["HOST"], host["GITHUB_OWNER"]})
         with open(work / "terms.txt", "a", encoding="utf-8") as stream:
             stream.write("".join(f"{term}\n" for term in terms))
-        write_tree(TEMPLATES / "product", product, values)
-        for name in LINT_FILES:
-            (product / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(ROOT / name, product / name)
         env = dict(os.environ)
         github = host["GITHUB_OWNER"]
         first_commit(work, env, "Start the project records",
                      f"github-{project}-dev:{github}/{project}-dev.git")
-        first_commit(product, env, "Start the project with its checks",
-                     f"github-{project}:{github}/{project}.git")
-        install_pre_commit(product)
-        for path in (work, product):
-            path.chmod(0o755)
-        product.rename(product_target)
+        work.chmod(0o755)
+        if not existing:
+            write_tree(TEMPLATES / "product", product, values)
+            for name in LINT_FILES:
+                (product / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, product / name)
+            first_commit(product, env, "Start the project with its checks",
+                         f"github-{project}:{github}/{project}.git")
+            install_pre_commit(product)
+            product.chmod(0o755)
+            product.rename(product_target)
         work.rename(target)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     say(f"made {target}")
-    say(f"made {product_target}")
+    if not existing:
+        say(f"made {product_target}")
 
 
-def write_block(srv, project, values):
+def write_block(srv, project, values, template):
+    """Write the block from its template; return its path and whether it was made now.
+
+    A block that exists is kept as it is, whichever form wrote it, so a run of the
+    other form never replaces a block that the owner may be about to run.
+    """
     path = srv / "blocks" / project / f"{BLOCK_ID}.sh"
-    text = render((TEMPLATES / "block.sh.in").read_text(encoding="utf-8"), values)
+    text = render((TEMPLATES / template).read_text(encoding="utf-8"), values)
     long = [line for line in text.splitlines() if len(line) >= 75]
     if long:
         raise Refusal(f"a block line has 75 characters or more: {long[0]!r}")
@@ -369,21 +398,34 @@ def write_block(srv, project, values):
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
     except FileExistsError:
         say(f"kept {path}")
-    else:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(text)
-        say(f"made {path}")
-    return path
+        return path, False
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    say(f"made {path}")
+    return path, True
 
 
-def new(project):
+def summary(existing):
+    """The lines that say what the block does, for the form that wrote it."""
+    if existing:
+        return ["The block {id} checks that the product repo exists and what each",
+                "product clone place holds, makes the -dev repo and the keys, pushes",
+                "the -dev seed, clones, keeps or repoints the product clone of the",
+                "orchestrator and the implementer, and sets the policy rules, jig's",
+                "status line and ~/.tmux.conf. It writes nothing into the product."]
+    return ["The block {id} makes the GitHub repos and keys, pushes the seed repos,",
+            "clones them in the other accounts, and sets the policy rules, jig's status",
+            "line and ~/.tmux.conf."]
+
+
+def new(project, existing=False):
     srv = pathlib.Path(os.environ.get("JIG_SRV") or SRV_ROOT)
     check_name(project)
     host = read_host_conf(srv)
     if getpass.getuser() != host["ORCH_ACCOUNT"]:
         raise Refusal(f"run as {host['ORCH_ACCOUNT']}, not {getpass.getuser()}")
     home = pathlib.Path(os.path.expanduser("~"))
-    check_not_foreign(srv, project, home)
+    check_not_foreign(srv, project, home, existing)
     check_facts(host)
     for part in ("blocks", "in", "out"):
         if not (srv / part).is_dir():
@@ -409,24 +451,35 @@ def new(project):
         # Last, so that no other name is filled inside the preferences' text.
         "PREFS": prefs_text(),
     }
-    seed_repos(project, host, values, home)
-    block = write_block(srv, project, values)
+    seed_repos(project, host, values, home, existing)
+    template = "block-existing.sh.in" if existing else "block.sh.in"
+    block, made = write_block(srv, project, values, template)
     digest = hashlib.sha256(block.read_bytes()).hexdigest()[:8]
     say("")
-    say(f"The block {BLOCK_ID} makes the GitHub repos and keys, pushes the seed repos,")
-    say("clones them in the other accounts, and sets the policy rules, jig's status")
-    say("line and ~/.tmux.conf. Its readback is in "
-        f"{srv / 'out' / project / (BLOCK_ID + '.txt')}.")
+    # A kept block may be of the other form, so only a block written now is described.
+    if made:
+        lines = summary(existing)
+        for line in lines[:-1]:
+            say(line.format(id=BLOCK_ID))
+        say(f"{lines[-1]} Its readback is in "
+            f"{srv / 'out' / project / (BLOCK_ID + '.txt')}.")
     say(f"# as {host['OWNER']} on {host['HOST']}")
     say(f"jig run {project} {BLOCK_ID} {digest}")
 
 
+USAGE = """usage: jig new <project> [--existing]
+  --existing  the product repo exists on GitHub already, and jig new writes no
+              file into it. The option is explicit because this account has no
+              deploy key for the product before the block runs, so jig new
+              cannot test the repo itself."""
+
+
 def main(argv):
-    if len(argv) != 1:
-        print("usage: jig new <project>", file=sys.stderr)
+    if len(argv) not in (1, 2) or (len(argv) == 2 and argv[1] != "--existing"):
+        print(USAGE, file=sys.stderr)
         return 2
     try:
-        new(argv[0])
+        new(argv[0], existing=len(argv) == 2)
     except Refusal as refusal:
         print(f"jig new: {refusal}", file=sys.stderr)
         return 1

@@ -8,6 +8,25 @@ commit-msg hook of the product are copies of jig's own (`tools/lint-a.sh`,
 so a fix to jig's lint A reaches every new project. `lib/jig_clones.py` is how
 lint A finds the sidecar beside the product, and `terms.txt` in it.
 
+`jig new <project> --existing` is for a product repository that exists on
+GitHub already, under the GitHub owner of the host config and with the
+project's name. It copies `dev/` into the sidecar as above, and writes no file
+into the product: no `product/` tree, no lint A files, no CI workflow, no first
+product commit and no pre-commit hook. Its block is `block-existing.sh.in`. The
+block first checks that the product repository exists and what stands at
+`~/ws/src/<project>` in the orchestrator and implementer accounts, and stops
+with one line, before any change, when it finds something it may not keep.
+Then it makes and pushes only the sidecar repository, adds the read-only
+product deploy keys of those two accounts, and in each of them clones the
+product, keeps a clone whose origin is already the block's URL, or sets that
+URL as the origin of a clone of the same repository. A clone whose origin is a
+local repository on the host is repointed only when GitHub holds the same
+branches and tags at the same commits; the local repository is never changed.
+`jig start` installs the pre-commit hook in each product clone it uses. The
+option is explicit because the orchestrator account has no deploy key for the
+product before the block runs, so `jig new` cannot test the repository itself.
+A run of either form for a project that the other form made keeps what exists.
+
 `product/.github/workflows/ci.yml` is the CI skeleton of the product: a GitHub
 Actions workflow that runs `make check` on every push. The first unit after the
 kickoff adds the other gates that the project gives to CI.

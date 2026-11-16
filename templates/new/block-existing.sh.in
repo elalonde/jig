@@ -1,0 +1,326 @@
+# new  as @OWNER@ on @HOST@ — role: owner
+# jig new @PROJECT@ --existing: the steps that need the owner, for a
+# product repo that exists on GitHub already, in order 1 to 7.
+# 1 facts and the gh login, before any change: the product repo
+# exists, and the product clone place of the orchestrator and of the
+# implementer is empty or holds a clone that step 5 keeps or
+# repoints; 2 the GitHub repo of -dev; 3 deploy keys; 4 first push of
+# the -dev seed; 5 clones in the role accounts; 6 model policy rules;
+# 7 jig's status line in each account's Claude Code settings, and
+# ~/.tmux.conf. The settings get no hook of another tool. Nothing is
+# pushed to the product repo, and no product clone gets a hook or a
+# config value from this block: jig start installs the pre-commit
+# hook. gh asks for a login only when it has none, and logs out at the
+# end. Safe to run twice: each step keeps what is already there.
+# Checked by jig new: the accounts answer by ssh; the deploy keys and
+# the -dev seed repo exist; the policy file exists. Not checked: that
+# the product repo exists, which step 1 checks; that the -dev name is
+# free on GitHub; that the status line command exists, which jig
+# upgrade installs; that it runs in a new session.
+set -eu -o pipefail
+
+P=@PROJECT@
+GH=@GITHUB_OWNER@
+ORCH=@ORCH@
+SPEC=@SPEC@
+IMPL=@IMPL@
+ORCH_HOME=@ORCH_HOME@
+SPEC_HOME=@SPEC_HOME@
+IMPL_HOME=@IMPL_HOME@
+POLICY=@POLICY@
+LINE=@STATUS_LINE@
+URL=https://github.com/$GH
+# Every product clone ends with this origin, the host alias of the
+# account's deploy key, so that each clone fetches with that key.
+PURL=github-$P:$GH/$P
+d=ws/src/$P-dev
+p=ws/src/$P
+G=(git -c credential.helper=
+  -c "credential.helper=!gh auth git-credential")
+export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+T=$(mktemp -d)
+LOGIN=
+cleanup() {
+  if [ -n "$LOGIN" ]; then
+    gh auth logout --hostname github.com </dev/null >/dev/null 2>&1 ||
+      true
+  fi
+  rm -rf "$T"
+}
+trap cleanup EXIT
+die() { echo "new: $*"; exit 1; }
+# shellcheck disable=SC2029  # the command expands in the account
+on() { ssh -o BatchMode=yes "$1@localhost" "$2" </dev/null; }
+
+# The refs of a repo as sorted "ref hash" lines, from git ls-remote on
+# stdin. HEAD is left out because it names no branch of its own, and
+# GitHub's pull request refs because a local repo never has them.
+refs() {
+  awk '$2 != "HEAD" && $2 !~ /^refs\/pull\// { print $2, $1 }' |
+    LC_ALL=C sort
+}
+
+# A clone whose origin is a local repo on this host may be pointed at
+# GitHub only when GitHub holds every branch and tag of that repo at
+# the same commit and nothing more, so that the clone loses nothing.
+# Prints "repoint" and the old URL, or "stop" and the first ref that
+# differs.
+same_refs() { # account old-url
+  local mine theirs first
+  if ! mine=$(on "$1" "git -C ~/$p ls-remote origin" | refs); then
+    echo "stop cannot read the refs of $2"
+    return 0
+  fi
+  if ! theirs=$("${G[@]}" ls-remote "$URL/$P.git" </dev/null | refs)
+  then
+    echo "stop cannot read the refs of $GH/$P on GitHub"
+    return 0
+  fi
+  first=$(LC_ALL=C comm -3 <(echo "$mine") <(echo "$theirs") |
+    awk 'NR == 1 { print $1 }')
+  if [ -z "$first" ]; then
+    echo "repoint $2"
+  else
+    echo "stop $first differs between $2 and GitHub"
+  fi
+}
+
+# What stands at the product clone place of one account, as one line:
+# "absent", "kept", "repoint" and the old URL, or "stop" and the cause.
+# It changes nothing, so step 1 asks it for every account before any
+# change.
+place() { # account
+  local o u
+  o=$(ssh -o BatchMode=yes "$1@localhost" bash -s -- "$p" <<'SH'
+cd ~ || exit 1
+if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+  echo absent
+  exit 0
+fi
+top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$top" ] || [ "$top" != "$(cd "$1" 2>/dev/null && pwd -P)" ]
+then
+  echo none
+  exit 0
+fi
+echo "url $(git -C "$1" remote get-url origin 2>/dev/null || true)"
+SH
+  ) || { echo "stop cannot look at ~/$p"; return 0; }
+  case $o in
+    absent) echo absent; return 0 ;;
+    "url ") echo "stop ~/$p has no origin"; return 0 ;;
+    url\ *) ;;
+    *) echo "stop ~/$p is not a git clone"; return 0 ;;
+  esac
+  u=${o#url }
+  # The other GitHub forms of the same repo: ssh with the user that
+  # GitHub gives (any user is taken here), and https.
+  case ${u%.git} in
+    "$PURL") echo kept ;;
+    *@github.com:"$GH/$P" | ssh://*@github.com/"$GH/$P" | \
+      "https://github.com/$GH/$P") echo "repoint $u" ;;
+    /* | file://*) same_refs "$1" "$u" ;;
+    *) echo "stop ~/$p has another origin, $u" ;;
+  esac
+}
+
+# The product clone of one account: clone it from PURL when its place
+# is empty, keep a clone of PURL as it is, or set PURL as the origin of
+# a clone of the same repo and change nothing else in that clone; the
+# old local repo itself is never changed. Step 1 has stopped the block
+# for every other case, so the last branch is only a guard.
+product() { # account
+  local r head
+  r=$(place "$1")
+  case $r in
+    absent) on "$1" "git clone -q $PURL ~/$p"; r=cloned ;;
+    kept) ;;
+    repoint\ *) on "$1" "git -C ~/$p remote set-url origin $PURL"
+      r="repointed from ${r#repoint }" ;;
+    *) die "$1: ${r#stop }" ;;
+  esac
+  head=$(on "$1" "git -C ~/$p log -1 --format=%h" || echo none)
+  echo "$1 product $r, head $head"
+}
+
+echo "step 1: user=$(id -un)"
+[ "$(id -un)" = @OWNER@ ] || die "run as @OWNER@"
+[ -f ~/.tmux.conf ] || die "no ~/.tmux.conf to copy"
+for a in "$ORCH" "$SPEC" "$IMPL"; do
+  on "$a" true || die "no ssh to $a"
+done
+if ! gh auth status --hostname github.com </dev/null >/dev/null 2>&1
+then
+  LOGIN=yes
+  gh auth login --hostname github.com --git-protocol https </dev/tty
+fi
+gh repo view "$GH/$P" </dev/null >/dev/null 2>&1 ||
+  die "no GitHub repo $GH/$P; nothing changed"
+for a in "$ORCH" "$IMPL"; do
+  r=$(place "$a")
+  case $r in
+    stop\ *) die "$a: ${r#stop }; nothing changed" ;;
+  esac
+  echo "$a product place: $r"
+done
+echo "step 1 ok"
+
+echo "step 2: GitHub repo of -dev, private"
+if gh repo view "$GH/$P-dev" </dev/null >/dev/null 2>&1; then
+  echo "repo $P-dev kept"
+else
+  gh repo create "$GH/$P-dev" --private </dev/null >/dev/null
+  echo "repo $P-dev made"
+fi
+echo "repo $P kept as it is"
+
+echo "step 3: deploy keys"
+key() { # account repo [--allow-write]
+  local f pub
+  f="${2//-/_}_deploy"
+  pub=$(on "$1" "cat ~/.ssh/$f.pub")
+  if gh repo deploy-key list -R "$GH/$2" --json key -q '.[].key' \
+    </dev/null | grep -qF "$(echo "$pub" | cut -d' ' -f2)"; then
+    echo "key $1 $2 kept"
+    return 0
+  fi
+  printf '%s\n' "$pub" > "$T/key.pub"
+  gh repo deploy-key add "$T/key.pub" -R "$GH/$2" -t "$1 $f" \
+    "${@:3}" </dev/null >/dev/null
+  echo "key $1 $2 made"
+}
+key "$ORCH" "$P-dev" --allow-write
+key "$SPEC" "$P-dev" --allow-write
+key "$IMPL" "$P-dev" --allow-write
+key "$ORCH" "$P"
+key "$IMPL" "$P"
+
+echo "step 4: first push of the -dev seed"
+if [ -n "$("${G[@]}" ls-remote --heads "$URL/$P-dev.git" </dev/null)" ]
+then
+  echo "push $P-dev kept"
+else
+  # A bare clone has every branch as its own head, so --all pushes
+  # them all; a working clone would hold 0.1 only as origin/0.1.
+  git clone -q --bare "$ORCH@localhost:$d" "$T/$P-dev" </dev/null
+  "${G[@]}" -C "$T/$P-dev" push -q --all "$URL/$P-dev.git" </dev/null
+  echo "push $P-dev made"
+fi
+
+echo "step 5: clones"
+# The two clones of an account are siblings: ~/ws/src/$P-dev and
+# ~/ws/src/$P, never one inside the other.
+up="git fetch -q origin && git branch -q -u origin/master master"
+up="$up && git branch -q -u origin/0.1 0.1"
+on "$ORCH" "cd ~/$d && $up"
+c="git clone -q -b 0.1"
+on "$SPEC" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
+on "$IMPL" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
+product "$ORCH"
+product "$IMPL"
+echo "step 5 ok"
+
+echo "step 6: model policy rules"
+[ -e "$POLICY.new-$P.bak" ] || cp -p "$POLICY" "$POLICY.new-$P.bak"
+rule() { # account home role expect
+  local cwd="$2/ws/src/$P-dev"
+  if grep -qF "cwd = \"$cwd\"" "$POLICY"; then
+    echo "rule $1 kept"
+    return 0
+  fi
+  printf '\n[[rule]]\nuser = "%s"\ncwd = "%s"\n' "$1" "$cwd" \
+    >> "$POLICY"
+  printf 'role = "%s"\nexpect = %s\n' "$3" "$4" >> "$POLICY"
+  echo "rule $1 made"
+}
+rule "$ORCH" "$ORCH_HOME" orchestrator '["Opus"]'
+rule "$SPEC" "$SPEC_HOME" "spec writer" '["Opus", "Fable", "Sonnet"]'
+rule "$IMPL" "$IMPL_HOME" implementer '["Opus", "Fable", "Sonnet"]'
+if ! python3 -I -c 'import sys, tomllib
+tomllib.load(open(sys.argv[1], "rb"))' "$POLICY"; then
+  cp -p "$POLICY.new-$P.bak" "$POLICY"
+  die "the policy is not valid; restored"
+fi
+
+echo "step 7: status line, ~/.tmux.conf"
+want=$(sha256sum < ~/.tmux.conf | cut -c1-8)
+for a in "$ORCH" "$SPEC" "$IMPL"; do
+  # Only the statusLine entry is written, so the settings get no hook.
+  # A status line of another command is replaced; the file as it was
+  # before the first change stays in settings.json.bak-new.
+  ssh -o BatchMode=yes "$a@localhost" python3 -I - "$LINE" <<'PY'
+import json, os, shutil, sys
+line = sys.argv[1]
+f = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(f, encoding="utf-8") as h:
+        d = json.load(h)
+except FileNotFoundError:
+    d = {}
+old = d.get("statusLine")
+if isinstance(old, dict) and old.get("command") == line:
+    print("settings kept")
+    sys.exit(0)
+if os.path.exists(f) and not os.path.exists(f + ".bak-new"):
+    shutil.copyfile(f, f + ".bak-new")
+    os.chmod(f + ".bak-new", 0o600)
+d["statusLine"] = {"type": "command", "command": line,
+                   "refreshInterval": 60}
+os.makedirs(os.path.dirname(f), exist_ok=True)
+with open(f + ".tmp", "w", encoding="utf-8") as h:
+    json.dump(d, h, indent=2)
+    h.write("\n")
+os.chmod(f + ".tmp", 0o600)
+os.replace(f + ".tmp", f)
+print("settings made")
+PY
+  have=$(on "$a" "sha256sum < ~/.tmux.conf | cut -c1-8" 2>/dev/null ||
+    true)
+  if [ "$have" = "$want" ]; then
+    echo "tmux $a kept"
+    continue
+  fi
+  ssh -o BatchMode=yes "$a@localhost" \
+    'cat > ~/.tmux.conf.new && mv ~/.tmux.conf.new ~/.tmux.conf' \
+    < ~/.tmux.conf
+  on "$a" "tmux source-file ~/.tmux.conf 2>/dev/null || true"
+  echo "tmux $a made"
+done
+
+# Readback. Expected: steps 1 to 7 in order; in step 1 one product
+# place line each for the orchestrator and the implementer; "made"
+# lines on the first run and "kept" lines on a second run; in step 5
+# one product line each, "cloned", "kept" or "repointed from" the old
+# URL, with the head; then one line per account: the account, the word
+# statusLine, and the command of LINE above; one -dev head per
+# account, the same hash three times; one product line each for the
+# orchestrator and the implementer, with the same head and the origin
+# PURL above; rules=3; tmux equal to want for each account.
+echo "--- readback new"
+for a in "$ORCH" "$SPEC" "$IMPL"; do
+  c=$(ssh -o BatchMode=yes "$a@localhost" python3 -I - <<'PY'
+import json, os
+f = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(f, encoding="utf-8") as h:
+        print(json.load(h)["statusLine"]["command"])
+except (OSError, ValueError, KeyError, TypeError):
+    print("none")
+PY
+)
+  echo "$a statusLine $c"
+done
+for a in "$ORCH" "$SPEC" "$IMPL"; do
+  echo "$a head $(on "$a" "git -C ~/$d log -1 --format=%h")"
+done
+for a in "$ORCH" "$IMPL"; do
+  h=$(on "$a" "git -C ~/$p log -1 --format=%h")
+  echo "$a product $h $(on "$a" "git -C ~/$p remote get-url origin")"
+done
+echo "rules=$(grep -cF "/ws/src/$P-dev\"" "$POLICY")"
+for a in "$ORCH" "$SPEC" "$IMPL"; do
+  echo "$a tmux $(on "$a" "sha256sum < ~/.tmux.conf | cut -c1-8")"
+done
+echo "want $want"
+echo "new done"
+# end new
