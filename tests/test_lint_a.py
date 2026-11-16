@@ -156,6 +156,60 @@ class LintATest(TempTestCase):
         self.write("tool.sh", '#!/bin/bash\necho "someone@example.org # 172.16.4.9"\n')
         self.assert_clean()
 
+    def test_lint_a_reads_rust_comments_and_doc_comments(self):
+        # Each kind of Rust comment is read, also a doc comment and the later
+        # line of a block comment.
+        for text in ("fn main() {} // from someone@example.org\n",
+                     "/// Ask someone@example.org.\nfn main() {}\n",
+                     "/*!\n * from 172.16.4.9\n */\n"):
+            self.write("src/lib.rs", text)
+            self.assert_refused("src/lib.rs:")
+
+    def test_lint_a_generic_patterns_skip_rust_strings(self):
+        # The same address and wording that a comment may not hold pass in the
+        # strings of a Rust file, plain and raw, with comment signs inside them.
+        self.write("src/lib.rs", 'const A: &str = "someone@example.org // 172.16.4.9";\n'
+                                 'const B: &str = r#"/* section 4 as required */"#;\n')
+        self.assert_clean()
+
+    def test_lint_a_reads_a_rust_file_by_its_name_whatever_its_first_line(self):
+        # A first line that names python does not make the file Python, so its
+        # strings are not read as if the file did not parse.
+        self.write("src/lib.rs", '#![cfg(feature = "python")]\n'
+                                 'const A: &str = "someone@example.org";\n')
+        self.assert_clean()
+
+    def test_lint_a_reads_the_shebang_line_of_a_rust_file(self):
+        self.write("src/main.rs", "#!/home/someone/bin/run-rust\nfn main() {}\n")
+        self.assert_refused("src/main.rs:1: home path")
+
+    def test_lint_a_reads_every_line_of_a_rust_file_it_cannot_read(self):
+        # A block comment that is never closed leaves the string after it to be
+        # read too. A string or a raw string left open does the same, and a step
+        # label after the comment sign of such a file is still at the start of
+        # its line.
+        self.write("src/lib.rs", '/* never closed\nconst A: &str = "someone@example.org";\n')
+        self.assert_refused("src/lib.rs:2: e-mail address")
+        for opener in ('"open;', 'r#"open";', "/* open"):
+            self.write("src/lib.rs", f'// Step 3\nconst A: &str = "someone@example.org";\n'
+                                     f"const B: &str = {opener}\n")
+            result = self.lint()
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("src/lib.rs:1: step or case label", result.stderr)
+            self.assertIn("src/lib.rs:2: e-mail address", result.stderr)
+
+    def test_lint_a_counts_rust_lines_at_newlines_only(self):
+        # A form feed does not end a line, so the comment after it is on line 2.
+        self.write("src/lib.rs", "fn a() {}\x0c\n// from someone@example.org\n")
+        self.assert_refused("src/lib.rs:2: e-mail address")
+
+    def test_lint_a_reads_step_labels_after_rust_comment_signs(self):
+        self.assert_doc_line("/// Step 3.", refused=True, name="lib.rs")
+        self.assert_doc_line("fn a() {} /* Case 2 */", refused=True, name="lib.rs")
+        self.assert_doc_line("/*\n * Step 3:\n */", refused=True, name="lib.rs")
+        self.assert_doc_line("// run Step 3.", refused=False, name="lib.rs")
+        self.assert_doc_line('const A: &str = "Step 3.";', refused=False, name="lib.rs")
+
     def test_lint_a_reads_yaml_and_makefile_comments(self):
         for name in ("flow.yml", "Makefile"):
             self.write(name, "# from 172.16.4.9\n")

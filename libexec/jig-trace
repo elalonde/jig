@@ -63,9 +63,14 @@ broken specs/ids.tsv gives its one line and nothing else.
 
 gen reads the comments of the named product files, with the comment signs lint A
 uses, and adds one entry to trace/<product path>.json for each comment that cites
-IDs of the general form. A block of full-line comments is one comment and is tied
-to the next code line; a comment at the end of a code line is tied to that line;
-a comment with no code line before or after it is file-level. An entry with the
+IDs of the general form. It reads Python and shell files, with their # comments,
+and Rust files, the files named *.rs, with their // and /* */ comments, doc
+comments included; any other file fails with one line, and so does a file whose
+comments or strings cannot be read to their end. A block of full-line comments
+is one comment and is tied to the next code line; a comment on a code line,
+before or after its code, is tied to that line; a comment with no code line
+before or after it is file-level. A Rust block comment that starts on a line of
+its own and ends on code is tied to the line where it ends. An entry with the
 same text, occurrence and comment lines as one already in the file replaces it in
 place, so running gen again adds nothing. gen never writes to the product.
 
@@ -100,7 +105,7 @@ from jig_trace import FormError  # noqa: E402
 FILL = "<fill>"
 # The subject of the commit that jig release prepare makes.
 RELEASE_SUBJECT = re.compile(r"Release [0-9]+\.[0-9]+\.[0-9]+")
-# The attributes that make git name Python and bash functions in hunk headers.
+# The attributes that make git name Python, bash and Rust functions in hunk headers.
 DIFF_ATTRIBUTES = pathlib.Path(ROOT) / "share" / "trace-diff.gitattributes"
 USAGE = "jig trace check | coverage | gen <product path> ... | form <commit>"
 # The kinds of object that git cat-file --batch can find; only a blob is a file.
@@ -522,21 +527,43 @@ def coverage(start):
 class Comments:
     """What gen reads in one product file.
 
-    Its lines, the full-line comments by line number, and the comments at the end
-    of code lines. A shebang on the first line is neither a comment nor code, so
-    that a header comment right below it counts as coming before any code.
+    Its lines, the runs of full-line comments, and the comments of code lines.
+    Each run is [first line, last line, words], where words holds one item for
+    each comment line, without its comment signs and outer white space; trailing
+    maps a code line to the words of the comment on it. comment_lines holds the
+    lines that comments cover and that have no code. A shebang on the first line
+    is neither a comment nor code, so that a header comment right below it counts
+    as coming before any code.
     """
 
-    def __init__(self, lines):
+    def __init__(self, lines, shebang):
         self.lines = lines
-        self.full = {}
+        self.shebang = shebang
+        self.runs = []
         self.trailing = {}
-        self.shebang = bool(lines) and lines[0].startswith("#!")
+        self.comment_lines = set()
 
     def is_code(self, number):
         if number == 1 and self.shebang:
             return False
-        return bool(self.lines[number - 1].strip()) and number not in self.full
+        return bool(self.lines[number - 1].strip()) and number not in self.comment_lines
+
+    def add_line(self, number, comment, trailing):
+        """Add a '#' comment, which covers one line; a full-line one joins the run above it."""
+        words = comment_words(comment)
+        if trailing:
+            self.trailing[number] = [words]
+            return
+        self.comment_lines.add(number)
+        if self.runs and self.runs[-1][1] == number - 1:
+            self.runs[-1][1] = number
+            self.runs[-1][2].append(words)
+        else:
+            self.runs.append([number, number, [words]])
+
+
+def hash_shebang(lines):
+    return bool(lines) and lines[0].startswith("#!")
 
 
 def python_comments(text):
@@ -545,7 +572,8 @@ def python_comments(text):
     The tokenizer knows strings, so a hash sign inside a string or a docstring
     is not a comment. Raise SyntaxError when the source cannot be tokenized.
     """
-    found = Comments(text.split("\n"))
+    lines = text.split("\n")
+    found = Comments(lines, hash_shebang(lines))
     try:
         for token in tokenize.generate_tokens(io.StringIO(text).readline):
             if token.type != tokenize.COMMENT:
@@ -555,10 +583,7 @@ def python_comments(text):
                 continue
             # The line of the source, not token.line, which after a string over
             # several lines holds all of them.
-            if found.lines[number - 1][:column].strip():
-                found.trailing[number] = token.string
-            else:
-                found.full[number] = token.string
+            found.add_line(number, token.string, bool(found.lines[number - 1][:column].strip()))
     except tokenize.TokenError as error:
         raise SyntaxError(error.args[0]) from None
     return found
@@ -566,17 +591,50 @@ def python_comments(text):
 
 def shell_comments(text):
     """Read the comments of a shell script line by line, as lint A does."""
-    found = Comments(text.split("\n"))
+    lines = text.split("\n")
+    found = Comments(lines, hash_shebang(lines))
     for number, line in enumerate(found.lines, 1):
         if number == 1 and found.shebang:
             continue
         comment = lint_a.hash_comment(line)
-        if comment is None:
-            continue
-        if line.lstrip().startswith("#"):
-            found.full[number] = comment
+        if comment is not None:
+            found.add_line(number, comment, not line.lstrip().startswith("#"))
+    return found
+
+
+def slash_comments(text, language):
+    """Group the // and /* */ comments that lint A's reader finds into gen's comments.
+
+    A comment that starts on a code line, before or after its code, belongs to
+    the trailing comment of that line, and so does every later comment that
+    starts on a line this trailing comment already covers: a /* */ comment that
+    goes on over later lines takes them with it. Any other comment starts on a
+    line with no code and joins the run of full-line comments that ends on the
+    line above or on its own first line; a blank line that no comment covers
+    ends a run. A run whose last comment ends on a code line, with code after
+    its */, ends there, and that code line is then the next code line after the
+    run. Raise lint_a.UnreadableText when a comment or literal is not closed.
+    """
+    read = lint_a.slash_comments(text, language)
+    found = Comments(read.lines, read.shebang)
+    trailing = None
+    run = None
+    for comment in read.comments:
+        words = [part for _number, part in comment.pieces]
+        found.comment_lines.update(number for number in range(comment.first, comment.last + 1)
+                                   if number not in read.code)
+        if trailing and comment.first <= trailing[1]:
+            found.trailing[trailing[0]] += words
+            trailing[1] = max(trailing[1], comment.last)
+        elif comment.first in read.code:
+            trailing = [comment.first, comment.last]
+            found.trailing[comment.first] = words
+        elif run and run[1] not in read.code and comment.first <= run[1] + 1:
+            run[1] = comment.last
+            run[2] += words
         else:
-            found.trailing[number] = comment
+            run = [comment.first, comment.last, words]
+            found.runs.append(run)
     return found
 
 
@@ -606,24 +664,19 @@ def entries_of(found):
     """Return the trace entries for the comments that cite IDs, in file order."""
     stripped = [line.strip() for line in found.lines]
     code = [number for number in range(1, len(found.lines) + 1) if found.is_code(number)]
-    comments = [(number, [found.trailing[number]], anchor(stripped, number))
-                for number in found.trailing]
-    block = []
-    for number in sorted(found.full):
-        block.append(number)
-        if number + 1 in found.full:
-            continue
-        start, end = block[0], block[-1]
-        after = [line for line in code if line > end]
+    comments = [(number, words, anchor(stripped, number))
+                for number, words in found.trailing.items()]
+    for start, _end, words in found.runs:
+        # Every line of a run is free of code, except perhaps its last, so the
+        # first code line after its start is the one it is tied to.
+        after = [line for line in code if line > start]
         if any(line < start for line in code) and after:
             place = anchor(stripped, after[0])
         else:
             place = (0, "", 1)
-        comments.append((start, [found.full[line] for line in block], place))
-        block = []
+        comments.append((start, words, place))
     entries = []
-    for _start, lines, (line, text, nth) in sorted(comments, key=lambda item: item[0]):
-        words = [comment_words(comment) for comment in lines]
+    for _start, words, (line, text, nth) in sorted(comments, key=lambda item: item[0]):
         ids = cited_ids(words)
         if ids:
             entries.append({"line": line, "text": text, "nth": nth, "ids": ids,
@@ -674,16 +727,22 @@ def gen_one(dev, product, name):
     if not path.is_file():
         return [f"{name}: the product has no file {relative}"]
     text = path.read_text(encoding="utf-8", errors="replace")
+    language = lint_a.slash_language(path)
     try:
-        if lint_a.is_python(path, text):
+        if language is not None:
+            found = slash_comments(text, language)
+        elif lint_a.is_python(path, text):
             found = python_comments(text)
         elif lint_a.is_shell(path, text):
             found = shell_comments(text)
         else:
-            return [f"{relative}: is neither Python nor shell, so it has no comment signs "
-                    "to read"]
+            kinds = ["Python", "shell"] + [known.name for known in lint_a.SLASH_LANGUAGES]
+            return [f"{relative}: is not {', '.join(kinds[:-1])} or {kinds[-1]}, so it has "
+                    "no comment signs to read"]
     except SyntaxError as error:
         return [f"{relative}: cannot be read as Python ({error})"]
+    except lint_a.UnreadableText as error:
+        return [f"{relative}: cannot be read as {language.name} ({error})"]
     trace = dev / "trace" / f"{relative}.json"
     existing = []
     if trace.exists():

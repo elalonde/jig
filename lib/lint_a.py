@@ -238,27 +238,296 @@ def hash_comment(line):
 
 
 def has_interpreter(text, *names):
+    # A Rust file can start with an inner attribute such as #![cfg(feature =
+    # "python")], which is code and names no interpreter.
     first = text.split("\n", 1)[0]
-    return first.startswith("#!") and any(name in first for name in names)
+    return (first.startswith("#!") and not first.startswith("#![")
+            and any(name in first for name in names))
 
 
 def is_python(path, text):
-    return path.suffix == ".py" or has_interpreter(text, "python")
+    return slash_language(path) is None and (path.suffix == ".py"
+                                             or has_interpreter(text, "python"))
 
 
 def is_shell(path, text):
-    return path.suffix in (".sh", ".bash") or has_interpreter(text, "bash", "/sh", " sh")
+    return slash_language(path) is None and (
+        path.suffix in (".sh", ".bash") or has_interpreter(text, "bash", "/sh", " sh"))
+
+
+class SlashLanguage:
+    """How one language whose comments are // and /* */ writes its comments and literals.
+
+    name is the name of the language in messages, and suffixes are the file name
+    endings that make a file one of its files. The other fields are the rules
+    that tell a comment sign from text inside a literal:
+
+    - nested: whether a /* inside a /* */ comment opens a comment of its own,
+      which then needs its own */;
+    - continued: whether a backslash at the end of a line carries a // comment
+      on to the next line;
+    - raw_prefixes: the prefixes that, followed by any number of # and a double
+      quote, open a raw string, which has no escapes and ends only at a double
+      quote followed by the same number of #;
+    - quote: what a single quote opens. "char" reads one character or one escape
+      and a closing quote as a character literal, and any other single quote as
+      code, such as a lifetime or a loop label. "string" reads it like a double
+      quote, closed by the next single quote that no backslash escapes;
+    - multiline: whether a string or character literal goes on over the end of a
+      line. When it does not, an end of line that no backslash escapes ends it.
+    """
+
+    def __init__(self, name, suffixes, nested, continued, raw_prefixes, quote, multiline):
+        self.name = name
+        self.suffixes = suffixes
+        self.nested = nested
+        self.continued = continued
+        # The longest first: a prefix that starts a longer one, as u starts u8,
+        # would otherwise be tried first and end the search.
+        self.raw_prefixes = tuple(sorted(raw_prefixes, key=len, reverse=True))
+        self.quote = quote
+        self.multiline = multiline
+
+
+# The languages that slash_comments reads, one row each.
+SLASH_LANGUAGES = (
+    SlashLanguage("Rust", suffixes=(".rs",), nested=True, continued=False,
+                  raw_prefixes=("r", "br", "cr"), quote="char", multiline=True),
+)
+
+# A Rust character literal: one character, or one escape such as \n, \', a \x escape
+# of two hex digits or \u{1F600}, between single quotes.
+CHAR_LITERAL = re.compile(r"'(?:[^'\\\n]|\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]{1,6}\}|[^xu\n]))'")
+# The signs that open a comment, with the extra / or * or the ! of a doc comment.
+LINE_COMMENT_SIGN = re.compile(r"//(?:/+|!)?")
+BLOCK_OPEN_EXTRA = re.compile(r"\*+|!")
+BLOCK_CLOSE_EXTRA = re.compile(r"\*+\Z")
+RAW_HASHES = re.compile("#*")
+# The start of a line of a file whose comments could not be read: after white
+# space and any //, /* or * signs, and the extra / or ! of a doc comment.
+SLASH_LINE_START = re.compile(r"\s*(?:(?://|/\*|\*)+/*!?)?\s*")
+
+
+def slash_language(path):
+    """Return the SlashLanguage of a file by its name, or None for another kind of file.
+
+    The name decides alone: the first line of a Rust file may look like a
+    shebang, and the file is still Rust.
+    """
+    for language in SLASH_LANGUAGES:
+        if path.suffix in language.suffixes:
+            return language
+    return None
+
+
+class UnreadableText(ValueError):
+    """A comment or a literal is still open at the end of the text."""
+
+
+class SlashComment:
+    """One // or /* */ comment.
+
+    first and last are the numbers of the lines it covers, and pieces holds one
+    (line number, words) pair for each of them: the part of the comment on that
+    line, without its comment signs and without the white space at both ends.
+    """
+
+    def __init__(self, first, last, pieces):
+        self.first = first
+        self.last = last
+        self.pieces = pieces
+
+
+class SlashText:
+    """The comments of one text: its lines, the comments in order, and the code lines.
+
+    code holds the number of each line with text outside its comments, which
+    includes every line of a literal that goes on over several lines. shebang is
+    true when the first line is a shebang, which is neither comment nor code.
+    """
+
+    def __init__(self, lines, shebang, comments, code):
+        self.lines = lines
+        self.shebang = shebang
+        self.comments = comments
+        self.code = code
+
+
+def block_pieces(body, first):
+    """Return (line number, words) for each line of the text between /* and */.
+
+    The opening sign may carry more * or one !, and the closing sign more *
+    before it; a line after the first may start with one * after its white
+    space, in the usual style of a comment over several lines. The signs of a
+    comment nested inside stay, as they are part of the text.
+    """
+    parts = body.split("\n")
+    pieces = []
+    for index, part in enumerate(parts):
+        if index == 0:
+            extra = BLOCK_OPEN_EXTRA.match(part)
+            part = part[extra.end():] if extra else part
+        else:
+            part = part.lstrip()
+            part = part[1:] if part.startswith("*") else part
+        if index == len(parts) - 1:
+            part = BLOCK_CLOSE_EXTRA.sub("", part)
+        pieces.append((first + index, part.strip()))
+    return pieces
+
+
+def slash_comments(text, language):
+    """Read the // and /* */ comments of a text with the rules of one language.
+
+    The text is read once, from the start, so that a comment sign inside a
+    literal and a quote inside a comment are both taken for text. Lines are
+    counted at "\\n" only, as gen counts them, so that lint A and gen agree on
+    every line number. /* and */ are read as pairs of characters, left to
+    right, each character used once: /**/ is a whole empty comment, and /*/
+    opens a comment and does not close it. Raise UnreadableText when a /*
+    comment, a string or a raw string is still open at the end of the text.
+    """
+    lines = text.split("\n")
+    shebang = text.startswith("#!") and not text.startswith("#![")
+    comments = []
+    code = set()
+    size = len(text)
+    number = 1
+    index = len(lines[0]) if shebang else 0
+
+    def literal_end(start, quote):
+        # Return the index just after the literal whose opening quote is at start.
+        at = start + 1
+        while at < size:
+            char = text[at]
+            if char == "\\":
+                at += 2
+            elif char == quote:
+                return at + 1
+            elif char == "\n" and not language.multiline:
+                return at
+            else:
+                at += 1
+        if not language.multiline:
+            return size
+        raise UnreadableText(f"line {number}: a string is not closed")
+
+    def covered(start, end, mark):
+        # Mark the lines from start to end as code and return the line of end.
+        last = number + text.count("\n", start, end)
+        if mark:
+            code.update(range(number, last + 1))
+        return last
+
+    while index < size:
+        char = text[index]
+        if char == "\n":
+            number += 1
+            index += 1
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            while end != -1 and language.continued and text[end - 1] == "\\":
+                end = text.find("\n", end + 1)
+            end = size if end == -1 else end
+            parts = text[index:end].split("\n")
+            parts[0] = parts[0][LINE_COMMENT_SIGN.match(parts[0]).end():]
+            comments.append(SlashComment(number, number + len(parts) - 1,
+                                         [(number + at, part.strip())
+                                          for at, part in enumerate(parts)]))
+            number += len(parts) - 1
+            index = end
+        elif text.startswith("/*", index):
+            depth, at = 1, index + 2
+            while at < size:
+                if language.nested and text.startswith("/*", at):
+                    depth, at = depth + 1, at + 2
+                elif text.startswith("*/", at):
+                    depth, at = depth - 1, at + 2
+                    if depth == 0:
+                        break
+                else:
+                    at += 1
+            if depth:
+                raise UnreadableText(f"line {number}: a /* comment is not closed")
+            last = covered(index, at, mark=False)
+            comments.append(SlashComment(number, last, block_pieces(text[index + 2:at - 2], number)))
+            number, index = last, at
+        elif char == '"' or (char == "'" and language.quote == "string"):
+            end = literal_end(index, char)
+            number, index = covered(index, end, mark=True), end
+        elif char == "'":
+            match = CHAR_LITERAL.match(text, index)
+            code.add(number)
+            index = match.end() if match else index + 1
+        else:
+            end = raw_string_end(text, index, language)
+            if end is None:
+                if not char.isspace():
+                    code.add(number)
+                index += 1
+            elif end < 0:
+                raise UnreadableText(f"line {number}: a raw string is not closed")
+            else:
+                number, index = covered(index, end, mark=True), end
+    return SlashText(lines, shebang, comments, code)
+
+
+def raw_string_end(text, index, language):
+    """Return the index just after a raw string that starts at index.
+
+    Return None when no raw string starts there, and -1 when one starts and is
+    not closed. A prefix counts only at the start of a word, so the r at the end
+    of an identifier is not one, and a prefix with # and no quote after it is a
+    raw identifier such as r#type, which is code.
+    """
+    if index and (text[index - 1].isalnum() or text[index - 1] == "_"):
+        return None
+    for prefix in language.raw_prefixes:
+        if text.startswith(prefix, index):
+            at = index + len(prefix)
+            hashes = RAW_HASHES.match(text, at).end() - at
+            at += hashes
+            if not text.startswith('"', at):
+                return None
+            close = '"' + "#" * hashes
+            end = text.find(close, at + 1)
+            return -1 if end == -1 else end + len(close)
+    return None
+
+
+def slash_doc_lines(text, language):
+    """Return (line number, text, start) for the comment lines of a // and /* */ file.
+
+    A text that cannot be read gets no benefit of the doubt: all of its lines
+    are read, each from after its white space and its leading comment signs.
+    """
+    try:
+        read = slash_comments(text, language)
+    except UnreadableText:
+        return [(number, line, line[SLASH_LINE_START.match(line).end():])
+                for number, line in enumerate(text.split("\n"), 1)]
+    found = []
+    if read.shebang:
+        found.append((1, read.lines[0], comment_start(read.lines[0])))
+    for comment in read.comments:
+        found.extend((number, words, words) for number, words in comment.pieces)
+    return found
 
 
 def doc_lines(path, text):
     """Return (line number, text, start) for the part of a file the generic patterns read.
 
-    A Python file gives its comments and docstrings, a shell, YAML or make file
-    its '#' comments, and any other file every line. The start is the line from
-    where its words begin, which the step and case labels are matched against:
-    after the '#' signs and spaces of a comment, after the opening triple quote
-    of a docstring, and after a list or heading sign of any other line.
+    A Python file gives its comments and docstrings, a Rust file its // and /*
+    */ comments and its shebang line, a shell, YAML or make file its '#'
+    comments, and any other file every line. The start is the line from where
+    its words begin, which the step and case labels are matched against: after
+    the '#' signs and spaces of a comment, after the signs of a // or /* */
+    comment, after the opening triple quote of a docstring, and after a list or
+    heading sign of any other line.
     """
+    language = slash_language(path)
+    if language is not None:
+        return slash_doc_lines(text, language)
     if is_python(path, text):
         return python_comment_lines(text)
     if (path.suffix in HASH_COMMENT_SUFFIXES or path.name in HASH_COMMENT_NAMES

@@ -746,9 +746,160 @@ class GenTest(TraceCase):
         self.assertEqual(len(lines), 3, result.stderr)
         self.assertIn("jig trace gen: src/gone.py: the product has no file", lines[0])
         self.assertIn("jig trace gen: ../outside.py: is outside the product", lines[1])
-        self.assertIn("jig trace gen: README.md: is neither Python nor shell", lines[2])
+        self.assertIn("jig trace gen: README.md: is not Python, shell or Rust", lines[2])
         self.assertFalse((self.dev / "trace" / "README.md.json").exists())
         self.assertEqual(self.entries("src/count.py"), COUNT_ENTRIES)
+
+
+# A Rust product file with full-line comments: a header with no code before it,
+# a run that mixes // and /* */ lines, two blocks split by a blank line, a block
+# comment with a blank line inside, and a last comment with no code after it.
+RUNS_LINES = [
+    "// Reads the counts, after R-1.",
+    "use std::io;",
+    "",
+    "/// Counts the lines, R-1;",
+    "/* the old name R-1a is gone. */",
+    "pub fn count(lines: &[&str]) -> usize {",
+    "    lines.len()",
+    "}",
+    "",
+    "// First block, R-1.",
+    "",
+    "// Second block, C-core-2.",
+    "pub fn first() -> u32 {",
+    "    /* A note with a gap, R-1.",
+    "",
+    "       still the same note. */",
+    "    0",
+    "}",
+    "// Nothing follows this note on R-1.",
+]
+RUNS_ENTRIES = [
+    entry(0, "", ["R-1"], comments=["Reads the counts, after R-1."]),
+    entry(6, "pub fn count(lines: &[&str]) -> usize {", ["R-1"],
+          comments=["Counts the lines, R-1;", "the old name R-1a is gone."]),
+    entry(13, "pub fn first() -> u32 {", ["R-1"], comments=["First block, R-1."]),
+    entry(13, "pub fn first() -> u32 {", ["C-core-2"], comments=["Second block, C-core-2."]),
+    entry(17, "0", ["R-1"], comments=["A note with a gap, R-1.", "", "still the same note."]),
+    entry(0, "", ["R-1"], comments=["Nothing follows this note on R-1."]),
+]
+# A Rust product file with comments on code lines: after the code, before it,
+# both, a block comment that goes on to a line with a comment of its own, and a
+# block comment that starts on a comment line and ends on a code line.
+MIXED_LINES = [
+    "fn main() {",
+    "    let x = 1; // After code, R-1.",
+    "    /* Before code, R-1. */ let y = 2;",
+    "    /* Both sides, R-1 */ f(); // and after.",
+    "    g(); /* Over two lines, R-1,",
+    "       then more */ // and one more.",
+    "    // Below the trailing note, C-core-2.",
+    "    h();",
+    "    /* Ends on code, R-1,",
+    "       here. */ k();",
+    "}",
+]
+MIXED_ENTRIES = [
+    entry(2, "let x = 1; // After code, R-1.", ["R-1"], comments=["After code, R-1."]),
+    entry(3, "/* Before code, R-1. */ let y = 2;", ["R-1"], comments=["Before code, R-1."]),
+    entry(4, "/* Both sides, R-1 */ f(); // and after.", ["R-1"],
+          comments=["Both sides, R-1", "and after."]),
+    entry(5, "g(); /* Over two lines, R-1,", ["R-1"],
+          comments=["Over two lines, R-1,", "then more", "and one more."]),
+    entry(8, "h();", ["C-core-2"], comments=["Below the trailing note, C-core-2."]),
+    entry(10, "here. */ k();", ["R-1"], comments=["Ends on code, R-1,", "here."]),
+]
+# The first lines of a Rust file: a block comment at the top that ends on code is
+# still file-level, as nothing comes before it; an inner attribute is code; a
+# shebang is not.
+TOP_FILES = {
+    "src/top.rs": "/* Header, R-1,\n   ends on code. */ use std::io;\nfn main() {}\n",
+    "src/attr.rs": '#![cfg(feature = "python")]\n// After the attribute, R-1.\nfn main() {}\n',
+    "src/bang.rs": "#!/usr/bin/env run-rust\n// Below the shebang, R-1.\nfn main() {}\n",
+}
+TOP_ENTRIES = {
+    "src/top.rs": [entry(0, "", ["R-1"], comments=["Header, R-1,", "ends on code."])],
+    "src/attr.rs": [entry(3, "fn main() {}", ["R-1"], comments=["After the attribute, R-1."])],
+    "src/bang.rs": [entry(0, "", ["R-1"], comments=["Below the shebang, R-1."])],
+}
+
+
+class RustGenTest(TraceCase):
+    """jig trace gen on the Rust files of the fixture product."""
+
+    def setUp(self):
+        super().setUp()
+        self.files = {"src/runs.rs": "\n".join(RUNS_LINES) + "\n",
+                      "src/mixed.rs": "\n".join(MIXED_LINES) + "\n", **TOP_FILES}
+        for name, text in self.files.items():
+            self.write(self.product / name, text)
+        self.git_commit_all(self.product)
+
+    def gen(self, *paths):
+        return run([TRACE, "gen", *(paths or self.files)], env=self.env(), cwd=self.dev)
+
+    def entries(self, product_path):
+        path = self.dev / "trace" / f"{product_path}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_gen_ties_full_line_rust_comments_to_the_next_code_line_or_the_file(self):
+        # Consecutive comment lines are one comment whatever signs they use, a
+        # blank line outside a comment splits two, and the first and the last
+        # comment, with no code before or after them, are file-level.
+        result = self.gen("src/runs.rs")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.entries("src/runs.rs"), RUNS_ENTRIES)
+
+    def test_gen_ties_rust_comments_on_a_code_line_to_that_line(self):
+        # Every comment that starts on a code line, before or after the code,
+        # belongs to that line, with the later lines of a block comment and a
+        # comment that starts on them; a block comment that starts on a comment
+        # line and ends on code is tied to the line where it ends.
+        result = self.gen("src/mixed.rs")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.entries("src/mixed.rs"), MIXED_ENTRIES)
+
+    def test_gen_reads_the_first_line_of_a_rust_file(self):
+        # The header at the top is file-level, the comment below an inner
+        # attribute is tied to the code after it, and the one below a shebang
+        # is file-level.
+        result = self.gen(*TOP_FILES)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual({name: self.entries(name) for name in TOP_FILES}, TOP_ENTRIES)
+
+    def test_gen_on_rust_files_then_check_passes_and_a_second_run_changes_no_byte(self):
+        self.assertEqual(self.gen().returncode, 0)
+        self.assert_passes()
+        before = {name: (self.dev / "trace" / f"{name}.json").read_bytes() for name in self.files}
+        result = self.gen()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual({name: (self.dev / "trace" / f"{name}.json").read_bytes()
+                          for name in self.files}, before)
+
+    def test_gen_fails_one_line_for_each_rust_file_left_open(self):
+        # A block comment, a string and a raw string that never close each fail
+        # their file with one line and no trace file, and the good file is still
+        # written; a file of a kind gen does not know fails too.
+        open_files = {"src/comment.rs": "fn a() {}\n/* never closed, R-1.\n",
+                      "src/string.rs": 'const A: &str = "open, R-1;\n',
+                      "src/raw.rs": 'const A: &str = r#"open, R-1";\n',
+                      "src/tool.go": "// R-1\npackage main\n"}
+        for name, text in open_files.items():
+            self.write(self.product / name, text)
+        result = self.gen(*open_files, "src/runs.rs")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.splitlines(), [
+            "jig trace gen: src/comment.rs: cannot be read as Rust "
+            "(line 2: a /* comment is not closed)",
+            "jig trace gen: src/string.rs: cannot be read as Rust (line 1: a string is not closed)",
+            "jig trace gen: src/raw.rs: cannot be read as Rust (line 1: a raw string is not closed)",
+            "jig trace gen: src/tool.go: is not Python, shell or Rust, so it has no comment "
+            "signs to read",
+        ])
+        for name in open_files:
+            self.assertFalse((self.dev / "trace" / f"{name}.json").exists(), name)
+        self.assertEqual(self.entries("src/runs.rs"), RUNS_ENTRIES)
 
 
 # A class with two methods far enough apart that each change gets its own hunk.
@@ -836,6 +987,31 @@ class FormTest(TraceCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr.splitlines(),
                          [f"jig trace form: {OLD_HASH}: is not a commit of the product"])
+
+
+# A Rust impl block whose method changes four lines below its fn line, so that
+# the fn line is outside the hunk. git names the method only with the Rust rule
+# that form turns on; its default rule would name the impl line.
+def meter(value):
+    return "\n".join(["struct Meter;", "", "impl Meter {", "    pub fn width(&self) -> u32 {",
+                      "        let a = 1;", "        let b = 2;", "        let c = 3;",
+                      f"        let d = {value};", "        let e = 5;", "        let f = 6;",
+                      "        a + b + c + d + e + f", "    }", "}"]) + "\n"
+
+
+class RustFormTest(TraceCase):
+
+    def test_form_names_the_rust_method_a_change_falls_in(self):
+        # A commit that changes the body of the method gives one row, which names
+        # the method and not the impl block around it.
+        self.write(self.product / "src/meter.rs", meter(4))
+        self.git_commit_all(self.product)
+        self.write(self.product / "src/meter.rs", meter(40))
+        self.git_commit_all(self.product)
+        result = run([TRACE, "form", "HEAD"], env=self.env(), cwd=self.dev)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(result.stdout.splitlines()[5:],
+                         ["| src/meter.rs | pub fn width(&self) -> u32 { | <fill> |"])
 
 
 # The records of a fixture project with one class for each coverage check, all of
