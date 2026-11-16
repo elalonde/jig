@@ -520,6 +520,14 @@ class CompletenessTest(TraceCase):
         self.trace("src/tool.py", [entry(1, "def main():", ["R-1", "R-91"])])
         self.assert_passes()
 
+    def test_id_that_two_matches_give_is_reported_at_its_first_line(self):
+        # The new ID stands as itself on the first line, and an old ID that reads
+        # as it stands on a later line. The ID is missing once, at the first line.
+        self.write(self.dev / "specs/id-map.tsv", ID_MAP_HEADER + "F-7\tR-7\n")
+        self.pre_import({"src/tool.py": "# R-7 first.\n" + TOOL_TEXT + "# F-7 later.\n"})
+        self.assert_fails_with("src/tool.py:1: R-7 of the tree of trace/pre-import is in no "
+                               "entry of trace/src/tool.py.json")
+
     def test_submodule_entry_at_a_path_with_a_space_is_skipped(self):
         # The old tree holds a submodule entry, whose commit the clone does not
         # have, at a path with a space, and a file that cites an uncarried control.
@@ -749,6 +757,154 @@ class GenTest(TraceCase):
         self.assertIn("jig trace gen: README.md: is not Python, shell or Rust", lines[2])
         self.assertFalse((self.dev / "trace" / "README.md.json").exists())
         self.assertEqual(self.entries("src/count.py"), COUNT_ENTRIES)
+
+
+# The rows of the ID map that the tests of gen with a map share: an old ID split
+# in two, a dropped ID, an old ID outside the general form, an old ID that holds
+# a shorter old ID, and two old IDs that became one.
+MAP_ROWS = ("F-7\tR-7,R-40\n" "R-8\t\n" "OLD.3\tR-3\n" "R-9\tR-90\n" "R-9.1\tR-91\n"
+            "F-1\tR-1\n" "F-2\tR-1\n")
+
+
+class MappedGenTest(TraceCase):
+    """jig trace gen with an ID map in the -dev clone, which renamed the IDs."""
+
+    def gen(self, *paths):
+        return run([TRACE, "gen", *(paths or ["src/mapped.py"])], env=self.env(), cwd=self.dev)
+
+    def write_map(self, rows=MAP_ROWS):
+        self.write(self.dev / "specs/id-map.tsv", ID_MAP_HEADER + rows)
+
+    def write_mapped(self, *comments):
+        """Write a product file with one function under each comment line given."""
+        lines = []
+        for number, comment in enumerate(comments, 1):
+            lines += [comment, f"def step{number}():", "    return 0", ""]
+        self.write(self.product / "src/mapped.py", "\n".join(lines))
+
+    def trace_path(self):
+        return self.dev / "trace/src/mapped.py.json"
+
+    def ids_after_gen(self, *comments):
+        """Run gen on a file with these comments; return the IDs of each entry."""
+        self.write_mapped(*comments)
+        result = self.gen()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        if not self.trace_path().exists():
+            return []
+        return [item["ids"] for item in json.loads(self.trace_path().read_text())]
+
+    def test_old_id_reads_as_the_new_ids_of_its_row_in_their_order(self):
+        # An old ID that the map split in two gives both new IDs, in the order of
+        # the row, and not the old ID itself.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Keeps F-7 in mind."), [["R-7", "R-40"]])
+
+    def test_ids_come_in_the_order_of_their_first_place_in_the_comment(self):
+        # An ID that is not in the map stays as it is. The IDs follow their place
+        # in the comment, not the order of the searches, and each comes once.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# R-3, then F-7, then R-3 again."),
+                         [["R-3", "R-7", "R-40"]])
+
+    def test_dropped_id_alone_gives_no_entry_and_beside_another_gives_nothing(self):
+        # A comment whose only ID was dropped gets no entry at all; in a comment
+        # with another ID, the dropped one adds nothing to that entry.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Was R-8 once."), [])
+        self.assertFalse(self.trace_path().exists())
+        self.assertEqual(self.ids_after_gen("# Was R-8 once.", "# R-8 gave way to R-5."),
+                         [["R-5"]])
+
+    def test_old_id_outside_the_general_form_is_found(self):
+        # The general form would not see this old ID at all; the map's own search
+        # for it does.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Follows OLD.3 here."), [["R-3"]])
+
+    def test_old_id_that_holds_a_shorter_old_id_reads_only_as_itself(self):
+        # The longer old ID is found first, so the shorter one inside it, which the
+        # general form alone would find, does not count there; the shorter one
+        # standing alone still does.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Follows R-9.1, not R-9."), [["R-91", "R-90"]])
+
+    def test_two_old_ids_that_became_one_give_it_once(self):
+        # Both old IDs read as the same new ID, which the entry holds once.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Both F-1 and F-2 apply."), [["R-1"]])
+
+    def test_broken_map_fails_with_its_one_line_and_writes_nothing(self):
+        # A space after the comma breaks the map. gen names the map as check does,
+        # writes no trace file for either path, and leaves an existing one as it is.
+        self.write_map("F-7\tR-7, R-40\n")
+        self.write_mapped("# Keeps F-7 in mind.")
+        before = (self.dev / "trace/src/tool.py.json").read_bytes()
+        self.write(self.product / "src/tool.py", "# Main cites R-1.\n" + TOOL_TEXT)
+        result = self.gen("src/mapped.py", "src/tool.py")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr.splitlines(), [
+            "jig trace gen: specs/id-map.tsv: line 2: the new ID ' R-40' does not have the "
+            "general ID form; new IDs are separated by commas, with no spaces"])
+        self.assertFalse(self.trace_path().exists())
+        self.assertEqual((self.dev / "trace/src/tool.py.json").read_bytes(), before)
+
+    def test_no_map_keeps_the_ids_as_the_comment_writes_them(self):
+        # Without a map, the old ID is kept as written and the IDs follow the text.
+        self.assertEqual(self.ids_after_gen("# R-3, then F-7, then R-3 again."),
+                         [["R-3", "F-7"]])
+
+    def test_second_run_with_the_same_map_changes_no_byte(self):
+        # A second run on the same file and map leaves the trace file as it was.
+        self.write_map()
+        self.write_mapped("# Keeps F-7 in mind.", "# Both F-1 and F-2 apply.")
+        self.assertEqual(self.gen().returncode, 0)
+        first = self.trace_path().read_bytes()
+        self.assertEqual(self.gen().returncode, 0)
+        self.assertEqual(self.trace_path().read_bytes(), first)
+
+    def test_changed_row_replaces_the_ids_in_place(self):
+        # After the row of an old ID names other new IDs, the next run gives the
+        # same entries, in the same places, with the new IDs.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# R-5 first.", "# Keeps F-7 in mind."),
+                         [["R-5"], ["R-7", "R-40"]])
+        self.write_map(MAP_ROWS.replace("F-7\tR-7,R-40", "F-7\tR-70"))
+        self.assertEqual(self.ids_after_gen("# R-5 first.", "# Keeps F-7 in mind."),
+                         [["R-5"], ["R-70"]])
+
+    def test_row_changed_to_dropped_empties_the_ids_of_the_entry_in_place(self):
+        # The entry written while the old ID had a new ID stays where it is, with
+        # no IDs, once the row drops that ID; no entry is added.
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Keeps F-7 in mind.", "# R-5 last."),
+                         [["R-7", "R-40"], ["R-5"]])
+        self.write_map(MAP_ROWS.replace("F-7\tR-7,R-40", "F-7\t"))
+        self.assertEqual(self.ids_after_gen("# Keeps F-7 in mind.", "# R-5 last."),
+                         [[], ["R-5"]])
+
+    def test_map_that_drops_an_id_after_a_run_without_a_map_empties_its_entry(self):
+        # A run with no map kept the old ID as written; a map that then drops it
+        # leaves the entry in place with no IDs.
+        self.assertEqual(self.ids_after_gen("# Was R-8 once."), [["R-8"]])
+        self.write_map()
+        self.assertEqual(self.ids_after_gen("# Was R-8 once."), [[]])
+
+    def test_gen_with_the_map_then_the_whole_check_passes_on_the_pre_import_tree(self):
+        # The product's comments still cite the old IDs, and its commit is the
+        # pre-import tree. gen writes the new IDs, which the spec holds, so every
+        # check, the search of the pre-import tree among them, passes.
+        self.write(self.dev / "specs/jig-spec.md",
+                   SPEC_TEXT + "Then R-3, R-5, R-7, R-40, R-90 and R-91.\n")
+        self.write_map()
+        self.write_mapped("# Keeps F-7 in mind.", "# R-8 gave way to R-5.",
+                          "# Follows OLD.3 here.", "# Follows R-9.1, not R-9.",
+                          "# Both F-1 and F-2 apply.", "# Was R-8 once.")
+        self.git_commit_all(self.product)
+        self.write(self.dev / "trace/pre-import", self.head() + "\n")
+        result = self.gen()
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assert_passes()
 
 
 # A Rust product file with full-line comments: a header with no code before it,

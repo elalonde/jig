@@ -36,7 +36,8 @@ check makes sure that tie still holds:
   then for the IDs of each class, where a match inside an earlier one does not
   count. Each ID found reads through the map, to its new IDs, to nothing for a
   dropped ID, or to itself, and each result must be in an entry of the trace of
-  its file. A broken ID map gives its one line and nothing else.
+  its file; one that is not gives the line of its first match in the file. A
+  broken ID map gives its one line and nothing else.
 
 A missing commit map, ID map or trace/pre-import means there was no rewrite or
 move, and that part passes.
@@ -73,6 +74,16 @@ before or after it is file-level. A Rust block comment that starts on a line of
 its own and ends on code is tied to the line where it ends. An entry with the
 same text, occurrence and comment lines as one already in the file replaces it in
 place, so running gen again adds nothing. gen never writes to the product.
+
+When the ID map specs/id-map.tsv exists, gen finds and reads a comment's IDs as
+check does in the pre-import tree, with the general ID form in place of the
+classes: the old IDs of the map first, the longest first, so that an old ID need
+not have the general form. An entry then holds what the IDs read as, each once,
+in the order of their first match in the comment and then of the map's row. A
+comment whose IDs were all dropped gets no new entry, and an entry it already has
+keeps its place with no IDs. A map that is not in its form gives the one line of
+check, after the name of the command, and gen writes nothing. With no map, every
+ID is kept as the comment writes it.
 
 form prints the outline of the ledger note of one product commit: the commit, a
 unit to fill in, and one row for each function that git names in the commit's
@@ -292,21 +303,25 @@ def tree_texts(product, commit, paths):
     return texts
 
 
-def id_searches(olds, classes):
-    """The searches for IDs in the pre-import tree, in the order they must run.
+def id_searches(olds, searches):
+    """The searches for IDs in a text, in the order they must run.
 
-    The old IDs of the map come first, the longest first, then the matches of each
-    class.
+    The old IDs of the ID map come first, the longest first, then the given
+    searches: the regexes of the ID classes for the pre-import tree, or the general
+    ID form for the comments that gen reads. An old ID need not have the general
+    form, so it is searched as a fixed string, with the same guards.
     """
-    searches = [jig_ids.fixed_bounded(old) for old in sorted(olds, key=len, reverse=True)]
-    return searches + [item.search for item in classes]
+    first = [jig_ids.fixed_bounded(old) for old in sorted(olds, key=len, reverse=True)]
+    return first + list(searches)
 
 
 def found_ids(text, searches):
-    """Return (line, ID) for each ID that the searches find in text, in their order.
+    """Return (line, ID) for each ID that the searches find in text, in text order.
 
     A match inside one found before it is part of that ID and does not count, so an
-    old ID that holds a shorter old ID, or a class match, is read only once.
+    old ID that holds a shorter old ID, or a class match, is read only once. The
+    searches run in their order, but the matches come back by their place in the
+    text, so that the first one for an ID is the first in the text.
     """
     spans, found = [], []
     for search in searches:
@@ -315,8 +330,9 @@ def found_ids(text, searches):
             if start == end or any(first <= start and end <= last for first, last in spans):
                 continue
             spans.append((start, end))
-            found.append((text.count("\n", 0, start) + 1, match.group(0)))
-    return found
+            found.append((start, match.group(0)))
+    found.sort()
+    return [(text.count("\n", 0, start) + 1, record) for start, record in found]
 
 
 def check_completeness(dev, product, classes, id_map):
@@ -336,7 +352,8 @@ def check_completeness(dev, product, classes, id_map):
     now = set(tree_files(product, "HEAD"))
     paths = sorted(path for path in tree_files(product, commit) if path in now)
     texts = tree_texts(product, commit, paths)
-    searches = id_searches(list(id_map.rows) if id_map else [], classes or [])
+    searches = id_searches(list(id_map.rows) if id_map else [],
+                           [item.search for item in classes or []])
     traces = jig_trace.trace_files(dev)
     for path in paths:
         carried = set()
@@ -643,13 +660,23 @@ def comment_words(comment):
     return lint_a.comment_start(comment).strip()
 
 
-def cited_ids(words):
-    """The IDs of the general form in the lines of a comment, each once, in order."""
+def cited_ids(words, searches, id_map):
+    """The IDs that the lines of a comment cite, read through the ID map.
+
+    Each ID found reads as the new IDs of its row of the map, as nothing when the
+    map dropped it, or as itself. The result holds each ID once, in the order of
+    the first match in the comment, and the new IDs of one row in the row's order.
+    It is None when the comment cites no ID at all, and empty when every ID it
+    cites was dropped.
+    """
+    found = found_ids("\n".join(words), searches)
+    if not found:
+        return None
     ids = []
-    for line in words:
-        for match in jig_ids.GENERAL_ID.finditer(line):
-            if match.group(0) not in ids:
-                ids.append(match.group(0))
+    for _line, record in found:
+        for new in id_map.read_through(record) if id_map else [record]:
+            if new not in ids:
+                ids.append(new)
     return ids
 
 
@@ -660,8 +687,12 @@ def anchor(stripped, number):
     return number, text, nth
 
 
-def entries_of(found):
-    """Return the trace entries for the comments that cite IDs, in file order."""
+def entries_of(found, searches, id_map):
+    """Return the trace entries for the comments that cite IDs, in file order.
+
+    The entry of a comment whose IDs the map all dropped has no IDs; merge uses it
+    only to empty the IDs of an entry that is already there.
+    """
     stripped = [line.strip() for line in found.lines]
     code = [number for number in range(1, len(found.lines) + 1) if found.is_code(number)]
     comments = [(number, words, anchor(stripped, number))
@@ -677,8 +708,8 @@ def entries_of(found):
         comments.append((start, words, place))
     entries = []
     for _start, words, (line, text, nth) in sorted(comments, key=lambda item: item[0]):
-        ids = cited_ids(words)
-        if ids:
+        ids = cited_ids(words, searches, id_map)
+        if ids is not None:
             entries.append({"line": line, "text": text, "nth": nth, "ids": ids,
                             "comments": words})
     return entries
@@ -694,14 +725,16 @@ def merge(existing, new):
 
     An entry that is already there keeps its place and takes the new line and
     IDs; the rest go at the end. No entry is ever dropped, because a comment that
-    moved away may still be what a reviewer wants to see.
+    moved away may still be what a reviewer wants to see. A new entry with no IDs,
+    from a comment whose IDs were all dropped, only empties the IDs of an entry
+    that is already there: an entry with no IDs ties nothing to its line.
     """
     merged = [dict(item) for item in existing]
     for item in new:
         matches = [old for old in merged if same_entry(old, item)]
         for old in matches:
             old["line"], old["ids"] = item["line"], item["ids"]
-        if not matches:
+        if not matches and item["ids"]:
             merged.append(item)
     return merged
 
@@ -718,7 +751,7 @@ def product_relative(product, name):
     return pathlib.PurePosixPath(*pathlib.PurePath(relative).parts).as_posix()
 
 
-def gen_one(dev, product, name):
+def gen_one(dev, product, name, searches, id_map):
     """Write the trace entries of one product file; return its failures."""
     relative = product_relative(product, name)
     if relative is None:
@@ -750,7 +783,7 @@ def gen_one(dev, product, name):
             existing = jig_trace.read_trace_file(trace)
         except FormError as error:
             return [f"trace/{relative}.json: {error}"]
-    merged = merge(existing, entries_of(found))
+    merged = merge(existing, entries_of(found, searches, id_map))
     # Writing only on a change keeps a second run from touching the file at all,
     # whatever layout the file had before.
     if merged != existing:
@@ -783,8 +816,14 @@ def gen(start, names):
     dev, product, failures = product_of(start)
     if failures:
         return failures
+    # A broken map would write wrong IDs into every file, so it stops the run
+    # before any file is written.
+    id_map, failures = read_id_map(dev)
+    if failures:
+        return failures
+    searches = id_searches(list(id_map.rows) if id_map else [], [jig_ids.GENERAL_ID])
     for name in names:
-        failures += gen_one(dev, product, name)
+        failures += gen_one(dev, product, name, searches, id_map)
     return failures
 
 
