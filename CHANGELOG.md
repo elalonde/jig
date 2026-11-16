@@ -5,6 +5,226 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.8.0
+
+What changed: the supervisor loop of each orchestrator, `jig orch`, now writes
+its project's activity to the file `orch/activity` under
+`~/ws/reviews/<project>/`, once a minute: one line of three tab-separated
+fields, the state, since when it holds and when the line was written. The state
+is `unit` while a unit of the project holds its lock in `/run/jig/lock` and is
+younger than 3 times its expected minutes, `down` while the orchestrator session
+is not live, `busy` while the session runs a turn, and `idle` otherwise, also
+while a dialog shows. The time a state began is kept across a restart of the
+loop when the old file holds the same state and is fresh. Every end of the loop,
+whatever its cause, writes `down`. `jig orch <project> status` prints the
+activity line after its other lines.
+
+An orchestrator that waits on another project of the host now says so with
+`jig orch <project> wait-on <other> <what>`, which writes the line of that
+project into `orch/waits` (the other project, since and what, split by tabs);
+the same `<what>` keeps its since. `jig orch <project> wait-on <other> --clear`
+removes the line, and `wait-on` alone lists the waits with the activity of each
+other project. `wait-on` refuses, and makes nothing, when the `orch/` directory
+of either project is missing, and warns when the activity file of the other
+project is missing or stale, as it is for a project whose loop runs a jig older
+than 0.8.0. Once a minute the loop reads its waits. When the other project has
+been `idle` or `down` for the stall time, it appends the event line
+`stall: <other> <state> since <HH:MM> (waits on: <what>)`, with the date before
+the time when it is not today. A missing, unreadable or stale activity file
+counts as `down`. When the other project runs a unit, or is busy on 3 activity
+polls in a row, so that a short turn does not end the stall, the loop appends
+`resumed: <other> <state>`, and a later stall gets a new stall line. The stall
+time is the key `ORCH_STALL_MINUTES` of `/srv/jig/host.conf`, a whole number of
+1 or more, and 15 minutes when the key is missing; a bad value, or a host
+config that cannot be read, is logged at the start of the loop and gives 15.
+`jig orch <project> status` prints one line for each wait.
+
+`jig orch <project> rollover` lets the orchestrator session end itself, so
+that the loop starts the next session as on any exit, and the session no
+longer has to ask Eric to type `/exit`. It sends SIGTERM to the pane's process
+only, prints one line first and does not wait. It refuses, and signals
+nothing, when no loop runs, when the session is not live or not the loop's own,
+when the pane's process does not run with the session ID that the loop gave
+it, or when the caller does not run inside that pane. The session first stops
+its background shells and its watcher, because a shell that still runs can carry
+the old session on beside the new one.
+
+When the loop ends, at a stop, at the third exit in 10 minutes or at a session
+it may not start, it now writes its state down, looks for forks of its last
+session at once and again a fork window later (`JIG_ORCH_FORK_WINDOW`, 60
+seconds unless set), and only then frees its lock. Before, it looked once at
+the third exit and not at all at a stop, so a fork of the last session that
+showed up after a stop was never ended, and the next start ran a second
+orchestrator beside it. `jig orch <project> stop` therefore waits for the lock
+30 seconds plus the fork window before it kills the loop, and when no loop
+runs, or the loop had to be killed, the stop takes both looks itself. A stop
+now takes at least the fork window. `jig orch <project> status` shows the
+reason the loop ended as its last line, not the lines of the two looks.
+
+The orchestrator template, `templates/new/dev/impl/orch/ORCHESTRATOR.md`, has a
+new section "Waiting on another project": `wait-on` and its `--clear`, and what
+to do at a stall line (read the other orchestrator's screen and the Current part
+of its `state.md`, read only, and tell Eric what blocks it and whose step it
+is) and at a resumed line (nothing more). Its rollover items now end the
+session with `jig orch <project> rollover` after stopping every background
+shell and the watcher, and a new item says to end the session only that way. A
+batch now starts detached, with `setsid nohup jig batch ...` and its output in
+a file under `orch/`, so that it is no background shell of the session and a
+rollover leaves it running; the handoff names the batch file, the output file
+and the pid of `jig batch`, and the fresh session follows that batch instead of
+starting a second one.
+
+`jig new <project> --existing` sets up a project whose product repository
+already exists on GitHub, under the GitHub owner of the host config and with
+the project's name. It writes the sidecar as the plain form does, and no file
+into the product: no product tree, no lint A files, no CI workflow, no first
+product commit and no hook. Its block has a form of its own,
+`templates/new/block-existing.sh.in`. The block first checks that the product
+repository exists and what stands at the place of the product clone in the
+orchestrator and implementer accounts, and stops with one line before any
+change when it finds something it may not keep. Then it makes and pushes only
+the sidecar repository, adds the read-only deploy keys of the product for those
+two accounts, and in each of them clones the product, keeps a clone whose
+origin is already the block's URL, or sets that URL as the origin of a clone of
+the same repository. A clone whose origin is a local repository on the host is
+repointed only when its branches and tags equal GitHub's both ways, each at
+the same commit, with `HEAD` and `refs/pull/` left out of the compare; a ref
+that only one side holds, or that points at another commit, stops the block
+with the first such ref in byte order. The local repository is never changed.
+`jig start` installs the pre-commit hook in each product clone it uses. A run
+of either form for a project that the other form made keeps what exists, and
+any other second word is a usage error.
+
+`jig trace gen` and lint A now read the comments of Rust files (`.rs`) and of C
+files and headers (`.c`, `.h`), with one reader for comments that start with
+`//` or `/*`. A Rust or C file is known by its name alone. The reader skips
+strings, character constants and Rust raw strings, follows nested block
+comments in Rust and backslash continuations in C, and counts lines at newlines
+only. `jig trace gen` ties a comment on a line of its own to the next line of
+code, or to the file, and a comment after code to that line, as it does for
+Python and shell. A file whose block comment or string is still open at its
+end cannot be read: `jig trace gen` fails with one line for each such file,
+saying it is not Python, shell, Rust or C, and lint A then reads every line of
+it. Lint A now reads only the comments of such files, and no longer their code
+and strings, and its step and case labels are matched after the comment signs.
+`jig trace form` names the Rust method or the C function a change falls in,
+through new rows of `share/trace-diff.gitattributes` (`*.rs diff=rust`, `*.c`
+and `*.h diff=cpp`).
+
+`jig trace gen` now reads `specs/id-map.tsv`, as `jig trace check` does: an old
+ID in a comment is written into the trace as the new IDs of its row, in their
+order, and an ID that the map drops gives no entry, alone, or nothing beside
+another. A second run with the same map changes no byte, and a run after a
+change of the map replaces the IDs of an entry in place. A map that cannot be
+read stops `jig trace gen` with its one line before it reads any file, so it
+writes nothing. With no map, `jig trace gen` works as before. The completeness
+check of `jig trace check` now reports an ID that two matches give at the line
+of its first match.
+
+The `CLAUDE.md` that `jig new` writes into the sidecar has a new section
+"Commit message standard", right after "Comment standard": how a commit
+message of the product reads, for a maintainer who has never seen the process.
+`jig validate prompt`, and so `jig start`, now refuses a prompt whose first line
+names the implementer account when its ROLE line does not name both
+"Comment standard" and "Commit message standard", with one line for each name
+that is missing. The prompt template names both.
+
+`jig start` now accepts `Spec tag: kickoff-rN` on the ROLE line of an
+implementer unit while origin holds no spec tag, and puts the approved worktree
+at that kickoff tag, so that a project can run implementer units between its
+kickoff and its first spec tag. Once origin holds a spec tag, such a start is
+refused with a line that names the spec tag found, because the ROLE line must
+then name the approved spec.
+
+Tests: the tests of the orchestrator loop, the release and the status line no
+longer depend on wall-clock margins, and the tests of `jig new --existing`
+cover both sides of the ref compare.
+
+Files and formats: new: `orch/activity` and `orch/waits` under
+`~/ws/reviews/<project>/`, in the forms above; the event lines `stall:` and
+`resumed:` of `orch/events.log`; the optional key `ORCH_STALL_MINUTES` in
+`/srv/jig/host.conf`; the environment variables `JIG_ORCH_ACTIVITY` (seconds
+between activity polls, 60) and `JIG_ORCH_STALL_SECONDS` (the stall time in
+seconds, in place of the key); the template `templates/new/block-existing.sh.in`.
+Changed: the output of `jig orch <project> status` (the activity line and one
+line for each wait); the commands `jig orch <project> wait-on` and
+`jig orch <project> rollover`, and the option `--existing` of `jig new`, all new;
+the form of the ROLE line of an implementer-account prompt; the failure line of
+`jig trace gen` for a file it cannot read. Changed files: `lib/jig_tmux.py`,
+`lib/lint_a.py`, `jig-new`, `jig-orch`, `jig-start`, `jig-start-worker`,
+`jig-trace`, `jig-validate`, `share/trace-diff.gitattributes`, `README.md`,
+`templates/prompt.md`, and the templates of `jig new`: its `README.md`, the
+sidecar's `CLAUDE.md` and `impl/orch/ORCHESTRATOR.md`. The formats of the conf
+files, `checks.tsv`, the reports, the trace and the ledger are unchanged.
+
+Migration: a host and its projects move from 0.7.0 to 0.8.0 in this order, and
+no unit of a project runs before step 4 is done for it. A project still on
+0.6.0 or earlier first takes the steps of the 0.7.0 entry.
+
+1. As the orchestrator account, run `jig upgrade 0.8.0`. It installs 0.8.0
+   under `/opt/jig/0.8.0/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.8.0` as the orchestrator
+   account. It sets `JIG_VERSION=0.8.0` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.8.0`.
+3. Take the section "Commit message standard" of the template `CLAUDE.md`,
+   `/opt/jig/0.8.0/templates/new/dev/CLAUDE.md`, into the common part of the
+   project's `CLAUDE.md`, right after "Comment standard", in one `-dev` commit,
+   pushed. A project made before 0.8.0 does not get it by itself, and the
+   prompts of the next step point at it.
+4. Before the first `jig start` of the project on 0.8.0, add "Commit message
+   standard" beside "Comment standard" on the ROLE line of every waiting prompt
+   whose first line names the implementer account: the prompts of the rows of
+   each batch file, pre-check and review prompts among them, and every prompt
+   drafted for a later unit. `jig start` refuses such a prompt that lacks the
+   name, and `jig batch` then stops at that row.
+5. Take the new section "Waiting on another project" and the changed items on
+   the rollover and on running a batch of the template
+   `/opt/jig/0.8.0/templates/new/dev/impl/orch/ORCHESTRATOR.md` into the
+   project's `impl/orch/ORCHESTRATOR.md`, with `@PROJECT@` replaced by the
+   project's name, in one `-dev` commit, pushed. The next session reads it as
+   its first message, so this comes before the restart of the loop.
+6. Restart each project's orchestrator loop, so that it runs the 0.8.0 code
+   and writes its activity file: first let the session finish its step, stop
+   its background shells and its watcher, and write its handoff; then, from a
+   shell of the orchestrator account outside the session, run
+   `jig orch <project> stop` and then `jig orch <project> start`. The loop that
+   this stop ends still runs the 0.7.0 code, which does not look for forks at a
+   stop, so between the two commands check that no process resumes the old
+   session, the Claude Code session ID in `orch/session-ids` (for example with
+   `pgrep -af -- --resume`), and end one that does before the start. From then
+   on each stop waits the fork window and looks twice, so it takes about a
+   minute longer than in 0.7.0. Check that `~/ws/reviews/<project>/orch/activity`
+   is fresh after the start.
+7. Use `jig orch <project> wait-on` only for another project that has had
+   step 6: a project whose loop writes no activity file counts as `down`, so a
+   wait on it gives a stall line after the stall time, and `wait-on` warns.
+8. A product that holds a copy of `share/trace-diff.gitattributes` or
+   `lib/lint_a.py` takes the 0.8.0 file from `/opt/jig/0.8.0/` in its next
+   product commit, with its ledger entry. With the new `lib/lint_a.py`, lint A
+   reads only the comments of the product's Rust and C files and matches the
+   step and case labels there, so run the product's `make check` before that
+   commit and fix the comments it names.
+9. A project with `specs/id-map.tsv` whose trace `jig trace gen` wrote before
+   0.8.0: its next run of `jig trace gen` writes the mapped IDs in place of the
+   old ones in each entry it touches, and fails with one line on a map that
+   cannot be read. Run `jig trace check` after that run, and commit the trace
+   with the ledger entry of that unit.
+10. Optional, for a host: set `ORCH_STALL_MINUTES=<n>` in `/srv/jig/host.conf`,
+    a whole number of 1 or more, when a stall should be reported sooner or
+    later than after 15 minutes.
+
+A note for a host whose `/etc/login.defs` sets `SYSLOG_SG_ENAB yes`: there `sg`
+does not replace itself with the command it runs, so the process of the
+orchestrator's pane is `sg`, not Claude Code. `jig orch <project> rollover` then
+refuses every time, and the session must end another way, for example by a
+person typing `/exit` in it.
+
+Requested by: Eric; the Rust and C comments and `jig new --existing`: feature
+requests of other projects.
+
+Units: 7 minor, 1 patch, 10 none
+
 ## 0.7.0
 
 What changed: `jig start` now sets `core.hooksPath` of a product clone to
