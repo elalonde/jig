@@ -947,7 +947,7 @@ class StartFolderTrustTest(StartCase):
 
     def test_start_passes_the_folders_of_its_account_in_the_section(self):
         # The record names an existing folder of the implementer twice, one that does
-        # not exist, one of another account and a line jig cannot read (line 7).
+        # not exist, one of another account and a line jig cannot read (line 6).
         data = self.worker_home / "data"
         data.mkdir()
         self.push_directories(f"implementer: {data}", "implementer: data",
