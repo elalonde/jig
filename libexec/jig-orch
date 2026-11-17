@@ -106,9 +106,9 @@ next start. At the first start, with no record yet, the files already
 there are taken as announced. A record line of the older form, a path alone, stands for
 the file that is at that path now, so an upgrade announces nothing again.
 
-Reports. Every JIG_ORCH_REPORT_POLL seconds the loop fetches the branch BRANCH of the
-conf file from origin of the project's clone, into refs/jig-orch/<BRANCH> only, and
-appends the event "report: <ID> <status>" for each new commit whose subject is exactly "log: <ID>",
+Reports. Every JIG_ORCH_REPORT_POLL seconds the loop reads BRANCH from the conf file
+again and fetches that branch from origin of the project's clone, into
+refs/jig-orch/<BRANCH> only, and appends the event "report: <ID> <status>" for each new commit whose subject is exactly "log: <ID>",
 the commit that ends a unit. The status is the text before the first colon of line 1 of
 impl/log/<ID>-report.md at that commit (the whole line when it has no colon), read as
 jig close reads it, or "unreadable" when the file cannot be read. The fetch moves no
@@ -119,7 +119,13 @@ tried again at the next poll. orch/reported keeps the commits announced, each wr
 there once its line is appended, so each gets one line across restarts. With no record
 yet, the first fetch that works takes the log commits already on origin as announced,
 except those whose commit time is at or after the loop's start, so a report that lands
-while the first fetches fail is not lost.
+while the first fetches fail is not lost. When BRANCH changed since the last poll, as
+when the project moves to a new version line while the loop runs, the loop logs one
+line that names the old and the new branch. The first fetch of the new branch that
+works then takes as announced each log commit that the old branch also held, as last
+fetched, and each log commit made before the loop's start; a log commit made after the
+start that only the new branch holds gets its line. A conf file that cannot be read
+keeps the branch of the last poll, with one line in the log for each run of failures.
 
 Hourly. Every JIG_ORCH_HOURLY seconds the loop ticks. The tick never wakes the model:
 the orchestrator writes its updates when a result changes what Eric expects, not by the
@@ -130,8 +136,8 @@ hour still leaves a mark in the log. Something changed when the loop appended an
 inbox, readback or report line to the event file (a line still waiting in the queue
 and the reminders do not count), or when refs/jig-orch/<BRANCH> moved and git diff
 --name-only from its last position names a file other than impl/orch/updates.log. The
-first fetch that works only sets that position, as it sets the report record; a
-failed fetch changes nothing. The idle line reads
+first fetch that works only sets that position, as it sets the report record, and so
+does the first fetch of a new branch; a failed fetch changes nothing. The idle line reads
 
   <date -Iseconds> idle: waits for <what> since <time>
 
@@ -1496,6 +1502,36 @@ class Orch:
                      f"{self.report_poll:g} s", tee=True)
         self.fetch_failing = True
 
+    def follow_branch(self):
+        """Read BRANCH from the conf file again, and watch the new branch when it moved.
+
+        The conf file of a project moves to a new version line while the loop runs. A
+        loop that kept the branch of its start would go on fetching the old line, and
+        the report commits of the new line would get no line. The ref of the old branch
+        stays as it was last fetched, so that the first fetch of the new branch can
+        leave out the reports that the old branch already held.
+        """
+        try:
+            branch = jig_units.read_conf(self.project)["BRANCH"]
+        except worker.Refused as error:
+            problem = f"branch: {error}; reports still come from {self.branch}"
+            if problem != self.branch_problem:
+                self.branch_problem = problem
+                self.log(problem)
+            return
+        self.branch_problem = None
+        if branch == self.branch:
+            return
+        self.log(f"branch: BRANCH of the conf file moved from {self.branch} to {branch}; "
+                 f"reports now come from {branch}")
+        # After two moves with no fetch between them, the branch fetched last is still
+        # the one whose reports were seen.
+        if self.moved_from is None:
+            self.moved_from = self.watch_ref
+        self.branch, self.watch_ref = branch, f"refs/jig-orch/{branch}"
+        # The diff from the old line's head to the new one's is no news of this hour.
+        self.origin_head = None
+
     def watch_reports(self):
         """Start a fetch when one is due, and look for new report commits after it.
 
@@ -1506,6 +1542,7 @@ class Orch:
         if self.fetching is None:
             if moment >= self.next_fetch:
                 self.next_fetch = moment + self.report_poll
+                self.follow_branch()
                 self.start_fetch()
             return
         code = self.fetching.poll()
@@ -1549,6 +1586,17 @@ class Orch:
             self.reported = {commit for commit, moment, _ in commits
                              if moment < int(self.loop_started)}
             self.write_reported()
+        if self.moved_from is not None:
+            # The first fetch of a new branch. A report that the old branch held got its
+            # line there, or was taken as announced there; a report older than the loop
+            # was made while no loop watched this branch, and is old news.
+            held = worker.git(self.clone, "log", "--extended-regexp", "--grep=^log: ",
+                              "--format=%H", self.moved_from)
+            old = set(held.stdout.split()) if held.returncode == 0 else set()
+            self.reported |= {commit for commit, moment, _ in commits
+                              if commit in old or moment < int(self.loop_started)}
+            self.write_reported()
+            self.moved_from = None
         for commit, _, unit in commits:
             if commit in self.reported or commit in self.pending:
                 continue
@@ -1701,6 +1749,7 @@ class Orch:
         self.report_poll = report_poll
         self.fetch_cap = min(FETCH_CAP_SECONDS, report_poll)
         self.fetching, self.fetch_failing, self.next_fetch = None, False, 0.0
+        self.moved_from, self.branch_problem = None, None
         self.waiting, self.queue, self.held = {}, [], None
         self.hourly, self.next_tick = hourly, time.monotonic() + hourly
         self.changed, self.last_change, self.origin_head = False, now_text(), None

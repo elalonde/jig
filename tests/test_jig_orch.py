@@ -1413,6 +1413,85 @@ class TestReportLines(ReportTestCase):
 
 
 
+class TestBranchMove(ReportTestCase):
+    """The conf file moves the project to a new version line while the loop runs."""
+
+    NEW_LINE = "line-2"
+
+    def conf(self):
+        return self.home / ".config" / "jig" / f"{PROJECT}.conf"
+
+    def move_conf(self):
+        text = self.conf().read_text(encoding="utf-8")
+        self.conf().write_text(text.replace(f"BRANCH={BRANCH}\n",
+                                            f"BRANCH={self.NEW_LINE}\n"), encoding="utf-8")
+
+    def push_new_line(self, unit, when=None):
+        """Push a log commit of a unit on the new line, which starts at the old line."""
+        path = self.writer / "impl" / "log" / f"{unit}-report.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"OK\njig-report: 1\nid: {unit}\n", encoding="utf-8")
+        dates = {"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when} if when else {}
+        self.git(self.writer, "add", "-A")
+        self.git(self.writer, "commit", "-q", "--no-verify", "-m", f"log: {unit}", **dates)
+        self.git(self.writer, "push", "-q", "origin", f"HEAD:refs/heads/{self.NEW_LINE}")
+        return self.git(self.writer, "rev-parse", "HEAD")
+
+    def test_loop_follows_the_new_branch_and_announces_only_its_new_reports(self):
+        # The old line has a report from before the loop and one announced while it ran.
+        # The new line starts from the old one, holds a report from before the loop
+        # start and a new one, and then the conf file names it. Only the new report gets
+        # a line, the move is logged once with both names, and the loop fetches the new
+        # line into its own ref.
+        self.push_log("a1", "OK", when=self.an_hour_ago())
+        self.start()
+        self.push_log("a2", "OK")
+        self.until(lambda: self.reports() == ["report: a2 OK"], seconds=30,
+                   what="the line for a2")
+        self.push_new_line("b1", when=self.an_hour_ago())
+        new = self.push_new_line("b2")
+        self.move_conf()
+        self.until(lambda: "report: b2 OK" in self.reports(), seconds=30,
+                   what="the line for b2 on the new line")
+        self.settle()
+        self.assertEqual(self.reports(), ["report: a2 OK", "report: b2 OK"])
+        moved = (f"branch: BRANCH of the conf file moved from {BRANCH} to {self.NEW_LINE}; "
+                 f"reports now come from {self.NEW_LINE}")
+        self.assertEqual(self.log().count(moved), 1, self.log())
+        found = run(["git", "-C", self.clone, "rev-parse", "-q", "--verify",
+                     f"refs/jig-orch/{self.NEW_LINE}"], env=self.env())
+        self.assertEqual(found.stdout.strip(), new)
+
+    def test_first_fetch_of_the_new_branch_leaves_out_what_the_old_branch_held(self):
+        # In this process: the old line's ref holds a report made after the loop start
+        # that is not in the record yet, as one still waiting in the queue would be. The
+        # first look at the new line queues only the report that the new line alone
+        # holds and that was made after the start; the other two go into the record.
+        held = self.push_log("a1", "OK")
+        self.git(self.clone, "fetch", "-q", "origin",
+                 f"+refs/heads/{BRANCH}:refs/jig-orch/{BRANCH}")
+        early = self.push_new_line("b1", when=self.an_hour_ago())
+        late = self.push_new_line("b2")
+        self.git(self.clone, "fetch", "-q", "origin",
+                 f"+refs/heads/{self.NEW_LINE}:refs/jig-orch/{self.NEW_LINE}")
+        (self.reviews / "orch").mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            orch = self.in_process()
+            orch.reported, orch.pending, orch.queue = set(), set(), []
+            orch.loop_started = time.time() - 600
+            orch.moved_from, orch.branch_problem = None, None
+            self.move_conf()
+            orch.follow_branch()
+            orch.find_reports()
+        self.assertEqual(orch.watch_ref, f"refs/jig-orch/{self.NEW_LINE}")
+        self.assertEqual(orch.queue, [("report: b2 OK", late)])
+        self.assertEqual(orch.reported, {held, early})
+        self.assertIsNone(orch.moved_from)
+
+    def in_process(self):
+        return load_orch().Orch(PROJECT)
+
+
 class TestEventOrder(ReportTestCase):
     def test_each_kind_of_event_is_one_line_in_the_order_it_came(self):
         # A reminder is due at the start; then an inbox file, a readback and a unit's
