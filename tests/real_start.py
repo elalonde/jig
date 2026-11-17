@@ -23,6 +23,7 @@ import getpass
 import grp
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -257,10 +258,11 @@ class FixtureProjectCase(unittest.TestCase):
     directory under /tmp. The worker reads the project's conf file from this account's
     ~/.config/jig, and puts the prompt and the tee under ~/ws; the test removes all of
     them. The worker marks the new -dev clone and each folder it passes as trusted
-    before the session starts, so the session starts with no folder-trust dialog. A
-    folder of --add-dir can still show the dialog of an added folder, since Claude Code
-    keeps no known mark for such a folder; the worker then stops at that dialog. Either
-    way, the test ends that session and frees its lock.
+    before the session starts. Claude Code 2.1.326 was measured to read the same key in
+    the entry of a folder of --add-dir, and then to skip the dialog of an added folder
+    as well, so the session starts with no dialog of either kind. A stop at either
+    dialog fails the test: with a later Claude Code that reads another key, this is
+    where it shows. The test ends that session and frees its lock.
 
     The fixture product tracks a hooks directory, and the clone has no core.hooksPath,
     as a product has before its first make check: the start sets core.hooksPath to
@@ -296,7 +298,7 @@ class FixtureProjectCase(unittest.TestCase):
         self.lock_dir = self.base / "lock"
         self.lock_dir.mkdir()
         # The session starts with no dialog, so the worker watches it for the whole
-        # settle time, unless the dialog of an added folder stops it sooner.
+        # settle time.
         self.env = {**os.environ, "JIG_LOCK_DIR": str(self.lock_dir),
                     "JIG_START_SETTLE": "15"}
 
@@ -360,12 +362,17 @@ class FixtureProjectCase(unittest.TestCase):
         lock = self.lock_dir / f"{HOOK_PROJECT}-{getpass.getuser()}"
         lock.unlink(missing_ok=True)
         lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
+        self.first_start = True
 
     def run_worker(self, *tag_args, add_dirs=()):
-        """Run the worker part alone; accept a start, or a stop at an added folder's dialog.
+        """Run the worker part alone; accept only a start that reached no dialog.
 
-        The folder-trust dialog of the start folder no longer comes, because the worker
-        marks that folder first, so a stop there fails the test.
+        The worker marks the start folder and each added folder that exists before the
+        session starts, so neither the folder-trust dialog nor the dialog of an added
+        folder may come. Each mark must be in ~/.claude.json afterwards. At the first
+        start of a test, a folder under the new /tmp directory had no mark before, so
+        the worker must print a line that it set it; a folder in the home can hold its
+        mark from an earlier run, and then gives no line.
 
         tag_args are the --tag and --approved-tag options; without them, the phase tag
         that the fixture holds is both. add_dirs are the --add-dir words. Returns the
@@ -375,17 +382,36 @@ class FixtureProjectCase(unittest.TestCase):
         result = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
                          "--expected", EXPECTED, "--model", MODEL, *tag_args, *add_dirs,
                          env=self.env)
-        self.assertNotIn("folder-trust dialog", result.stderr)
-        stopped = result.returncode == 1 and "the dialog of the added folder" in result.stderr
-        self.assertTrue(result.returncode == 0 or stopped, result.stderr)
-        print(f"worker: {'stopped at the dialog of an added folder' if stopped else 'started'}")
-        print("\n".join(line for line in result.stdout.splitlines()
-                        if line.startswith("trust ")))
+        print(f"worker: exit {result.returncode}")
+        trust = [line for line in result.stdout.splitlines() if line.startswith("trust ")]
+        print("\n".join(trust))
+        output = result.stdout + result.stderr
+        self.assertNotIn("refused: dialog:", output)
+        self.assertEqual(result.returncode, 0, output)
+        self.assert_marked(trust, add_dirs)
         command = capture("tmux", "display-message", "-p", "-t", f"={HOOK_SESSION}:",
                           "#{pane_start_command}").stdout
         self.stop_session()
         self.assertFalse(session_alive(HOOK_SESSION))
         return command
+
+    def assert_marked(self, trust, add_dirs):
+        """Check the trust lines of one start and the marks they leave behind."""
+        account = getpass.getuser()
+        added = [os.path.expanduser(word) for flag, word in zip(add_dirs, add_dirs[1:])
+                 if flag == "--add-dir"]
+        folders = [str(self.dev), *(folder for folder in added if os.path.isdir(folder))]
+        for line in trust:
+            self.assertTrue(line.endswith(": trusted"), line)
+        if self.first_start:
+            for folder in folders:
+                if pathlib.Path(folder).is_relative_to(self.base):
+                    self.assertIn(f"trust {account} {folder}: trusted", trust)
+        self.first_start = False
+        state = json.loads((HOME / ".claude.json").read_text(encoding="utf-8"))
+        for folder in folders:
+            entry = state.get("projects", {}).get(folder, {})
+            self.assertIs(entry.get("hasTrustDialogAccepted"), True, folder)
 
     def hooks_path(self):
         """Return the core.hooksPath that git uses in the product clone, or None."""
