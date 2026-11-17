@@ -104,6 +104,12 @@ def write_state(path, state):
             os.fchmod(stream.fileno(), mode)
             json.dump(state, stream, indent=2)
             stream.write("\n")
+            # The data must be on the disk before the rename. Otherwise a
+            # power loss soon after it can leave the file empty or cut off
+            # on a file system that writes the name first, and the file
+            # holds the whole Claude Code state of the account.
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
     except BaseException:
         try:

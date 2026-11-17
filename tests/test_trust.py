@@ -104,6 +104,27 @@ class TrustMarkTest(TrustMarkCase):
         self.assertNotEqual(self.state.stat().st_ino, before)
         self.assertEqual(sorted(path.name for path in self.home.iterdir()), [".claude.json"])
 
+    def test_the_new_file_is_on_the_disk_with_all_its_data_before_the_rename(self):
+        # A power loss just after the rename must not leave the file empty or cut off,
+        # so the new file is synced, whole, before it takes the old one's name.
+        self.write({"theme": "dark"})
+        calls = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(descriptor):
+            calls.append(("fsync", os.fstat(descriptor).st_size))
+            real_fsync(descriptor)
+
+        def replace(source, target):
+            calls.append(("replace", os.stat(source).st_size))
+            real_replace(source, target)
+
+        with mock.patch.object(jig_trust.os, "fsync", fsync), \
+                mock.patch.object(jig_trust.os, "replace", replace):
+            self.assertEqual(self.mark(), ("trusted", None))
+        size = self.state.stat().st_size
+        self.assertEqual(calls, [("fsync", size), ("replace", size)])
+
     def test_the_key_of_an_added_folder_is_written_when_it_is_asked_for(self):
         self.assertEqual(self.mark(key="someOtherKey"), ("trusted", None))
         self.assertEqual(self.entry(), {"someOtherKey": True})
