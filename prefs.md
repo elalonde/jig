@@ -11,6 +11,13 @@ Language:
   session and the next steps.
 - When Eric did not answer a question, repeat the question at the top of the
   next message, with the reason it matters.
+- Show each celebration at the top of the reply to Eric's next message, and
+  not before, so that you know that Eric saw it. Write it to `updates.log`
+  when it happens. Keep each celebration not yet shown as one item in the Open
+  part of `state.md`, and remove the item when you have shown it.
+- The order at the top of a reply: first the celebrations not yet shown, then
+  the question that Eric did not answer, then the summary after a gap of about
+  an hour.
 
 Briefs, and every other message that gives Eric options:
 

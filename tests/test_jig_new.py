@@ -452,6 +452,38 @@ class JigNewTest(JigNewCase):
                       "session, and when a result changes what Eric expects or something "
                       "needs him; never by the clock.", texts["ORCHESTRATOR.md"])
 
+    def test_standing_prompt_shows_each_celebration_at_eric_next_message(self):
+        # A celebration shown before Eric writes can scroll past unseen. The common part
+        # of the standing prompt, apart from the preferences included above it, holds
+        # the rule of when to show one, the item in state.md that keeps it until then,
+        # and the order at the top of a reply.
+        text = " ".join(self.made_text("impl/orch/ORCHESTRATOR.md").split())
+        part = text.split("Updates and celebrations:", 1)[1].split("## Blocks", 1)[0]
+        for line in ("write each celebration to `updates.log` when it happens. Show it in "
+                     "the console at the top of your reply to Eric's next message, and not "
+                     "before,",
+                     "Keep each celebration that you have not shown as one item in the Open "
+                     "part of `state.md`, and remove the item when you have shown the "
+                     "celebration.",
+                     "The order at the top of a reply: first the celebrations not yet shown, "
+                     "then the question that Eric did not answer, then the summary after a "
+                     "gap of about an hour."):
+            self.assertIn(line, part)
+
+    def test_preferences_hold_the_reply_rule_of_celebrations(self):
+        # The preferences that every standing prompt includes hold the same rule: the
+        # celebration at the top of the reply to Eric's next message, the item in
+        # state.md, and the order at the top of a reply.
+        text = " ".join((ROOT / "prefs.md").read_text(encoding="utf-8").split())
+        for line in ("Show each celebration at the top of the reply to Eric's next "
+                     "message, and not before,",
+                     "Keep each celebration not yet shown as one item in the Open part of "
+                     "`state.md`, and remove the item when you have shown it.",
+                     "The order at the top of a reply: first the celebrations not yet "
+                     "shown, then the question that Eric did not answer, then the summary "
+                     "after a gap of about an hour."):
+            self.assertIn(line, text)
+
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
         # form of the table that jig tag reads, or the first revision tag is refused.

@@ -340,6 +340,15 @@ Updates and celebrations:
   what it fixes. A minor release gets at most 12 lines: what it adds, with
   the numbers. A major release gets the longest, at most 30 lines, with the
   story of the version.
+- When to show a celebration: write each celebration to `updates.log` when it
+  happens. Show it in the console at the top of your reply to Eric's next
+  message, and not before, so that you know that Eric saw it. Keep each
+  celebration that you have not shown as one item in the Open part of
+  `state.md`, and remove the item when you have shown the celebration. Thus a
+  new session after a rollover or a restart shows each celebration once.
+- The order at the top of a reply: first the celebrations not yet shown, then
+  the question that Eric did not answer, then the summary after a gap of about
+  an hour.
 
 ## Blocks
 
