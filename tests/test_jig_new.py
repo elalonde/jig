@@ -89,9 +89,9 @@ class TrustStepMixin:
 ACCOUNT_PLACEHOLDERS = {"orchestrator": "@ORCH@", "specwriter": "@SPEC@",
                         "implementer": "@IMPL@"}
 # A copy of the orchestrator row of that table in the approved spec, for a tree that
-# has no approved worktree beside it. The name of the other project in it is built
-# from parts, so that the term check of this repo does not meet it.
-_MOVED = "Pu" + "ron"
+# has no approved worktree beside it. The copy leaves out the one clause that the
+# template leaves out too, on the steps of another project's move, because that clause
+# names a project that has no place in this repo; the comparison removes it anyway.
 SPEC_ORCHESTRATOR_ROW = (
     "| Orchestrator | orchestrator | the `-dev` repo, public sources, the jig change log, "
     "its inbox, the screen that `jig wait` prints, which, with the clean room on, is never "
@@ -101,9 +101,8 @@ SPEC_ORCHESTRATOR_ROW = (
     "(section 7, \"Waiting on another project\") | prompts, blocks, `impl/orch/`, the "
     "kickoff record, answers in `QUESTIONS.md`, briefs, the spec-phase summary and timing "
     "rows of `specs/00-status.md`, `CLAUDE.md`, `terms.txt`, "
-    "`impl/log/<batch ID>-summary.md`, `requests/<ID>.md` in `jig-dev`; in steps 4 to 6 "
-    f"of {_MOVED}'s move, the files of `{_MOVED.lower()}-dev` that those steps give to the "
-    "orchestrator (section 13) | product code, spec text, the reference, a tag |")
+    "`impl/log/<batch ID>-summary.md`, `requests/<ID>.md` in `jig-dev` "
+    "| product code, spec text, the reference, a tag |")
 
 
 def spec_orchestrator_row():
