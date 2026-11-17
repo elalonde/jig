@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import signal
+import stat
 import subprocess
 import textwrap
 import time
@@ -149,7 +150,9 @@ class RealStartEndTest(TempTestCase):
         self.assertNotEqual(listed.returncode, 0, "the session of the run still runs")
         self.assertEqual(list(self.temp.iterdir()), [])
         self.assertEqual(self.git(self.approved, "rev-parse", "HEAD"), self.first)
-        self.assertFalse(os.access(self.approved / "spec.md", os.W_OK))
+        # The write bits, not os.access, which says yes to root for every file.
+        mode = (self.approved / "spec.md").stat().st_mode
+        self.assertEqual(stat.S_IMODE(mode) & 0o222, 0, oct(mode))
 
     def assert_entries_removed(self):
         # An end that did not wait for the session would be over before the session
