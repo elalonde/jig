@@ -990,12 +990,13 @@ def wait_on(project, words, poll):
     # orch directories must exist already; the command makes neither. The directory
     # of the other project is the one whose activity file the stall check reads.
     if not clear:
-        if home is None:
-            print(f"jig orch: refused: wait-on: the orchestrator account {account} is not "
-                  f"known, so no activity file of {other} can be read", file=sys.stderr)
-            return REFUSED
         for directory, name in ((orch_dir(project), project),
-                                (other_orch_dir(home, other), other)):
+                                (other_orch_dir(home, other) if home else None, other)):
+            if directory is None:
+                print(f"jig orch: refused: wait-on: the orchestrator account {account} is "
+                      f"not known, so no activity file of {other} can be read",
+                      file=sys.stderr)
+                return REFUSED
             if not directory.is_dir():
                 print(f"jig orch: refused: wait-on: {directory} does not exist: no "
                       f"orchestrator of {name} runs on this host", file=sys.stderr)

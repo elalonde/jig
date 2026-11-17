@@ -413,10 +413,10 @@ class TestOrchestratorHome(OrchTestCase):
         (self.reviews / "orch" / "waits").write_text(
             f"{OTHER}\t{orch.stamp(self.now)}\ta block\n", encoding="utf-8")
 
-    def in_process(self, call):
+    def in_process(self, call, known=True):
         """Run call with the fixture's environment and account database; return what it
-        printed."""
-        homes = {"boss": str(self.boss_home)}
+        printed. With known false, the database does not know the account boss."""
+        homes = {"boss": str(self.boss_home)} if known else {}
 
         def getpwnam(name):
             if name not in homes:
@@ -427,7 +427,8 @@ class TestOrchestratorHome(OrchTestCase):
         env.update(LOGNAME="fixture-runner", USER="fixture-runner")
         out = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch("pwd.getpwnam", getpwnam), contextlib.redirect_stdout(out):
+                mock.patch("pwd.getpwnam", getpwnam), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out):
             call()
         return out.getvalue()
 
@@ -441,6 +442,20 @@ class TestOrchestratorHome(OrchTestCase):
         written = self.in_process(lambda: orch.wait_on(PROJECT, [OTHER, "a block"], POLL))
         self.assertIn(f"waits on {OTHER}", written)
         self.assertNotIn("warning", written)
+
+    def test_wait_on_with_an_unknown_account_refuses_after_its_own_directory(self):
+        # A host without the account boss: a project with no orch directory of its own
+        # is refused for that directory first, as on a host with the account; a
+        # project that has one is refused for the account.
+        (self.reviews / "orch" / "waits").unlink()
+        refused = self.in_process(lambda: orch.wait_on("nobody", [OTHER, "a block"], POLL),
+                                  known=False)
+        self.assertIn(f"{self.home / 'ws' / 'reviews' / 'nobody' / 'orch'} does not exist",
+                      refused)
+        refused = self.in_process(lambda: orch.wait_on(PROJECT, [OTHER, "a block"], POLL),
+                                  known=False)
+        self.assertIn("the orchestrator account boss is not known", refused)
+        self.assertFalse((self.reviews / "orch" / "waits").exists())
 
 
 class TestQuietLines(OrchTestCase):
