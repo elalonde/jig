@@ -187,7 +187,9 @@ def update(path, change):
     is read again just before the rename. When the file changed since
     the read, it is read, changed and made again, once; when it changed
     again by then, the new file goes into place all the same, and the
-    read after the rename shows what was lost.
+    read after the rename shows what was lost. So the second pass reads
+    no status before its rename: it would rename in either case. That
+    pass always ends in a return, so the loop never runs to its end.
     """
     for again in (False, True):
         state, status = load(path)
@@ -198,7 +200,6 @@ def update(path, change):
             put_in_place(temporary, path)
             return True
         discard(temporary)
-    return True
 
 
 def locate(home):
