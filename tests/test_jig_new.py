@@ -487,6 +487,8 @@ class JigNewTest(JigNewCase):
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
         # form of the table that jig tag reads, or the first revision tag is refused.
+        # That holds also for the row of four cells, which closes a loop with a fix
+        # unit in place of a second review.
         text = self.made_text("impl/orch/ORCHESTRATOR.md")
         for line in ("`BRANCH=<line> jig tag demo <tag> <commit>`, with `<line>` the `BRANCH` "
                      "of your conf file, `~/.config/jig/demo.conf`.",
@@ -495,6 +497,9 @@ class JigNewTest(JigNewCase):
                      "The row is `| <document path> | <commit> | <ID> |`, with the document as "
                      "its path from the repo root",
                      "the commit that the last review round of the loop read",
+                     "`| <document path> | <commit> | <ID> | <fix ID> |`, with the fix unit's "
+                     "commit;",
+                     "`impl/log/<fix ID>-report.md` must start with `OK`.",
                      "so the tag goes at or after the commit that adds the row."):
             self.assertIn(line, text)
 
