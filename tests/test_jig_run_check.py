@@ -1,8 +1,11 @@
+import importlib.machinery
+import importlib.util
 import os
 import pathlib
 import pwd
 import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -60,6 +63,108 @@ def runs(pid):
     except OSError:
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+# A child of the shell that marks that it is ready, then sleeps. With "clean" it
+# answers SIGTERM by sleeping half a second and then writing the done file, as a check
+# that puts things back before it exits; with "ignore" it ignores SIGTERM; with
+# "plain" it keeps the default and dies at once.
+CHILD = """
+import os, pathlib, signal, sys, time
+mode, ready, done = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+def clean(_signum, _frame):
+    time.sleep(0.5)
+    done.write_text("cleaned", encoding="utf-8")
+    sys.exit(0)
+if mode == "clean":
+    signal.signal(signal.SIGTERM, clean)
+elif mode == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ready.write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(60)
+"""
+
+
+def load_run_check():
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("jig_run_check_under_test", str(RUN_CHECK))
+    module = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+class KillGroupTest(TempTestCase):
+    """The kill of a check's group gives its processes time to clean up, and no more."""
+
+    def setUp(self):
+        super().setUp()
+        self.module = load_run_check()
+        self.child = self.tmp / "child.py"
+        self.child.write_text(CHILD, encoding="utf-8")
+        self.ready = self.tmp / "ready"
+        self.done = self.tmp / "done"
+
+    def start(self, mode):
+        """Start the child under sh -c in a group of its own, as a check runs; return both."""
+        # The command after the child keeps sh from replacing itself with the child, so
+        # the shell stays the head of the group, as with a real row.
+        command = " ".join(shlex.quote(str(part)) for part in
+                           (sys.executable, self.child, mode, self.ready, self.done))
+        process = subprocess.Popen(["sh", "-c", f"{command}; true"], start_new_session=True,
+                                   stdin=subprocess.DEVNULL)
+        self.addCleanup(self.end, process)
+        for _ in range(100):
+            if self.ready.exists() and self.ready.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.05)
+        self.assertTrue(self.ready.exists(), "the child never got ready")
+        return process, int(self.ready.read_text(encoding="utf-8"))
+
+    def end(self, process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+    def kill(self, process):
+        """Run kill_group on the process; return the seconds it took."""
+        began = time.monotonic()
+        self.module.kill_group(process)
+        return time.monotonic() - began
+
+    def test_a_child_that_cleans_up_at_sigterm_finishes_before_the_kill_returns(self):
+        # The shell at the head of the group dies at once at SIGTERM; the child's cleanup
+        # still takes half a second, and must not be cut off by the SIGKILL.
+        process, _ = self.start("clean")
+        self.kill(process)
+        self.assertEqual(self.done.read_text(encoding="utf-8") if self.done.exists() else None,
+                         "cleaned")
+        self.assertEqual(group_members(process.pid), [])
+
+    def test_a_child_that_ignores_sigterm_is_killed_when_the_grace_ends(self):
+        # With a one-second grace, the kill waits that long for a child that ignores
+        # SIGTERM, then kills it.
+        self.module.GRACE_SECONDS = 1
+        process, child = self.start("ignore")
+        took = self.kill(process)
+        self.assertGreaterEqual(took, 0.9)
+        self.assertLess(took, 5)
+        for _ in range(50):
+            if not runs(child):
+                break
+            time.sleep(0.05)
+        self.assertFalse(runs(child), "the child that ignored SIGTERM still runs")
+
+    def test_a_group_that_ends_at_sigterm_is_not_kept_waiting_for_the_grace(self):
+        # Every process of the group dies at SIGTERM, so the kill returns at once and
+        # does not sit out the grace, here a long one.
+        self.module.GRACE_SECONDS = 10
+        process, child = self.start("plain")
+        took = self.kill(process)
+        self.assertLess(took, 2)
+        self.assertFalse(runs(child))
 
 
 class RunCheckCase(TempTestCase):

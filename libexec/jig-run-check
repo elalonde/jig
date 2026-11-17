@@ -49,6 +49,11 @@ and then exits with 128 plus the signal number, so that the slot is free only on
 the command is gone; otherwise a closed tmux session would leave a heavy command
 running while another took its slot. SIGKILL cannot be caught: after it, the command
 runs on, unlimited, while its slot is free.
+
+To kill the group, at the cap or at a signal, this sends SIGTERM to it and waits until
+no process of the group is left, up to 30 seconds, and only then sends SIGKILL to what
+is left. A check that cleans up at SIGTERM thus gets to finish its cleanup, also in a
+child of the shell that runs the command, which ends at once.
 """
 
 import os
@@ -75,8 +80,12 @@ SESSION_NAME = re.compile(
 
 # The code that timeout(1) gives for a command it stopped, so a reader knows it.
 TIMED_OUT = 124
-# A killed check gets this long after SIGTERM to clean up before SIGKILL.
-GRACE_SECONDS = 5
+# A killed check gets up to this long after SIGTERM to clean up before SIGKILL. A check
+# that puts back what it changed, such as a work tree moved to another tag or entries it
+# added to a shared file, needs that time; a group that is gone sooner gets no wait.
+GRACE_SECONDS = 30
+# How often the wait after SIGTERM looks whether a process of the group is left.
+POLL_SECONDS = 0.05
 SRV_ROOT = "/srv/jig"
 # The account the conf template names; a conf file that names none means it.
 DEFAULT_IMPL_ACCOUNT = "implementer"
@@ -160,16 +169,54 @@ def run(command, repo, output, cap, env=None):
     return (128 - code if code < 0 else code), wall
 
 
+def group_runs(group):
+    """Say whether a process of the process group still runs; a zombie has ended."""
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie still counts for killpg. In a container whose first process does not
+    # reap orphans, an orphan that ended stays a zombie, so only /proc tells whether a
+    # live process is left. Without a readable /proc, killpg is all there is to go by.
+    try:
+        entries = list(pathlib.Path("/proc").iterdir())
+    except OSError:
+        return True
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        if fields[0] != "Z" and int(fields[2]) == group:
+            return True
+    return False
+
+
 def kill_group(process):
+    """Stop the command's process group: SIGTERM, then SIGKILL to what is left.
+
+    The wait after SIGTERM lasts until no process of the group is left, not only until
+    the shell at its head is gone: sh -c ends at once at SIGTERM while a child of it
+    still runs its cleanup, and a SIGKILL at that point would cut the cleanup off.
+    """
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    try:
-        process.wait(timeout=GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-    # A process that ignored SIGTERM, or a child that outlived the shell, ends here.
+    deadline = time.monotonic() + GRACE_SECONDS
+    while True:
+        # Reap the shell once it ends, so that it no longer counts as a member.
+        process.poll()
+        if not group_runs(process.pid) or time.monotonic() >= deadline:
+            break
+        time.sleep(POLL_SECONDS)
+    # A process that ignored SIGTERM, or one still cleaning up when the grace ended,
+    # ends here.
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
