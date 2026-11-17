@@ -5,6 +5,93 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.9.1
+
+What changed: `jig report`, for a product that has no branch of the conf's
+`BRANCH` yet, now reads every origin branch of the product also for the vector
+checks: a listed commit counts when any origin branch holds it, and the check
+for vectors that no commit names reads every origin branch. In 0.9.0 only the
+check of the unit's commits did so.
+
+`jig start` and the supervisor loop, `jig orch`, set all the trust marks of a
+start with one read and one rename of Claude Code's state file of the account,
+instead of one write per folder. Claude Code writes that file without a lock, so
+a session's write between the read and the rename was lost; jig now reads the
+file's status again just before the rename, and when the file changed it reads
+and changes it once more. A folder that the list holds twice, also once with `~`
+and once written in full, gets its mark and one trust line; in 0.9.0 it got no
+mark, and its session waited at the trust dialog.
+
+`jig tag` accepts a closed review loop whose must-fix findings a fix unit
+applied, with no second review: a row of the table "Closed review loops" may
+have a fourth cell, the fix unit's ID. The review's findings file must exist,
+and the fix unit's report must start with `OK`. Rows of three cells, and rows
+with an empty fourth cell, are checked as before.
+
+`jig run-check`, at the time cap or a stop signal, sends SIGTERM to the
+command's process group and then waits until no process of the group is left,
+up to 30 seconds, before SIGKILL, so that a cleanup in a child of the shell can
+finish. It skips a process entry whose name is not UTF-8 or cannot be parsed,
+instead of ending the wait. `make real-start` leaves nothing behind: at its end
+it stops the sessions of the run and waits until their processes are gone,
+removes its folders and their entries in Claude Code's state file, and puts the
+approved worktree back where it was. Its folders and those of the tests are
+named `jig-test.*` in the temporary directory.
+
+The stall check of `jig orch` reads the activity files of a project that it
+waits on in the home of the orchestrator account, `ORCH_ACCOUNT` of the conf
+file, `orchestrator` when the conf file names none. `jig batch` stops with exit
+15 on a must-fix or should-fix finding that it cannot count, written as a table
+row or a heading of another form, and names its line.
+
+The templates of `jig new`: `ORCHESTRATOR.md` gives the four-cell row of
+"Closed review loops"; it and `prefs.md`, the owner's preferences that `jig new`
+puts into it, show each celebration at
+the top of the reply to Eric's next message, and not before, keep each one not
+yet shown as an Open item of `state.md`, and put first the celebrations, then
+the unanswered question, then the summary after a gap of about an hour.
+
+Files and formats: changed files: `lib/jig_trust.py`, `libexec/jig-batch`,
+`libexec/jig-orch`, `libexec/jig-report`, `libexec/jig-run-check`,
+`libexec/jig-start-worker`, `libexec/jig-tag`, `prefs.md`, the template
+`ORCHESTRATOR.md` under `templates/new/`, and `tests/real_start.py`; new file:
+`tests/real_start_end.py`. The table "Closed review loops" of the status file
+takes an optional fourth cell; a table of three cells reads as before. The
+other formats are unchanged.
+
+Migration: a host and its projects move from 0.9.0 to 0.9.1 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.9.1`. It installs 0.9.1
+   under `/opt/jig/0.9.1/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.9.1` as the orchestrator
+   account. It sets `JIG_VERSION=0.9.1` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.9.1`.
+3. Restart each project's orchestrator loop, so that it loads the new trust
+   step and stall check: let the session finish its step, then, from a shell of
+   the orchestrator account outside the session, run `jig orch <project> stop`
+   and then `jig orch <project> start`. The start marks the `-dev` clone and
+   each folder of the orchestrator's sessions, a folder that its list holds
+   twice too, and prints a trust line for each mark it sets or cannot set. A
+   line that ends in `not marked` names a folder whose session will wait at the
+   dialog. A loop that is not restarted keeps the 0.9.0 code.
+4. Nothing more for the specwriter and implementer accounts: the next `jig
+   start` of a unit in each sets the marks with the new step, with a trust line
+   for each.
+5. From now on an orchestrator may close a review loop through a fix unit, with
+   a row of four cells in "Closed review loops":
+   `| <document path> | <fix commit> | <review ID> | <fix ID> |`. The second
+   cell is the fix unit's commit, whose document is tagged, not the review's.
+6. Copy the new rules of the templates by hand into the project's own
+   `ORCHESTRATOR.md`: the four-cell row, and when and in which order to show
+   celebrations. `jig upgrade` changes no file of a project's
+   repo.
+
+Requested by: another project, for the changes of `jig report` and `jig batch`;
+the rest: found in the use of 0.9.0 and in the code review of the line.
+
+Units: 0 minor, 3 patch, 7 none
+
 ## 0.9.0
 
 What changed: Claude Code asks whether a folder can be trusted the first time a
