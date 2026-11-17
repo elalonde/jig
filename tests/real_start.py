@@ -14,9 +14,14 @@ use their own test IDs, which no real unit uses.
 
 The worker marks the -dev clone of a start, and each folder it passes, as trusted in
 ~/.claude.json of this account before the session starts. So the fixture project's
-sessions start with no folder-trust dialog, and the run leaves the marks of the
-fixture folders in that file. The close test starts claude itself, not through the
-worker, so its new folder has no mark and its session still waits at the dialog.
+sessions start with no folder-trust dialog. The close test starts claude itself, not
+through the worker, so its new folder has no mark and its session still waits at the
+dialog.
+
+The run ends by tests/real_start_end.py, also after a failure and at SIGTERM, SIGHUP
+or SIGINT: no session of the run runs, no folder of the run is left, the approved
+worktree is back at the commit where the run found it, and ~/.claude.json holds no
+entry of a folder of the run. Each test registers its sessions and folders there.
 """
 
 import getpass
@@ -31,10 +36,10 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 
+from tests import real_start_end
 from tests.support import ROOT
 
 START = ROOT / "libexec" / "jig-start"
@@ -76,6 +81,10 @@ HOOK_HOME_CLONES = tuple(HOME / "ws" / "src" / name for name in
 HOOK_REVIEWS = HOME / "ws" / "reviews" / HOOK_PROJECT
 # The text of each hook that the fixture product tracks: not jig's, as it has no marker.
 PRODUCT_HOOK = "#!/bin/sh\nexit 0\n"
+
+# What this run started and made, and the end that removes it.
+END = real_start_end.RunEnd(APPROVED)
+setUpModule, tearDownModule = real_start_end.module_hooks(END)
 
 
 def load_script(name, path):
@@ -133,7 +142,7 @@ class RealStartTest(unittest.TestCase):
         self.lock = REAL_LOCK
         holder = lock_holder(REAL_LOCK)
         if holder is not None and holder != SESSION:
-            scratch = tempfile.mkdtemp(prefix="jig-real-start-lock.")
+            scratch = str(END.make_folder())
             self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
             self.env["JIG_LOCK_DIR"] = scratch
             self.lock = pathlib.Path(scratch) / LOCK_NAME
@@ -145,7 +154,7 @@ class RealStartTest(unittest.TestCase):
                        "--model", MODEL, "--approved-tag", TAG, "--tag", TAG, env=self.env)
 
     def stop_session(self):
-        capture("tmux", "kill-session", "-t", f"={SESSION}")
+        END.stop_session(SESSION)
         self.lock.unlink(missing_ok=True)
         self.beside.unlink(missing_ok=True)
 
@@ -161,46 +170,48 @@ class RealStartTest(unittest.TestCase):
         self.assertFalse(self.lock.exists(),
                          f"{self.lock} belongs to another unit; this test leaves it")
         self.assertFalse(session_alive(), f"{SESSION} is running")
+        END.session(SESSION)
         size_before = TEE.stat().st_size if TEE.exists() else 0
         self.addCleanup(self.stop_session)
+        scratch = END.make_folder()
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
 
-        with tempfile.TemporaryDirectory(prefix="jig-real-start.") as scratch:
-            prompt = pathlib.Path(scratch) / "prompt.md"
-            prompt.write_text("Say OK, then stop.\n", encoding="utf-8")
+        prompt = scratch / "prompt.md"
+        prompt.write_text("Say OK, then stop.\n", encoding="utf-8")
 
-            first = self.run_worker(prompt)
-            self.assertEqual(first.returncode, 0, first.stderr)
-            self.assertTrue(self.lock.is_file())
-            self.assertEqual(self.beside.read_text(encoding="utf-8").strip(), EXPECTED)
-            self.assertTrue(session_alive())
-            self.wait_for_output(size_before)
+        first = self.run_worker(prompt)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.lock.is_file())
+        self.assertEqual(self.beside.read_text(encoding="utf-8").strip(), EXPECTED)
+        self.assertTrue(session_alive())
+        self.wait_for_output(size_before)
 
-            groups = session_groups()
-            print(f"session id -nG: {' '.join(groups)}")
-            self.assertIn("jig", groups)
+        groups = session_groups()
+        print(f"session id -nG: {' '.join(groups)}")
+        self.assertIn("jig", groups)
 
-            spec = APPROVED / "specs" / "jig-spec.md"
-            self.assertTrue(spec.is_file(), spec)
-            self.assertEqual(capture("git", "-C", str(APPROVED), "rev-parse", "HEAD").stdout,
-                             capture("git", "-C", str(CLONE), "rev-parse",
-                                     f"{TAG}^{{commit}}").stdout)
-            self.assertFalse(os.access(spec, os.W_OK), spec)
+        spec = APPROVED / "specs" / "jig-spec.md"
+        self.assertTrue(spec.is_file(), spec)
+        self.assertEqual(capture("git", "-C", str(APPROVED), "rev-parse", "HEAD").stdout,
+                         capture("git", "-C", str(CLONE), "rev-parse",
+                                 f"{TAG}^{{commit}}").stdout)
+        self.assertFalse(os.access(spec, os.W_OK), spec)
 
-            refused = self.run_worker(prompt)
-            self.assertEqual(refused.returncode, 1, refused.stderr)
-            self.assertIn("refused: lock:", refused.stderr)
+        refused = self.run_worker(prompt)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("refused: lock:", refused.stderr)
 
-            self.stop_session()
-            kept = TEE.read_bytes()
-            second = self.run_worker(prompt)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            self.wait_for_output(len(kept))
-            self.assertTrue(TEE.read_bytes().startswith(kept))
+        self.stop_session()
+        kept = TEE.read_bytes()
+        second = self.run_worker(prompt)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.wait_for_output(len(kept))
+        self.assertTrue(TEE.read_bytes().startswith(kept))
 
 
 class RealCloseTest(unittest.TestCase):
     def stop_close_session(self):
-        capture("tmux", "kill-session", "-t", f"={CLOSE_SESSION}")
+        END.stop_session(CLOSE_SESSION)
 
     def pane_text(self):
         pane = capture("tmux", "capture-pane", "-p", "-t", f"={CLOSE_SESSION}:").stdout
@@ -212,9 +223,10 @@ class RealCloseTest(unittest.TestCase):
         # scratch lock and say whether Claude Code wrote a transcript before the dialog.
         self.assertFalse(session_alive(CLOSE_SESSION), f"{CLOSE_SESSION} is running")
         self.assertFalse(CLOSE_TRANSCRIPTS.exists(), f"{CLOSE_TRANSCRIPTS} is not this test's")
+        END.session(CLOSE_SESSION)
         dialog = load_start_worker().TRUST_DIALOG
-        folder = tempfile.mkdtemp(prefix="jig-real-close.")
-        lock_dir = pathlib.Path(tempfile.mkdtemp(prefix="jig-real-close-lock."))
+        folder = str(END.make_folder())
+        lock_dir = END.make_folder()
         self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
         self.addCleanup(shutil.rmtree, lock_dir, ignore_errors=True)
         self.addCleanup(shutil.rmtree, CLOSE_TRANSCRIPTS, ignore_errors=True)
@@ -286,10 +298,15 @@ class FixtureProjectCase(unittest.TestCase):
         for path in places:
             self.assertFalse(path.exists() or path.is_symlink(), f"{path} is not this test's")
         self.assertFalse(session_alive(HOOK_SESSION), f"{HOOK_SESSION} is running")
-        self.base = pathlib.Path(tempfile.mkdtemp(prefix="jig-test."))
+        END.session(HOOK_SESSION)
+        # These places were checked to be free, so the run makes them and may remove them.
+        for path in (HOOK_PROMPTS, HOOK_REVIEWS):
+            END.folder(path)
+        self.base = END.make_folder()
         self.addCleanup(self.remove_base)
         if self.IN_HOME:
             for path in HOOK_HOME_CLONES:
+                END.folder(path)
                 self.addCleanup(remove_tree, path)
         self.addCleanup(shutil.rmtree, HOOK_PROMPTS, ignore_errors=True)
         self.addCleanup(shutil.rmtree, HOOK_REVIEWS, ignore_errors=True)
@@ -360,7 +377,7 @@ class FixtureProjectCase(unittest.TestCase):
         remove_tree(self.base)
 
     def stop_session(self):
-        capture("tmux", "kill-session", "-t", f"={HOOK_SESSION}")
+        END.stop_session(HOOK_SESSION)
         lock = self.lock_dir / f"{HOOK_PROJECT}-{getpass.getuser()}"
         lock.unlink(missing_ok=True)
         lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
