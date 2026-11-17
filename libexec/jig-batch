@@ -41,8 +41,12 @@ findings: a line that starts with "### F-<n> must-fix" is a must-fix finding, on
 starts with "### F-<n> should-fix" is a should-fix finding, and no other line counts,
 "### F-<n> info" among them. A pre-check row with any must-fix or should-fix finding
 stops the batch, so the unit it checks never starts with its prompt unfixed. A review
-row stops the batch on a must-fix finding only. Without such findings (only info
-findings, or one line that says there is none) the batch goes on. After a stop on
+row stops the batch on a must-fix finding only. A finding in another form also stops
+the batch, after a row of either kind, with a line that names its line number: a table
+row with a cell that starts with "must-fix" or "should-fix", or a heading that holds
+one of these words and is not of the counted form. Without such findings (only info
+findings, or one line that says there is none, also when it names a class) the batch
+goes on. After a stop on
 findings the orchestrator handles them and runs the remaining rows as a new batch file
 without that row and without its ID among the depends-on IDs; a rerun of the same file
 stops at the same row again.
@@ -77,7 +81,8 @@ skip and stop writes one line with a timestamp to stdout. The exit codes:
  13  no runnable row remains, and some rows did not report OK: NEEDS SPEC or blocked
  14  the orchestrator's clone could not read origin
  15  findings: a pre-check row has a must-fix or should-fix finding, or a review row a
-     must-fix finding
+     must-fix finding, or the findings file of either holds a finding that jig cannot
+     count
  16  a pre-check or review row reported OK or was skipped, but origin has no findings
      file for it
 """
@@ -131,6 +136,25 @@ KINDS = ("unit", "pre-check", "review")
 # middle of a line is not taken for a finding.
 MUST_FIX = re.compile(r"### F-[0-9]* must-fix")
 SHOULD_FIX = re.compile(r"### F-[0-9]* should-fix")
+CLASS_WORDS = ("must-fix", "should-fix")
+
+
+def uncounted_finding(line):
+    """Say whether a line is a must-fix or should-fix finding in a form that is not counted.
+
+    A reviewer that writes its findings as table rows, or under headings of another
+    form, would otherwise give a count of 0 and let the batch go on past a must-fix
+    finding. Such a line is a table row with a cell that starts with a class word, or
+    a heading that holds a class word and is not a counted heading. A line of prose
+    that names a class, as the summary of a findings file does, is not one.
+    """
+    text = line.strip()
+    if text.startswith("|"):
+        return any(cell.strip().startswith(CLASS_WORDS) for cell in text.split("|"))
+    if text.startswith("#"):
+        counted = MUST_FIX.match(line) or SHOULD_FIX.match(line)
+        return not counted and any(word in text for word in CLASS_WORDS)
+    return False
 CLOSE_DELAY_SECONDS = 600.0
 # A jig wait that is ended for a close gets this long to exit with its git and ssh
 # children before they are killed outright.
@@ -442,6 +466,12 @@ class Batch:
         must = sum(1 for line in lines if MUST_FIX.match(line))
         should = sum(1 for line in lines if SHOULD_FIX.match(line))
         counts = f"{must} must-fix and {should} should-fix findings in {path}"
+        uncounted = [number for number, line in enumerate(lines, 1)
+                     if uncounted_finding(line)]
+        if uncounted:
+            raise Stop(FINDINGS, f"stop: {row.kind} row {row.unit}: line {uncounted[0]} "
+                                 f"of {path} holds a finding that jig cannot count; "
+                                 f"{counts}")
         if must or (row.kind == "pre-check" and should):
             raise Stop(FINDINGS, f"stop: {row.kind} row {row.unit}: {counts}")
         say(f"findings of {row.kind} row {row.unit}: {counts}; going on")

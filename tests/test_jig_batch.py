@@ -127,6 +127,14 @@ SHOULD_FIX = "### F-1 should-fix\n" + FINDING_FIELDS + "### F-2 should-fix\n" + 
 INFO_ONLY = ("### F-1 info\n" + FINDING_FIELDS +
              "problem: the prompt says ### F-9 must-fix in the middle of a line\n")
 NO_FINDING = "No findings: the prompt agrees with the tree and the spec.\n"
+# Findings in forms that the count does not read: a table row with its class in a cell,
+# and a heading of another form. Each stands on line 3, after a title and a blank line.
+TABLE_ROW = ("# Review\n\n"
+             "| F1 | must-fix (a missed file) | libexec/jig-x | the file is not read |\n")
+OTHER_HEADING = "# Review\n\n## F1: must-fix\n" + FINDING_FIELDS
+# Prose that names the classes, as the summary of a findings file does, counts for
+# nothing and does not stop the batch.
+INFO_AND_PROSE = "### F-1 info\n" + FINDING_FIELDS + "No must-fix or should-fix finding.\n"
 
 TIMESTAMPED = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}[+-][0-9:]{5} \S")
 
@@ -478,6 +486,36 @@ class BatchFindingsTest(BatchCase):
         self.assertEqual(self.calls(), self.one_unit("u1") + self.one_unit("r1") +
                          self.one_unit("u2"))
         self.assertIn("findings of review row r1: 0 must-fix and 2 should-fix",
+                      result.stdout)
+
+    def test_a_review_with_a_finding_in_a_table_row_stops_the_batch_at_its_line(self):
+        # The review writes its must-fix finding as a table row, which the count does
+        # not read: the batch stops with the findings code and names line 3, and the
+        # unit after the review does not start.
+        self.control("findings-r1", TABLE_ROW)
+        result = self.batch(*self.reviewed_unit())
+        self.assert_stopped(result, 15, "review row r1: line 3 of impl/log/r1-findings.md "
+                                        "holds a finding that jig cannot count")
+        self.assertEqual(self.calls(), self.one_unit("u1") + self.one_unit("r1"))
+
+    def test_a_review_with_a_heading_of_another_form_stops_the_batch_at_its_line(self):
+        # The heading "## F1: must-fix" is not counted, so it stops the batch the same
+        # way, with its line number.
+        self.control("findings-r1", OTHER_HEADING)
+        result = self.batch(*self.reviewed_unit())
+        self.assert_stopped(result, 15, "review row r1: line 3 of impl/log/r1-findings.md "
+                                        "holds a finding that jig cannot count")
+        self.assertEqual(self.calls(), self.one_unit("u1") + self.one_unit("r1"))
+
+    def test_a_review_with_info_and_prose_that_names_the_classes_goes_on(self):
+        # An info finding and a line of prose that names both classes: nothing counts,
+        # nothing stops, and the next unit starts.
+        self.control("findings-r1", INFO_AND_PROSE)
+        result = self.batch(*self.reviewed_unit())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), self.one_unit("u1") + self.one_unit("r1") +
+                         self.one_unit("u2"))
+        self.assertIn("findings of review row r1: 0 must-fix and 0 should-fix",
                       result.stdout)
 
     def test_a_pre_check_without_a_findings_file_stops_the_batch(self):
