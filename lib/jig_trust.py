@@ -31,9 +31,11 @@ PROJECTS = "projects"
 # The key that ends the dialog for the folder a session starts in.
 TRUST_KEY = "hasTrustDialogAccepted"
 # The key for a folder that a session gets with --add-dir. Claude Code
-# 2.1.326 asks about such a folder in a dialog of its own, and kept the
-# answer in no file, so no key of its own is known; the step writes the
-# key of the start folder in the entry of that folder. Change it here.
+# 2.1.326 asks about such a folder in a dialog of its own. It reads this
+# same key in the entry of the added folder itself and then skips that
+# dialog, but it never writes the key: the answer in the dialog is kept
+# in no file. That was measured with real sessions of that version, so a
+# later version that reads another key needs a change here only.
 ADDED_FOLDER_KEY = TRUST_KEY
 
 TRUSTED = "trusted"
