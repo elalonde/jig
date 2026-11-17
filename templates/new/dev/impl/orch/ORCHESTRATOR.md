@@ -18,7 +18,24 @@ blocks that need sudo or his GitHub login.
 
 - Kickoff: a conversation with Eric whose output is `specs/00-kickoff.md`,
   approved by the tag `kickoff-rN`. Ask each question once, with a
-  recommendation. Decide the obvious ones yourself and record them.
+  recommendation. Decide the obvious ones yourself and record them. The
+  record holds: purpose; definition of done; reference material and excluded
+  sources; constraints; the decisions Eric reserves; the phase plan; the
+  release policy; the project profile; and the extra folders of each
+  account, when there are any.
+- Extra folders: ask once which folders the sessions of each account use
+  beyond the defaults, for example an oracle or a data folder. Record them in
+  the section "Directories" of the kickoff record: the line `## Directories`,
+  then one line `<account>: <folder>` for each folder. The account is
+  `orchestrator`, `specwriter` or `implementer`; the folder is an absolute
+  path, or a path that starts with `~/` for the home of that account. Other
+  lines of the section are text. jig gives each folder to the sessions of
+  that account, and `jig validate prompt` accepts a READ path in it in a
+  prompt for that account. jig ignores a line that it cannot read, with one line on
+  standard error, among them a folder under `~/ws/ref` for an account other
+  than `specwriter`, and the product clone for `orchestrator`. A project with
+  no extra folder needs no section. The section changes only by a kickoff
+  revision with its tag.
 - Project profile: the kickoff record has a section "Project profile", from
   the line `## Project profile` to the next line that starts with `## `, with
   one line `<switch>: <value>` for each of the six switches: `reference`,
@@ -198,6 +215,16 @@ every worker that reported is closed, which can be up to 10 minutes later.
 Act on the stop line and on the `report:` line when they come; do not wait for
 the exit code.
 
+At every batch boundary, before you start the next batch, run
+`jig changelog --since <pinned>`, where `<pinned>` is the `JIG_VERSION` of
+`~/.config/jig/@PROJECT@.conf`. When it prints a newer version, run
+`jig upgrade @PROJECT@ <version>` with the newest version at that batch
+boundary, before you start the next batch. Carry out the migration steps of
+each entry it printed, and write the new pin with its date in `state.md`. Do
+not keep the upgrade in `handoff.md` for the next session. `jig upgrade`
+refuses while a lock of the project exists, so run it after `jig batch` has
+closed every worker. No unit is cancelled for an upgrade.
+
 ## Session rules
 
 - The first thing after each start of this session: start one background
@@ -233,7 +260,7 @@ the exit code.
   - 2, no size: go on. A fresh session has none until its status line first
     writes, within about a minute. When it lasts longer, name it in the next
     hourly update.
-- Roll over also at every batch boundary, in the same way.
+- Roll over only when `jig ctx` exits 3 or 4, never at a batch boundary.
 - End the session only with `jig orch @PROJECT@ rollover`, never by asking
   Eric to type `/exit`. It ends the session at once, so stop every background
   shell and the watcher first (a detached `jig batch` is neither): a shell that

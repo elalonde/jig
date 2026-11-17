@@ -7,8 +7,8 @@ update.
 
 ## Session
 
-The time this session ended, and why: the soft context limit, the hard
-context limit, or a batch boundary. No rollover yet.
+The time this session ended, and why: the soft context limit (`jig ctx`
+exit 3) or the hard context limit (exit 4). No rollover yet.
 
 ## In hand
 
@@ -19,5 +19,6 @@ is not complete is named here as not complete. Nothing yet.
 ## First for the next session
 
 The actions the next session does first, in order, before any new work. Name
-a file only when the next session must read it. Nothing yet: start with the
-"Next units" of `state.md`.
+a file only when the next session must read it. A jig upgrade is never an
+item here: run it when a batch ends, before the next batch starts. Nothing
+yet: start with the "Next units" of `state.md`.

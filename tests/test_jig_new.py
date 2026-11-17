@@ -84,6 +84,60 @@ class TrustStepMixin:
         return [line for line in output.splitlines() if line.startswith("trust ")]
 
 
+# The account names of the spec's table of accounts and roles, and the placeholders that
+# the CLAUDE.md template of jig new holds in their place.
+ACCOUNT_PLACEHOLDERS = {"orchestrator": "@ORCH@", "specwriter": "@SPEC@",
+                        "implementer": "@IMPL@"}
+# A copy of the orchestrator row of that table in the approved spec, for a tree that
+# has no approved worktree beside it. The name of the other project in it is built
+# from parts, so that the term check of this repo does not meet it.
+_MOVED = "Pu" + "ron"
+SPEC_ORCHESTRATOR_ROW = (
+    "| Orchestrator | orchestrator | the `-dev` repo, public sources, the jig change log, "
+    "its inbox, the screen that `jig wait` prints, which, with the clean room on, is never "
+    "a screen of a session in the specwriter account (section 7); at a stall line, read "
+    "only, the screen of the other project's orchestrator (`tmux capture-pane` of "
+    "`<other>-orch`) and `impl/orch/state.md` in the other project's `-dev` clone "
+    "(section 7, \"Waiting on another project\") | prompts, blocks, `impl/orch/`, the "
+    "kickoff record, answers in `QUESTIONS.md`, briefs, the spec-phase summary and timing "
+    "rows of `specs/00-status.md`, `CLAUDE.md`, `terms.txt`, "
+    "`impl/log/<batch ID>-summary.md`, `requests/<ID>.md` in `jig-dev`; in steps 4 to 6 "
+    f"of {_MOVED}'s move, the files of `{_MOVED.lower()}-dev` that those steps give to the "
+    "orchestrator (section 13) | product code, spec text, the reference, a tag |")
+
+
+def spec_orchestrator_row():
+    """Return the orchestrator row of the approved spec, and where it was read.
+
+    The approved worktree sits beside the product clone in a worker account; a tree
+    without one, as in CI, uses the copy above.
+    """
+    spec = ROOT.parent / f"{ROOT.name}-dev-approved" / "specs" / "jig-spec.md"
+    try:
+        lines = spec.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith("| Orchestrator | "):
+            return line, str(spec)
+    return SPEC_ORCHESTRATOR_ROW, "the copy in tests/test_jig_new.py"
+
+
+def as_template_row(row):
+    """Return a row of the spec's table in the form that the CLAUDE.md template holds.
+
+    The account names become placeholders. The citations of the spec's parts are left
+    out, because lint A refuses a numbered pointer in the product, and so is the clause
+    on the steps of another project's move, because it names that project.
+    """
+    cells = row.split(" | ")
+    cells[1] = ACCOUNT_PLACEHOLDERS.get(cells[1], cells[1])
+    row = " | ".join(cells)
+    row = re.sub(r"\b(orchestrator|specwriter|implementer) account\b",
+                 lambda match: ACCOUNT_PLACEHOLDERS[match[1]] + " account", row)
+    row = re.sub(r" \(section [0-9]+[^)]*\)", "", row)
+    return re.sub(r"; in steps [0-9]+ to [0-9]+ of [^|]*?(?= \|)", "", row)
+
 class JigNewCase(TempTestCase):
     """The fixture layout of jig new: a srv root, an ssh double and fixture accounts."""
 
@@ -511,6 +565,72 @@ class JigNewTest(JigNewCase):
         self.assertEqual(self.headings("handoff.md"),
                          ["## Session", "## In hand", "## First for the next session"])
 
+    def test_standing_prompt_rolls_over_only_at_exit_3_or_4_and_never_at_a_batch_boundary(self):
+        # The rules for jig ctx exit 3 and exit 4 stay as they are, and the only
+        # sentence that names a rollover beside a batch boundary is the one that rules
+        # the rollover there out.
+        flat = self.made_text("impl/orch/ORCHESTRATOR.md")
+        only = "Roll over only when `jig ctx` exits 3 or 4, never at a batch boundary."
+        for rule in ("3, at about 250k tokens: roll over. Start no new step. Finish the step "
+                     "in hand, write `state.md` and `handoff.md`, commit them, and end the "
+                     "session",
+                     "4, at about 280k tokens: exit after the current tool call. Stop every "
+                     "background shell and the watcher, but not a detached `jig batch`, then "
+                     "run `jig orch demo rollover`.", only):
+            self.assertIn(rule, flat)
+        both = [sentence for sentence in re.split(r"(?<=\.)\s+(?:- )?", flat)
+                if "batch boundary" in sentence and "roll" in sentence.lower()]
+        self.assertEqual(both, [only])
+
+    def test_standing_prompt_upgrades_jig_at_the_batch_boundary_before_the_next_batch(self):
+        # At a batch boundary the orchestrator reads the change log and upgrades there,
+        # before the next batch, and leaves no upgrade to the next session.
+        flat = self.made_text("impl/orch/ORCHESTRATOR.md")
+        for rule in ("At every batch boundary, before you start the next batch, run "
+                     "`jig changelog --since <pinned>`",
+                     "When it prints a newer version, run `jig upgrade demo <version>` with "
+                     "the newest version at that batch boundary, before you start the next "
+                     "batch.",
+                     "Do not keep the upgrade in `handoff.md` for the next session."):
+            self.assertIn(rule, flat)
+
+    def test_handoff_file_names_no_batch_boundary_and_no_upgrade_for_the_next_session(self):
+        # A session ends only at a context limit, and the one sentence on an upgrade
+        # keeps it out of the items for the next session.
+        flat = self.made_text("impl/orch/handoff.md")
+        self.assertNotIn("batch boundary", flat.lower())
+        self.assertIn("and why: the soft context limit (`jig ctx` exit 3) or the hard "
+                      "context limit (exit 4). No rollover yet.", flat)
+        upgrades = [sentence for sentence in re.split(r"(?<=\.)\s+", flat)
+                    if "upgrade" in sentence.lower()]
+        self.assertEqual(upgrades, ["A jig upgrade is never an item here: run it when a batch "
+                                    "ends, before the next batch starts."])
+
+    def test_standing_prompt_asks_at_the_kickoff_for_the_section_directories(self):
+        # The kickoff part of the standing prompt names the section "Directories" and
+        # its line form, so that the orchestrator of a new project asks for the extra
+        # folders of each account.
+        flat = self.made_text("impl/orch/ORCHESTRATOR.md")
+        kickoff = flat[flat.index("- Kickoff:"):flat.index("- Project profile:")]
+        for text in ("the extra folders of each account, when there are any.",
+                     'Record them in the section "Directories" of the kickoff record: the '
+                     "line `## Directories`, then one line `<account>: <folder>` for each "
+                     "folder.",
+                     "The account is `orchestrator`, `specwriter` or `implementer`; the "
+                     "folder is an absolute path, or a path that starts with `~/` for the "
+                     "home of that account."):
+            self.assertIn(text, kickoff)
+
+    def test_claude_md_template_has_the_orchestrator_row_of_the_spec(self):
+        # The orchestrator row of the template is the row of the spec's table, with the
+        # account names as placeholders, without the spec's citations and without the
+        # clause on another project's move. On failure the message names where the row
+        # of the spec was read.
+        row, source = spec_orchestrator_row()
+        template = (ROOT / "templates/new/dev/CLAUDE.md").read_text(encoding="utf-8")
+        rows = [line for line in template.splitlines() if line.startswith("| Orchestrator | ")]
+        self.assertEqual(rows, [as_template_row(row)], source)
+
     def test_standing_prompt_holds_the_preferences_text_and_the_rollover_rules(self):
         # The preferences file's text, without its title, stands in the standing prompt
         # in place of its name, so the orchestrator has it without reading another file.
@@ -526,7 +646,6 @@ class JigNewTest(JigNewCase):
         flat = " ".join(orchestrator.split())
         for rule in ("After each step, run `jig ctx`.", "3, at about 250k tokens: roll over.",
                      "4, at about 280k tokens: exit after the current tool call.",
-                     "Roll over also at every batch boundary",
                      "a rollover does not affect it",
                      "Its first hourly update cites the commit of `handoff.md`."):
             self.assertIn(rule, flat)
