@@ -5,6 +5,105 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.9.0
+
+What changed: Claude Code asks whether a folder can be trusted the first time a
+session works in it, and a session that jig starts would wait at that dialog with
+nobody to answer it. jig now sets the answer first, in Claude Code's state file of
+the account: the key `hasTrustDialogAccepted`, set to true in the entry of the
+folder, also for each folder that a session gets with `--add-dir` (Claude Code
+2.1.326 reads that key there and then shows no dialog for the added folder).
+`jig start` marks the `-dev` clone and each folder it passes, in the worker account;
+`jig orch` marks the orchestrator's folders at its start and before each new
+session; `jig new` marks the orchestrator's `-dev` clone, and its block marks the
+`-dev` clone of each account where it makes one. Each prints a line `trust
+<account>: <value>`, the value trusted, kept or not marked, and one more line that
+names the file when it cannot set the mark; that line does not change the exit
+code. The step writes a new file, syncs it to disk, renames it into place and reads
+it back.
+
+A project can give the sessions of an account more folders in a section
+`## Directories` of its kickoff record, one line `<account>: <folder>` each, for
+the accounts orchestrator, specwriter and implementer. `jig start` reads the section
+at the newest kickoff tag on origin and passes those folders with `--add-dir`; a
+line it cannot read is ignored, with one line on stderr. Before anything changes,
+it refuses a folder that is not in the approved list of the account. A conf file
+without `ORCH_ACCOUNT`, `SPEC_ACCOUNT` or `IMPL_ACCOUNT` gives that account its own
+word in that list. `jig validate prompt` accepts a READ path in a folder that the
+section gives the prompt's account; a path under the reference directory stays
+refused while the clean room is on. It also refuses, with one line, a ROLE section
+that splits `Spec tag:` over two lines, and `jig start` refuses such a prompt
+through it.
+
+The supervisor loop, `jig orch`, no longer appends the event `hourly update`; an
+hour with no change still gets its `idle:` line in the project's updates log, and
+dated Open items still give their reminders. It reads `BRANCH` of the conf file at
+each report poll: after a move to a new version line it logs the move, fetches the
+new line, and announces only the reports of that line made after the loop started.
+
+`jig report` accepts a product commit that any origin branch of the product holds
+when the product has no branch of the conf's name yet. With that branch, and for
+`-dev`, the check is as before. The refusal names the branches it read.
+
+The templates of `jig new`: `ORCHESTRATOR.md` and `handoff.md` roll over only when
+`jig ctx` exits 3 or 4, never at a batch boundary; at each batch boundary, before
+the next batch, the orchestrator runs `jig changelog --since <pinned>` and `jig
+upgrade <project> <version>`, and never leaves the upgrade in `handoff.md`. They
+name no hourly update: an update comes as the first message of each session, and
+when a result changes what Eric expects or something needs him, never by the clock.
+The kickoff part asks for the section `## Directories`, and the orchestrator row of
+the `CLAUDE.md` template allows the read-only look at another project's
+orchestrator at a stall line. `make real-start` fails at the dialog of an added
+folder and reads each trust mark back.
+
+Files and formats: new files: `lib/jig_trust.py`, `lib/jig_spec_tag.py`. Changed
+files: `lib/jig_dirs.py`, `libexec/jig-new`, `libexec/jig-orch`,
+`libexec/jig-report`, `libexec/jig-start`, `libexec/jig-start-worker`,
+`libexec/jig-validate`, the templates `block.sh.in`, `block-existing.sh.in`,
+`CLAUDE.md`, `ORCHESTRATOR.md` and `handoff.md` under `templates/new/`, and
+`tests/real_start.py`. New format: the section `## Directories` of the kickoff
+record. The event log no longer holds the line `hourly update`; its other lines
+are unchanged.
+
+Migration: a host and its projects move from 0.8.2 to 0.9.0 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.9.0`. It installs 0.9.0
+   under `/opt/jig/0.9.0/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.9.0` as the orchestrator
+   account. It sets `JIG_VERSION=0.9.0` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.9.0`.
+3. Restart each project's orchestrator loop, so that it loads the new
+   supervisor: let the session finish its step, then, from a shell of the
+   orchestrator account outside the session, run `jig orch <project> stop` and
+   then `jig orch <project> start`. The start marks the `-dev` clone and each
+   folder of the orchestrator's sessions, and prints a trust line for each mark
+   it sets or cannot set, none for a mark that is there already. A line that
+   ends in `not marked` names a folder whose session will wait at the dialog. A
+   loop that is not restarted keeps the 0.8.2 code.
+4. For a project that `jig new` made, run `jig new <project>` again as the
+   orchestrator account, with `--existing` when the project was made with it.
+   It keeps every file that exists, its block too, and marks the
+   orchestrator's `-dev` clone, with its trust line. For a project that `jig
+   new` did not make it refuses and changes nothing; the loop start above has
+   marked the same clone.
+5. Nothing more for the specwriter and implementer accounts: the next `jig
+   start` of a unit in each marks its `-dev` clone and each folder it passes,
+   with a trust line for each.
+6. Copy the new rules of the templates by hand into the project's own
+   `ORCHESTRATOR.md` and `handoff.md`: the rollover only at `jig ctx` exit 3 or
+   4, the upgrade at the batch boundary, and no hourly update. `jig upgrade`
+   changes no file of a project's repo.
+
+A known case: the trust step names the entry by the folder's path as written,
+with no symbolic link followed, so a folder whose path holds a symbolic link can
+still bring the trust dialog.
+
+Requested by: another project, for the change of `jig report`, whose product had
+no branch of its version line yet; the rest: Eric, through the spec.
+
+Units: 1 minor, 4 patch, 3 none
+
 ## 0.8.2
 
 What changed: the pre-commit hook that `jig start` installs in a product clone
