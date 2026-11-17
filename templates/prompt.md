@@ -15,6 +15,9 @@ STATE: <the expected state when this unit starts: the previous unit, the
 READ: <files and sections, each path from its repo name:
   <project>-dev/... in the -dev clone, <project>/... in the product
   clone beside it; inbox files beside this prompt>.
+  <In a review prompt: no plain git status in a reference checkout,
+  because it rewrites .git/index; git --no-optional-locks status is
+  allowed.>
   DO NOT READ: impl/log/ except the previous report; transcripts;
   full logs; <project items>.
 AUTHORITY: <edits outside the normal rules that this prompt allows;
@@ -30,7 +33,10 @@ SESSION ECONOMY: grep first; read by section; cut -c1-200; long output
   to ~/ws/reviews/<project>/<ID>-*.txt; pass or fail from exit codes;
   the full suite once per product commit, timed. Start no new step
   above 250k tokens; stop at 280k after the last complete pushed
-  commit, with a clean tree.
+  commit, with a clean tree. Wait on CI with a command that exits
+  when CI ends (for jig, tools/ci-green --wait), not with a watcher
+  that you must start again. A test or probe that needs tmux uses its
+  own server, tmux -L <name>, never the default server.
 STEPS: 1 premise; 2 ...; n-1 commit, push; n report, committed alone
   as "log: <ID>", pushed.
 ESCALATION: report first line "NEEDS ERIC: <reason>" or

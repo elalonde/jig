@@ -379,28 +379,26 @@ class JigNewTest(JigNewCase):
     def test_standing_prompt_starts_the_event_watcher_first(self):
         # The supervisor types nothing into the session, so an orchestrator that never
         # starts its watcher would miss every event. The first rule of the session rules
-        # names the watcher command, the Monitor tool and the once-read of the old
-        # session's events; a fresh session reads those events too, and no line says
-        # that the supervisor sends a line into the session. The harness tool ends a
-        # watcher at a deadline, so the same rule says to start it with the longest
-        # deadline and again after each end, and how to treat the lines that a
-        # restarted watcher prints again.
+        # names the watcher that ends at the first event, how the harness runs it (one
+        # turn when it ends, no deadline, not the tool that gives a turn for each line),
+        # its start again after each wake, the unit ID in place of a separate jig wait,
+        # and the once-read of the old session's events; a fresh session reads those
+        # events too, and no line says that the supervisor sends a line into the session.
         text = self.made_text("impl/orch/ORCHESTRATOR.md")
         rules = text.split("## Session rules", 1)[1]
         first = rules.split(" - ", 2)[1]
         for part in ("The first thing after each start of this session: start one "
-                     "background watcher, `jig orch demo events`,",
-                     "(in Claude Code, the Monitor tool)",
-                     "Never run two watchers at once.",
-                     "When the harness tool ends a watcher at a deadline, start it with the "
-                     "longest deadline that the tool allows, and start it again at each "
-                     "notice that it ended;",
-                     "A restarted watcher prints first the lines that the earlier watcher of "
-                     "this session printed, in the same order.",
-                     "Act only on the lines after them, and on a line of that replay only "
-                     "when you have no record, in this session or in `state.md` and "
-                     "`handoff.md`, of having handled it.",
+                     "background watcher, `jig orch demo events --next [<unit ID>]`, as a "
+                     "background command of the harness that gives you one turn when the "
+                     "command ends (in Claude Code, a Bash command run in the background).",
+                     "Set no deadline on it,",
+                     "(in Claude Code, not with the Monitor tool).",
+                     "After each wake, act on what it printed, then start it again.",
+                     "While a unit runs, pass that unit's ID as `<unit ID>`:",
+                     "Run no separate `jig wait` in the background.",
+                     "Never run two watchers at once,",
                      "`~/ws/reviews/demo/orch/events.log`",
+                     "`~/ws/reviews/demo/orch/events.mark`",
                      "the lines between the last two start lines: `jig orch demo events --old`.",
                      "Act on each of these events that `state.md` and `handoff.md` do not "
                      "show as handled"):
@@ -412,6 +410,40 @@ class JigNewTest(JigNewCase):
         self.assertNotIn("announces", text)
         self.assertNotIn("Start no second one", text)
         self.assertNotIn("minutes", first)
+        # The tool that gives a turn for each line is named only to rule it out, never
+        # as the way to run the watcher.
+        self.assertEqual(text.count("Monitor"), 1)
+        self.assertNotIn("(in Claude Code, the Monitor tool)", text)
+        self.assertNotIn("deadline that the tool allows", text)
+        # A batch and a fresh session pass the unit ID to the watcher instead of a
+        # jig wait of their own.
+        self.assertIn("In a batch, pass the running unit's ID to the watcher, which runs "
+                      "`jig wait` on it;", text)
+        self.assertIn("passes the running unit's ID to its watcher", text)
+        self.assertNotIn("run `jig wait` on the running unit", text)
+        self.assertNotIn("runs `jig wait` on the running unit", text)
+
+    def test_standing_prompt_holds_one_review_a_fix_unit_and_the_backlog(self):
+        # The spec loop has one Fable review of a spec document or a plan and at most
+        # one fix unit after it; the findings that are not must-fix go to the backlog.
+        # The rule of review rounds is gone, so an orchestrator does not order a second
+        # review after the fix.
+        text = self.made_text("impl/orch/ORCHESTRATOR.md")
+        loop = text[text.index("- Spec loop:"):text.index("- Batches:")]
+        for rule in ("A spec document or a plan gets at most one Fable review, and only "
+                     "where jig's spec says that one is needed",
+                     "one fix unit applies every must-fix finding, and no second review "
+                     "follows the fix unit.",
+                     "Every finding that is not must-fix goes to the backlog: add a line for "
+                     "it to `impl/orch/backlog.md`.",
+                     "A line leaves the backlog when a unit or a spec revision takes it.",
+                     "when a fix unit ran, the row of each of these documents has four "
+                     "cells, with the same review ID and fix ID, also when the fix unit did "
+                     "not change that document."):
+            self.assertIn(rule, loop)
+        self.assertIsNone(re.search(r"\brounds?\b", text))
+        self.assertIn("`backlog.md` (the findings of a spec or plan review that are not "
+                      "must-fix,", text)
 
     def test_standing_prompt_celebrates_every_release_by_its_size(self):
         # An orchestrator learns from the standing prompt alone that a release, a patch
@@ -496,10 +528,14 @@ class JigNewTest(JigNewCase):
                      "`Closed review loops` in `specs/00-status.md`.",
                      "The row is `| <document path> | <commit> | <ID> |`, with the document as "
                      "its path from the repo root",
-                     "the commit that the last review round of the loop read",
+                     "the commit that the review read,",
                      "`| <document path> | <commit> | <ID> | <fix ID> |`, with the fix unit's "
                      "commit;",
-                     "`impl/log/<fix ID>-report.md` must start with `OK`.",
+                     "the first line of `impl/log/<fix ID>-report.md` must be exactly `OK` "
+                     "or start with `OK:`, and its `commits:` line must not be `none`.",
+                     "at least one of the documents of the rows with that review ID and fix "
+                     "ID must differ between the oldest commit that adds the findings file "
+                     "and the commit to tag:",
                      "so the tag goes at or after the commit that adds the row."):
             self.assertIn(line, text)
 

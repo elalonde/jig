@@ -46,15 +46,21 @@ blocks that need sudo or his GitHub login.
   `jig validate prompt` act as with the clean room on and print a line that
   says so. Before each `kickoff-rN` tag, check that `clean room` on, and a
   `differences review` other than `none`, have `reference` yes.
-- Spec loop: spec-writer units write the specs. For each document, run review
-  rounds until a round has no must-fix finding. In a round, a fresh Fable
-  session as @SPEC@ writes the findings; a fix unit applies every must-fix
-  finding and applies or answers every should-fix finding. The next round
-  reviews the diff only. When a fixed finding returns, send the list to Eric
-  with a recommendation. When round 2 still has a must-fix finding, assess
-  your own conduct of the loop before each later round. The result, with its
-  reason, is continue, change the prompts, or brief Eric. Write it to
-  `impl/orch/briefs/<ID>.md` and show it in the console.
+- Spec loop: spec-writer units write the specs. A spec document or a plan
+  gets at most one Fable review, and only where jig's spec says that one is
+  needed: one for each spec document, also for each one that a revision
+  changes. The review is a fresh Fable session as @SPEC@ that writes the
+  findings. When it has a must-fix finding, one fix unit applies every
+  must-fix finding, and no second review follows the fix unit. Every finding
+  that is not must-fix goes to the backlog: add a line for it to
+  `impl/orch/backlog.md`. A line leaves the backlog when a unit or a spec
+  revision takes it. The loop ends with the review when it has no must-fix
+  finding, and else with the fix unit. Each spec document that the review
+  read gets its own row of `Closed review loops` (Tag block, below); when a
+  fix unit ran, the row of each of these documents has four cells, with the
+  same review ID and fix ID, also when the fix unit did not change that
+  document. When a fixed finding returns in a later review, send the list
+  to Eric with a recommendation.
 - Batches: take first the units that unblock the most later work. At most 6
   units per batch, every prompt written before the batch starts; the first
   batch of a project is at most 2 hours. "Running a batch" below says how.
@@ -77,15 +83,19 @@ blocks that need sudo or his GitHub login.
   approved tag: a row in the table under a Markdown heading with exactly the
   text `Closed review loops` in `specs/00-status.md`. The row is
   `| <document path> | <commit> | <ID> |`, with the document as its path from
-  the repo root, such as `specs/<file>`, the commit that the last review round
-  of the loop read, and the ID of that review, whose
-  `impl/log/<ID>-findings.md` holds no must-fix finding. When a fix unit
-  applied the review's must-fix findings, with no second review, the row has
-  a fourth cell, the ID of that fix unit:
+  the repo root, such as `specs/<file>`, the commit that the review read, and
+  the ID of that review, whose `impl/log/<ID>-findings.md` holds no must-fix
+  finding. When a fix unit applied the review's must-fix findings, with no
+  second review, the row has a fourth cell, the ID of that fix unit:
   `| <document path> | <commit> | <ID> | <fix ID> |`, with the fix unit's
   commit; the review's findings file must exist and may hold must-fix
-  findings, and `impl/log/<fix ID>-report.md` must start with `OK`. A row
-  with an empty fourth cell counts as a row of three. jig tag reads the
+  findings, the first line of `impl/log/<fix ID>-report.md` must be exactly
+  `OK` or start with `OK:`, and its `commits:` line must not be `none`. And at
+  least one of the documents of the rows with that review ID and fix ID must
+  differ between the oldest commit that adds the findings file and the commit
+  to tag: jig tag checks this for those rows together, so a document that the
+  fix did not change passes when the fix changed another document of the same
+  review. A row with an empty fourth cell counts as a row of three. jig tag reads the
   status file, the findings and the fix report at the commit it tags, so the
   tag goes at or after the commit that adds the row.
 
@@ -94,7 +104,9 @@ blocks that need sudo or his GitHub login.
 All in `impl/orch/`, committed after every unit: `ORCHESTRATOR.md` (this
 file), `state.md` (always current, at most about 200 lines), `briefs/<ID>.md`,
 `updates.log` (every update, with a timestamp), `handoff.md` (written
-at rollover).
+at rollover), `backlog.md` (the findings of a spec or plan review that are not
+must-fix, and other items that wait for a later spec revision or fix unit,
+newest first).
 
 `jig orch` appends its own idle line to `updates.log` when an hour passes with
 no change, and does not commit it. Commit `updates.log` with your next commit,
@@ -132,16 +144,19 @@ never alone. In `updates.log` the first line of each entry starts with
 ## Waiting on a session
 
 Check each running worker session every 10 minutes, by machine:
-`jig wait @PROJECT@ <ID>`. It uses no model and costs no tokens. It ends when
+`jig wait @PROJECT@ <ID>`, which your watcher runs when you pass it the unit
+ID (Session rules, below). It uses no model and costs no tokens. It ends when
 the report commit reaches origin, the session ends, the screen shows no
-change, a dialog shows, or 3 times the expected duration passes.
+change, a dialog shows, or 3 times the expected duration passes. Its end at
+the report gives no line, because the line `report: <ID> <status>` wakes you;
+each other end gives the line `jig wait <ID> exit <code>: <last line>`.
 
-- A screen with no change: read the screen that `jig wait` printed once, then
-  run `jig wait` again or escalate. It is not by itself an escalation.
+- A screen with no change: start the watcher with the unit ID again, or
+  escalate. It is not by itself an escalation.
 - With the clean room on, a session in the @SPEC@ account: `jig wait` prints
   no screen, because that screen can show reference text. At a screen with no
-  change, run `jig wait` once more; when that also ends with no change,
-  escalate.
+  change, start the watcher with the unit ID once more; when that wait also
+  ends with no change, escalate.
 - A dialog, or a timeout, is an escalation.
 
 ## Waiting on another project
@@ -179,8 +194,9 @@ and starts the next row only when the report's status is `OK` and the
 validation passed. It closes the reporting worker with `jig close` before the
 next start in the same account, and otherwise 10 minutes after the report.
 Every report commit also wakes you: the supervisor appends
-`report: <ID> <status>` to the event file, and your watcher prints it. In a batch, run `jig wait` on the
-running unit; an end with no change does not stop `jig batch`. A rerun of the
+`report: <ID> <status>` to the event file, and your watcher prints it. In a batch, pass the
+running unit's ID to the watcher, which runs `jig wait` on it; an end with no change does not
+stop `jig batch`. A rerun of the
 same file skips the rows that are closed OK already.
 
 - Pre-check rows: a pre-check unit is a read-only session that checks a unit's
@@ -234,22 +250,26 @@ closed every worker. No unit is cancelled for an upgrade.
 ## Session rules
 
 - The first thing after each start of this session: start one background
-  watcher, `jig orch @PROJECT@ events`, through the harness tool that gives
-  you a turn for each new line that a command prints (in Claude Code, the
-  Monitor tool). Never run two watchers at once. When the harness tool ends a
-  watcher at a deadline, start it with the longest deadline that the tool
-  allows, and start it again at each notice that it ended; the tool's own
-  description gives the deadline. A restarted watcher prints first the lines
-  that the earlier watcher of this session printed, in the same order. Act
-  only on the lines after them, and on a line of that replay only when you
-  have no record, in this session or in `state.md` and `handoff.md`, of
-  having handled it. The supervisor types nothing into this
+  watcher, `jig orch @PROJECT@ events --next [<unit ID>]`, as a background
+  command of the harness that gives you one turn when the command ends (in
+  Claude Code, a Bash command run in the background). Set no deadline on it,
+  and do not run it with a tool that gives a turn for each line (in Claude
+  Code, not with the Monitor tool). After each wake, act on what it printed,
+  then start it again. While a unit runs, pass that unit's ID as
+  `<unit ID>`: the watcher then also runs `jig wait` on the unit, and ends
+  with one line `jig wait <unit ID> exit <code>: <last line>` when that wait
+  ends other than at the unit's report. Run no separate `jig wait` in the
+  background. Never run two watchers at once, because they share one mark.
+  The supervisor types nothing into this
   session: it appends each event as one line to the event file,
   `~/ws/reviews/@PROJECT@/orch/events.log` (the `inbox:` and `readback:`
   lines, the lines `report: <ID> <status>` and the reminders), and the line
   `start <session ID>` before it starts a session.
-  The watcher prints each line after the last start line, then each new
-  line. Then read, once, the events of the old session, the lines between
+  The watcher keeps a mark, `~/ws/reviews/@PROJECT@/orch/events.mark`, the
+  number of lines that it has printed. It prints the lines after the mark,
+  moves the mark, and exits at the first one; with no mark it starts after
+  the last start line. A line that comes while no watcher runs stays after
+  the mark, so the next run prints it, and no line comes twice. Then read, once, the events of the old session, the lines between
   the last two start lines: `jig orch @PROJECT@ events --old`. Act on each
   of these events that `state.md` and `handoff.md` do not show as handled,
   because an event that came while the old session ended is among them.
@@ -274,7 +294,7 @@ closed every worker. No unit is cancelled for an upgrade.
 - A running unit is a separate session in a worker account, and a rollover
   does not affect it. Name it in `handoff.md`; in a batch also the batch file,
   the output file and the pid of `jig batch`. The fresh session reads the tail
-  of the output file, runs `jig wait` on the running unit and starts no second
+  of the output file, passes the running unit's ID to its watcher and starts no second
   `jig batch` while that pid lives; when `jig batch` was stopped, it waits for
   the running unit, runs `jig report` and `jig close`, then runs the same batch
   file again.
@@ -294,8 +314,8 @@ Stop the item and ask Eric for:
 - a change to the license list;
 - an irreversible GitHub act: a history rewrite of a public repo, deleting a
   release or a tag, visibility or settings;
-- a machine check or gate that still fails after 3 attempts (a review round
-  is not one);
+- a machine check or gate that still fails after 3 attempts (a review is
+  not one);
 - a check that needs Eric at a machine;
 - a requirement ambiguous in a way that changes what is built;
 - a decision the records name as Eric's;

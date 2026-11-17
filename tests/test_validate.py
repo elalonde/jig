@@ -462,6 +462,23 @@ class ValidatePromptTest(ValidateCase):
                           *blocks["ROLE"][1:]]
         self.assert_valid("prompt", prompt_text(first, blocks, last))
 
+    def test_prompt_template_holds_the_waits_the_tmux_server_and_the_reference_status(self):
+        # Every unit waits on CI with a command that ends by itself, and runs tmux for a
+        # test only on a server of its own, because the default server of a worker
+        # account holds the sessions of the running units. A review prompt keeps a
+        # plain git status out of a reference checkout, because it rewrites the index.
+        _, blocks, _ = prompt_parts_of((TEMPLATES / "prompt.md").read_text(encoding="utf-8"))
+        economy = " ".join(" ".join(blocks["SESSION ECONOMY"]).split())
+        self.assertIn("Wait on CI with a command that exits when CI ends (for jig, "
+                      "tools/ci-green --wait), not with a watcher that you must start again.",
+                      economy)
+        self.assertIn("A test or probe that needs tmux uses its own server, tmux -L <name>, "
+                      "never the default server.", economy)
+        read = " ".join(" ".join(blocks["READ"]).split())
+        self.assertIn("<In a review prompt: no plain git status in a reference checkout, "
+                      "because it rewrites .git/index; git --no-optional-locks status is "
+                      "allowed.>", read)
+
     def test_validate_prompt_accepts_the_template_once_its_names_are_filled(self):
         text = (TEMPLATES / "prompt.md").read_text(encoding="utf-8")
         self.assert_invalid("prompt", text, "'<ID>'")

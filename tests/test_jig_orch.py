@@ -1825,6 +1825,145 @@ class TestWatcher(TempTestCase):
         self.assertEqual(watcher.stderr.read(), b"")
 
 
+# Stands in for jig wait as the child of events --next. It notes its arguments and its
+# pid in HOME, prints two lines, and then exits with the code in wait-exit in HOME, or,
+# without that file, sleeps until it is ended. exec keeps the pid of the sleep the pid
+# that the watcher started, so a test can see that it is gone.
+WAIT_DOUBLE = """#!/bin/bash
+echo "$@" > "$HOME/wait-args"
+echo $$ > "$HOME/wait-pid"
+echo "jig wait: watching $2"
+echo "$2 runs past three times its expected minutes"
+if [ -e "$HOME/wait-exit" ]; then exit "$(cat "$HOME/wait-exit")"; fi
+exec sleep 60
+"""
+
+
+class TestNextEvent(TempTestCase):
+    """jig orch <project> events --next, the watcher that ends at the first new event."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.home / "ws" / "reviews" / PROJECT / "orch" / "events.log"
+        self.path.parent.mkdir(parents=True)
+        self.mark = self.path.with_name("events.mark")
+        self.wait = self.tmp / "jig-wait"
+        self.wait.write_text(WAIT_DOUBLE, encoding="utf-8")
+        self.wait.chmod(0o755)
+
+    def append(self, *lines):
+        with open(self.path, "a", encoding="utf-8") as stream:
+            stream.write("".join(f"{line}\n" for line in lines))
+
+    def start(self, *unit):
+        """Start the watcher with its output on pipes; the cleanup ends it."""
+        watcher = subprocess.Popen([str(ORCH), PROJECT, "events", "--next", *unit],
+                                   env=self.env(JIG_ORCH_WAIT=str(self.wait)),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        def end():
+            if watcher.poll() is None:
+                watcher.kill()
+                watcher.wait()
+            watcher.stdout.close()
+            watcher.stderr.close()
+
+        self.addCleanup(end)
+        return watcher
+
+    def finished(self, watcher):
+        """Wait for the watcher to exit 0 and return the lines it printed."""
+        self.assertEqual(watcher.wait(timeout=5), 0, watcher.stderr.read())
+        return watcher.stdout.read().decode().splitlines()
+
+    def assert_still_waiting(self, watcher):
+        time.sleep(0.6)
+        self.assertIsNone(watcher.poll(), "the watcher ended")
+
+    def assert_gone(self, pid):
+        # The watcher reaps its child, so a pid that still answers is a child that runs.
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_lines_that_came_between_runs_are_printed_once_by_the_next_run(self):
+        # The first run prints the line after the start line and exits. Two lines then
+        # come while no watcher runs: the next run prints both and nothing older. A
+        # third run has nothing new, waits, and prints only the line that comes next.
+        self.append("inbox: old", "start s1", "report: a1 OK")
+        self.assertEqual(self.finished(self.start()), ["report: a1 OK"])
+        self.assertEqual(self.mark.read_text(encoding="utf-8"), "3\n")
+        self.append("inbox: one", "readback: b1")
+        self.assertEqual(self.finished(self.start()), ["inbox: one", "readback: b1"])
+        watcher = self.start()
+        self.assert_still_waiting(watcher)
+        self.append("report: a2 OK")
+        self.assertEqual(self.finished(watcher), ["report: a2 OK"])
+
+    def test_a_missing_mark_or_one_beyond_the_file_starts_after_the_last_start_line(self):
+        self.append("report: a1 OK", "start s1", "inbox: old", "start s2", "inbox: new")
+        self.assertEqual(self.finished(self.start()), ["inbox: new"])
+        self.mark.write_text("99\n", encoding="utf-8")
+        self.assertEqual(self.finished(self.start()), ["inbox: new"])
+
+    def test_hourly_update_lines_alone_move_the_mark_and_do_not_end_it(self):
+        # Two clock ticks come after the mark: the watcher prints nothing and runs on,
+        # with the mark past them. The next event comes out alone, without the tick
+        # that came with it.
+        self.append("start s1")
+        watcher = self.start()
+        self.append("hourly update", "hourly update")
+        self.assert_still_waiting(watcher)
+        self.assertEqual(self.mark.read_text(encoding="utf-8"), "3\n")
+        self.append("hourly update", "report: a1 OK")
+        self.assertEqual(self.finished(watcher), ["report: a1 OK"])
+        self.assertEqual(self.mark.read_text(encoding="utf-8"), "5\n")
+
+    def test_a_wait_that_ends_without_a_report_gives_its_line_and_ends(self):
+        # The fixture wait exits with the code of a unit that runs too long; its last
+        # line of output goes into the one line, and the mark does not move.
+        self.append("start s1")
+        (self.home / "wait-exit").write_text("4\n", encoding="utf-8")
+        lines = self.finished(self.start("u1"))
+        self.assertEqual(lines, ["jig wait u1 exit 4: u1 runs past three times its "
+                                 "expected minutes"])
+        self.assertEqual((self.home / "wait-args").read_text(encoding="utf-8"),
+                         f"{PROJECT} u1\n")
+        self.assertFalse(self.mark.exists())
+
+    def test_a_wait_that_ends_at_a_report_gives_no_line_and_no_exit(self):
+        # The report wakes the session through its own event line, which the watcher
+        # then prints alone.
+        self.append("start s1")
+        (self.home / "wait-exit").write_text("0\n", encoding="utf-8")
+        watcher = self.start("u1")
+        self.assert_still_waiting(watcher)
+        self.assertTrue((self.home / "wait-pid").exists())
+        self.append("report: u1 OK")
+        self.assertEqual(self.finished(watcher), ["report: u1 OK"])
+
+    def test_the_child_wait_ends_with_the_watcher(self):
+        # Once when an event ends the watcher, once at SIGTERM: each time the child
+        # that still slept is gone when the watcher has exited.
+        self.append("start s1")
+        for ending in ("event", "signal"):
+            with self.subTest(ending=ending):
+                pid_file = self.home / "wait-pid"
+                pid_file.unlink(missing_ok=True)
+                watcher = self.start("u1")
+                deadline = time.monotonic() + 5
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                time.sleep(0.1)
+                pid = int(pid_file.read_text(encoding="utf-8"))
+                if ending == "event":
+                    self.append("inbox: one")
+                    self.assertEqual(self.finished(watcher), ["inbox: one"])
+                else:
+                    watcher.terminate()
+                    self.assertEqual(self.finished(watcher), [])
+                self.assert_gone(pid)
+
+
 class TestWatcherOfAnEndedSession(OrchTestCase):
     def test_watcher_ends_when_the_session_that_started_it_ends(self):
         # A fixture session in tmux starts the watcher as a background process in a

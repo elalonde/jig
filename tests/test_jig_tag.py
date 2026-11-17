@@ -50,9 +50,10 @@ def findings_text(*severities):
     return "\n".join(lines)
 
 
-def report_text(first_line):
-    """Return a unit report whose first line, the outcome, is the given one."""
-    return "\n".join([first_line, "jig-report: 1", "class: patch", "---", "Notes.", ""])
+def report_text(first_line, commits):
+    """Return a unit report with the given outcome line and the given commits: value."""
+    return "\n".join([first_line, "jig-report: 1", "id: fx1", "class: patch",
+                      f"commits: {commits}", "---", "Notes.", ""])
 
 
 def needs_spec_line():
@@ -362,29 +363,45 @@ class TagFixUnitTest(TagCase):
     def setUp(self):
         super().setUp()
         self.approve("spec-p4", self.first)
-        # The review read the second text and found a must-fix; the fix unit then made
-        # the third text, which is the one to tag.
+        # The review read the second text and wrote its must-fix findings; the fix unit
+        # then made the third text, which is the one to tag.
         self.read = self.commit({DOC: "two\n"})
+        self.commit({"impl/log/rv1-findings.md": findings_text("should-fix", "must-fix")})
         self.fixed = self.commit({DOC: "three\n"})
 
-    def close(self, row, report=None, findings=True):
-        """Commit the row with the review's must-fix findings and the fix unit's report."""
-        files = {STATUS: status_text(row, fix_column=True)}
-        if findings:
-            files["impl/log/rv1-findings.md"] = findings_text("should-fix", "must-fix")
+    def close(self, *rows, report=None, findings=True, commits=None):
+        """Commit the rows and the fix unit's report; the report names the fix commit.
+
+        Without findings, the review's findings file is removed in the same commit.
+        """
+        files = {STATUS: status_text(*rows, fix_column=True)}
         if report is not None:
-            files["impl/log/fx1-report.md"] = report_text(report)
-        return self.commit(files)
+            files["impl/log/fx1-report.md"] = report_text(
+                report, self.fixed if commits is None else commits)
+        removed = () if findings else ["impl/log/rv1-findings.md"]
+        return self.commit(files, removed=removed)
 
     def test_a_must_fix_review_with_an_ok_fix_report_is_tagged(self):
-        changed = self.close((DOC, self.fixed, "rv1", "fx1"), "OK: two findings applied")
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"),
+                             report="OK: two findings applied")
         self.assert_tagged(self.tag("spec-p4r1", changed), "spec-p4r1", changed)
 
     def test_a_fix_report_whose_first_line_is_not_ok_is_refused(self):
-        changed = self.close((DOC, self.fixed, "rv1", "fx1"), needs_spec_line())
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), report=needs_spec_line())
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
-                            "impl/log/fx1-report.md", "does not start with OK",
+                            "fix report outcome", "impl/log/fx1-report.md",
                             needs_spec_line())
+
+    def test_a_fix_report_whose_first_line_only_starts_with_the_letters_ok_is_refused(self):
+        # OKAY is another word, not the outcome of a report that ended well.
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), report="OKAY")
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "fix report outcome", "impl/log/fx1-report.md", "'OKAY'")
+
+    def test_a_fix_report_with_no_commits_is_refused(self):
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), report="OK", commits="none")
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "fix report commits", "impl/log/fx1-report.md")
 
     def test_a_row_whose_fix_report_is_missing_is_refused(self):
         changed = self.close((DOC, self.fixed, "rv1", "fx1"))
@@ -392,29 +409,29 @@ class TagFixUnitTest(TagCase):
                             "fix unit has no impl/log/fx1-report.md")
 
     def test_a_row_whose_findings_file_is_missing_is_refused_even_with_a_fix_report(self):
-        changed = self.close((DOC, self.fixed, "rv1", "fx1"), "OK", findings=False)
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), report="OK", findings=False)
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
                             "review has no impl/log/rv1-findings.md")
 
     def test_a_row_whose_document_differs_from_the_commit_to_tag_is_refused(self):
         # The row names the commit that the review read, not the fix unit's commit, so
         # the fixed text was never recorded as the end of the loop.
-        changed = self.close((DOC, self.read, "rv1", "fx1"), "OK")
+        changed = self.close((DOC, self.read, "rv1", "fx1"), report="OK")
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC, "differs")
 
     def test_a_fix_id_equal_to_the_review_id_is_refused(self):
-        changed = self.close((DOC, self.fixed, "rv1", "rv1"), "OK")
+        changed = self.close((DOC, self.fixed, "rv1", "rv1"), report="OK")
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
                             "fix ID rv1 is the ID of its review")
 
     def test_a_fix_id_that_is_no_id_is_refused(self):
-        changed = self.close((DOC, self.fixed, "rv1", "fix-unit-1"), "OK")
+        changed = self.close((DOC, self.fixed, "rv1", "fix-unit-1"), report="OK")
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
                             "fix ID 'fix-unit-1' is not an ID")
 
     def test_a_row_of_three_cells_with_a_must_fix_is_refused_in_a_table_of_four_columns(self):
         # The fourth cell is empty, so the row is an old one and its must-fix counts.
-        changed = self.close((DOC, self.fixed, "rv1", ""), "OK")
+        changed = self.close((DOC, self.fixed, "rv1", ""), report="OK")
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
                             "impl/log/rv1-findings.md holds a must-fix finding")
 
@@ -427,6 +444,63 @@ class TagFixUnitTest(TagCase):
                               "impl/log/rv1-findings.md": findings_text("should-fix"),
                               "impl/log/rv2-findings.md": findings_text()})
         self.assert_tagged(self.tag("spec-p4r1", tagged), "spec-p4r1", tagged)
+
+
+class TagFixDifferenceTest(TagCase):
+    """A row with a fix ID needs a change by the fix to a document of its review's rows.
+
+    The review read two documents and then wrote its findings file; each test makes the
+    fix unit's commit after that, and the rows name that commit.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.approve("spec-p4", self.first)
+        self.commit({DOC: "two\n", OTHER_DOC: "other\n"})
+        self.commit({"impl/log/rv1-findings.md": findings_text("must-fix"),
+                     "impl/log/rv2-findings.md": findings_text("info")})
+
+    def close(self, fix_files, *rows):
+        """Commit the fix, then the rows at the fix's commit with its OK report.
+
+        Each row is given as (path, review ID[, fix ID]); the fix's commit goes in as
+        the row's commit.
+        """
+        fixed = self.commit(fix_files)
+        cells = [(path, fixed, *ids) for path, *ids in rows]
+        return self.commit({STATUS: status_text(*cells, fix_column=True),
+                            "impl/log/fx1-report.md": report_text("OK", fixed)})
+
+    def test_a_row_alone_whose_document_the_fix_did_not_change_is_refused(self):
+        # The fix unit committed, but only outside the documents of its rows; the other
+        # document has a clean review of its own, so only the first row fails.
+        changed = self.close({"impl/notes.md": "notes\n"},
+                             (DOC, "rv1", "fx1"), (OTHER_DOC, "rv2"))
+        result = self.tag("spec-p4r1", changed)
+        self.assert_refused(result, "review", f"{DOC}: difference",
+                            "fix unit fx1 changed none of")
+        self.assertNotIn(OTHER_DOC, result.stderr)
+
+    def test_two_rows_of_one_review_and_fix_pass_when_the_fix_changed_one_document(self):
+        changed = self.close({DOC: "three\n"},
+                             (DOC, "rv1", "fx1"), (OTHER_DOC, "rv1", "fx1"))
+        self.assert_tagged(self.tag("spec-p4r1", changed), "spec-p4r1", changed)
+
+    def test_two_rows_of_one_review_and_fix_both_fail_when_the_fix_changed_neither(self):
+        changed = self.close({"impl/notes.md": "notes\n"},
+                             (DOC, "rv1", "fx1"), (OTHER_DOC, "rv1", "fx1"))
+        self.assert_refused(self.tag("spec-p4r1", changed), "review",
+                            f"{DOC}: difference", f"{OTHER_DOC}: difference")
+
+    def test_the_change_is_counted_from_the_first_findings_file_not_a_later_edit(self):
+        # The findings file is edited after the fix, so a reader that took the newest
+        # commit that touches it would see no change by the fix.
+        fixed = self.commit({DOC: "three\n"})
+        self.commit({"impl/log/rv1-findings.md": findings_text("must-fix", "info")})
+        rows = ((DOC, fixed, "rv1", "fx1"), (OTHER_DOC, fixed, "rv1", "fx1"))
+        changed = self.commit({STATUS: status_text(*rows, fix_column=True),
+                               "impl/log/fx1-report.md": report_text("OK", fixed)})
+        self.assert_tagged(self.tag("spec-p4r1", changed), "spec-p4r1", changed)
 
 
 class TagVersionLineTest(TagCase):

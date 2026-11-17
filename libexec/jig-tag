@@ -32,10 +32,18 @@ tag is the same as at the commit of the row, and the row's review left
 impl/log/<ID>-findings.md with no must-fix finding. A row may have a fourth cell, the
 ID of the fix unit that applied the review's must-fix findings with no second review.
 Such a row's commit is the fix unit's commit, its review's findings file must exist but
-may hold must-fix findings, and impl/log/<fix ID>-report.md must exist with a first line
-that starts with OK; the fix ID must be an ID other than the review's. An empty fourth
-cell leaves the row as one of three cells. The status file, the findings file and the
-fix report are read at the commit to tag, because that is the tree the tag approves.
+may hold must-fix findings, and the fix ID must be an ID other than the review's. The
+fix unit's report, impl/log/<fix ID>-report.md, must have a first line that is exactly
+OK or starts with "OK:", and a commits: line other than none. And the fix must have
+changed something after the review: at least one of the documents named by the rows
+with the same review ID and fix ID must differ between the oldest commit that adds the
+review's findings file and the commit to tag. Without these three checks, the report
+of any unit that ended well, or a fix that changed nothing, would close the loop of a
+review whose must-fix findings nobody applied. The rows of one review and one fix are
+checked together, because one review can read several documents while its fix changes
+only some of them. An empty fourth cell leaves the row as one of three cells. The
+status file, the findings file and the fix report are read at the commit to tag,
+because that is the tree the tag approves.
 
 Otherwise the annotated tag is made at the commit with the git identity of the account
 that runs this, and pushed. Exits 0 only when origin then shows the tag at the commit;
@@ -232,17 +240,75 @@ def loop_rows(text):
     return records
 
 
+def findings_added(clone, commit, findings):
+    """Return the oldest commit on the history of commit that adds the findings file.
+
+    Returns '' when no commit adds it. Every branch of the history counts, so that a
+    findings file added on a merged branch is found too.
+    """
+    added = git_out(clone, "log", "--full-history", "--diff-filter=A", "--format=%H",
+                    commit, "--", findings)
+    lines = added.splitlines()
+    return lines[-1] if lines else ""
+
+
+def difference_failure(clone, commit, unit, fix, rows):
+    """Return why the fix changed no document after its review, or None when it did.
+
+    The documents are those of every row with this review ID and this fix ID, because a
+    review that read two documents gets a row for each, and its fix may change only
+    one of them. The review's findings file marks the end of the review, so the fix
+    shows as a document that differs between the oldest commit that adds that file
+    and the commit to tag.
+    """
+    findings = f"impl/log/{unit}-findings.md"
+    since = findings_added(clone, commit, findings)
+    if not since:
+        return (f"difference: no commit on the history of {commit[:12]} adds {findings}, "
+                "so the change after the review cannot be read")
+    documents = sorted({row[0] for row in rows
+                        if len(row) == 4 and row[2] == unit and row[3] == fix})
+    for document in documents:
+        before = git_out(clone, "rev-parse", "--verify", "-q", f"{since}:{document}")
+        after = git_out(clone, "rev-parse", "--verify", "-q", f"{commit}:{document}")
+        if before != after:
+            return None
+    return (f"difference: the fix unit {fix} changed none of {', '.join(documents)} "
+            f"between {since[:12]}, which adds {findings}, and {commit[:12]}")
+
+
+def report_failure(text, report):
+    """Return why a fix unit's report does not show a fix that ended with commits.
+
+    The first line must be exactly OK or start with "OK:", the form of a report that
+    ended well; a line like OKAY is another word. The commits: line must name commits,
+    because a report of none means that the unit changed nothing.
+    """
+    lines = text.splitlines()
+    first = lines[0] if lines else ""
+    if first != "OK" and not first.startswith("OK:"):
+        return (f"fix report outcome: the first line of {report} is neither OK nor "
+                f"starts with 'OK:': {first[:80]!r}")
+    values = [line[len("commits:"):].strip() for line in lines if line.startswith("commits:")]
+    if not values:
+        return f"fix report commits: {report} has no commits: line"
+    if values[0] in ("", "none"):
+        return f"fix report commits: the commits: line of {report} names no commit"
+    return None
+
+
 def loop_failure(clone, commit, document, rows):
     """Return why the document has no closed loop at the commit, or None when it has.
 
     A row of three cells passes when its review left a findings file with no must-fix
     finding. A row with a fix ID records a review whose must-fix findings a later fix
     unit applied, with no second review: its review's findings file may hold must-fix
-    findings, and the row passes when the fix unit's report says it ended well, that is
-    when its first line starts with OK. In both forms, the row's commit is the one
-    whose document was last read or fixed, so the document at the commit to tag must
-    be the same as at the row's commit. Any row that passes is enough; otherwise the
-    reason of the last row that names the document is given.
+    findings, and the row passes when the fix unit's report says it ended well with
+    commits, and a document of the rows of that review and fix changed after the
+    review. In both forms, the row's commit is the one whose document was last read or
+    fixed, so the document at the commit to tag must be the same as at the row's
+    commit. Any row that passes is enough; otherwise the reason of the last row that
+    names the document is given.
     """
     reason = (f"no row in the table Closed review loops of {STATUS} at {commit[:12]}; "
               f"the row it looks for is | {document} | <commit> | <ID> |, or "
@@ -285,11 +351,10 @@ def loop_failure(clone, commit, document, rows):
         if text is None:
             reason = f"the row's fix unit has no {report} at {commit[:12]}"
             continue
-        first = text.splitlines()[0].strip() if text.strip() else ""
-        if not first.startswith("OK"):
-            reason = f"the first line of {report} does not start with OK: {first[:80]!r}"
-            continue
-        return None
+        reason = report_failure(text, report) or difference_failure(
+            clone, commit, unit, fix, rows)
+        if reason is None:
+            return None
     return reason
 
 
