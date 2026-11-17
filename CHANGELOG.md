@@ -5,6 +5,54 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.8.2
+
+What changed: the pre-commit hook that `jig start` installs in a product clone
+now refuses a commit only for a private term that the commit adds, not for one
+that the product already held. `jig terms check <project>` takes two new
+options for it: `--staged <work tree>` reads only the lines and path names that
+the staged change adds, and `--message <file>` reads a commit message. Without
+them the command checks the whole product as before. The hook runs the staged
+check when the project's jig is 0.8.2 or newer, and the whole check with an
+older jig. A new commit-msg hook checks the message of each commit for the
+private terms. It is the same file as the pre-commit hook, told apart by its
+second line `# jig commit-msg hook`; `jig start` and `jig new` install it,
+exclude it from the product and remove it as they do the pre-commit hook, and
+leave alone a hook that the product keeps or tracks itself. The hooks and lint A
+find the `-dev` clone of a linked work tree in any directory, through
+`git rev-parse --git-common-dir`.
+
+The staged check counts the new content of a path whose type changes (a file to
+a link or a submodule, or back) in full, and no longer refuses such a commit
+when it adds no term. It reads submodules in one form whatever `diff.submodule`
+says, and shows a new submodule also when `diff.ignoreSubmodules` or the
+project's `.gitmodules` would hide it. A new file in a directory that the head
+commit already holds no longer counts a term in that directory's name; a new
+directory, and a new or renamed file name, still count.
+
+Files and formats: changed files: `hooks/pre-commit`, `libexec/jig-terms`,
+`libexec/jig-start-worker`, `libexec/jig-start`, `libexec/jig-new`,
+`lib/jig_clones.py`, `README.md`. A clone gets the new file `hooks/commit-msg`
+in its git directory. The output of `jig terms check` without the new options
+is unchanged.
+
+Migration: a host and its projects move from 0.8.1 to 0.8.2 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.8.2`. It installs 0.8.2
+   under `/opt/jig/0.8.2/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.8.2` as the orchestrator
+   account. It sets `JIG_VERSION=0.8.2` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.8.2`.
+3. Nothing more: the next `jig start` of a unit installs the new pre-commit hook
+   and the commit-msg hook in its clones. The supervisor loop, `jig orch`, runs
+   no changed code, so it needs no restart.
+
+Requested by: another project, whose product already held a private term, so
+that the 0.8.1 hook refused each of its commits.
+
+Units: 0 minor, 2 patch, 26 none
+
 ## 0.8.1
 
 What changed: the screen reader of the supervisor loop, `jig orch`, now takes
