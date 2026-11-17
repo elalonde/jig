@@ -35,8 +35,9 @@ usage: jig orch <project> start | stop | status | events [--old] | rollover
   wait-on <other> <what>...
           writes the line of <other> in orch/waits: the project waits on <other> for
           <what>; the since of the line is kept when the line holds the same <what>.
-          It refuses when ~/ws/reviews/<project>/orch/ or ~/ws/reviews/<other>/orch/
-          does not exist, and makes neither; it warns when
+          It refuses when ~/ws/reviews/<project>/orch/, or ~/ws/reviews/<other>/orch/
+          in the home of the orchestrator account, does not exist, and makes
+          neither; it warns when
           the activity file of <other> is missing or stale: its loop then writes
           none, because it runs a jig older than 0.8.0 or no loop runs
   wait-on <other> --clear
@@ -186,14 +187,18 @@ holds of: unit, a lock in the lock directory (JIG_LOCK_DIR, /run/jig/lock) named
 <project>-<account> for an account of the conf file, younger than 3 times the
 expected minutes beside it; down, the session is not live; idle, a dialog (no input
 bar for a few polls); busy, a spinner line of a running turn just above the input box;
-idle, else. since is when the state began, kept across a restart of the loop when the
+idle, else. The accounts of the conf file include the orchestrator account: the
+account that ORCH_ACCOUNT names, or orchestrator when the file has no such key.
+since is when the state began, kept across a restart of the loop when the
 old file holds the same state and is fresh, under 3 activity polls old. When the loop
 ends, for any reason, it writes down. A file that cannot be written is logged at most
 once an hour.
 
 Stalls. orch/waits holds a line for each project that the orchestrator waits on:
 the other project, since and what, split by tabs, written by wait-on. Once an activity
-poll the loop reads it, and for each line the activity file of the other project: a
+poll the loop reads it, and for each line the activity file of the other project, in
+the home of the orchestrator account. status and wait-on read it in the same place,
+so that they show the state the stall line comes from. A
 file that is missing, does not parse, or is older than 3 activity polls means down,
 since its written time or since the loop first saw it so. When that project has been
 idle or down for the stall time, the loop appends "stall: <other> <state> since
@@ -511,6 +516,44 @@ def account_home(account):
         return None
 
 
+def orch_accounts(conf):
+    """Return the accounts of the orchestrator role by the conf file of a project.
+
+    They are the words of ORCH_ACCOUNT, or the account orchestrator, the word of the
+    role, when the file has no such key, as the approved list of the account takes it.
+    The unit state and the home of the activity files both come from here, so that
+    the two never use different defaults.
+    """
+    return (conf.get("ORCH_ACCOUNT") or "").split() or ["orchestrator"]
+
+
+def orch_home(conf):
+    """Return the home of the orchestrator account, or None when it is not known.
+
+    The activity files of all projects are in that home. The stall check, jig orch
+    status and wait-on read the activity file of another project there, so that all
+    three show the state from the same file.
+    """
+    return account_home(orch_accounts(conf)[0])
+
+
+def project_conf(project):
+    """Return the conf file of the project as data, or no keys when it cannot be read.
+
+    wait-on runs without a conf file; with none, the orchestrator account is the
+    account orchestrator.
+    """
+    try:
+        return jig_units.read_conf(project)
+    except jig_units.Refused:
+        return {}
+
+
+def other_orch_dir(home, project):
+    """Return the orch directory of a project in the home of the orchestrator account."""
+    return home / "ws" / "reviews" / project / "orch"
+
+
 def stamp(moment):
     return moment.astimezone().replace(microsecond=0).isoformat()
 
@@ -593,7 +636,7 @@ def unit_running(conf, project, now):
     beside it can still stall; without an expected time, or a start time that can be
     read, the lock alone counts.
     """
-    names = conf.get("ORCH_ACCOUNT", "").split() + jig_units.accounts(conf)
+    names = orch_accounts(conf) + jig_units.accounts(conf)
     for account in dict.fromkeys(names):
         lock = worker.lock_path(project, account)
         if not lock.is_file():
@@ -650,8 +693,12 @@ def describe(found, now, poll):
     return f"{state} since {stamp(since)}"
 
 
-def wait_lines(project, now, poll):
-    """Return one line for each wait of the project, with the activity of the other."""
+def wait_lines(project, home, now, poll):
+    """Return one line for each wait of the project, with the activity of the other.
+
+    home is the home of the orchestrator account, None when it is not known; the
+    activity files are then missing.
+    """
     try:
         text = (orch_dir(project) / WAITS_FILE).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -659,7 +706,9 @@ def wait_lines(project, now, poll):
     waits, _ = parse_waits(text)
     lines = []
     for other, since, what in waits:
-        shown = describe(read_activity(orch_dir(other) / ACTIVITY_FILE), now, poll)
+        found = (None, "missing") if home is None \
+            else read_activity(other_orch_dir(home, other) / ACTIVITY_FILE)
+        shown = describe(found, now, poll)
         lines.append(f"waits on {other}: {shown}; waited on since {since}: {what}")
     return lines
 
@@ -916,8 +965,10 @@ def wait_on(project, words, poll):
     """jig orch <project> wait-on: list, write or clear the waits of the project."""
     waits_file = orch_dir(project) / WAITS_FILE
     now = datetime.datetime.now().astimezone()
+    account = orch_accounts(project_conf(project))[0]
+    home = account_home(account)
     if not words:
-        lines = wait_lines(project, now, poll)
+        lines = wait_lines(project, home, now, poll)
         print("\n".join(f"jig orch: {project}: {line}" for line in lines)
               or f"jig orch: {project}: no waits")
         return DONE
@@ -936,12 +987,19 @@ def wait_on(project, words, poll):
               file=sys.stderr)
         return USAGE
     # A mistyped name on either side would leave a wait that no loop reads, so both
-    # orch directories must exist already; the command makes neither.
-    for name in (project, other):
-        if not clear and not orch_dir(name).is_dir():
-            print(f"jig orch: refused: wait-on: {orch_dir(name)} does not exist: no "
-                  f"orchestrator of {name} runs on this host", file=sys.stderr)
+    # orch directories must exist already; the command makes neither. The directory
+    # of the other project is the one whose activity file the stall check reads.
+    if not clear:
+        if home is None:
+            print(f"jig orch: refused: wait-on: the orchestrator account {account} is not "
+                  f"known, so no activity file of {other} can be read", file=sys.stderr)
             return REFUSED
+        for directory, name in ((orch_dir(project), project),
+                                (other_orch_dir(home, other), other)):
+            if not directory.is_dir():
+                print(f"jig orch: refused: wait-on: {directory} does not exist: no "
+                      f"orchestrator of {name} runs on this host", file=sys.stderr)
+                return REFUSED
     try:
         old = waits_file.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -963,7 +1021,7 @@ def wait_on(project, words, poll):
     lines = [*kept, f"{other}\t{since}\t{what}"]
     write_whole(waits_file, "".join(f"{line}\n" for line in lines))
     print(f"jig orch: {project} waits on {other} since {since}: {what}")
-    found = read_activity(orch_dir(other) / ACTIVITY_FILE)
+    found = read_activity(other_orch_dir(home, other) / ACTIVITY_FILE)
     shown = describe(found, now, poll)
     if shown.startswith("no activity file"):
         print(f"jig orch: warning: {other} has {shown}: its loop writes none, because it "
@@ -1898,8 +1956,8 @@ class Orch:
 
         # The activity files are in the home of the orchestrator account; a conf file
         # without ORCH_ACCOUNT gets the account orchestrator, as for its approved list.
-        account = self.account.split()[0]
-        home = account_home(account)
+        account = orch_accounts(self.conf)[0]
+        home = orch_home(self.conf)
 
         def read(other):
             if home is None:
@@ -1907,7 +1965,7 @@ class Orch:
                                               f"no activity file can be read; each "
                                               f"project waited on counts as down")
                 return None, "missing"
-            path = home / "ws" / "reviews" / other / "orch" / ACTIVITY_FILE
+            path = other_orch_dir(home, other) / ACTIVITY_FILE
             found = read_activity(path)
             if found[1] == "unparsed":
                 self.problem(f"activity {other}", f"{path} cannot be read or does not "
@@ -2028,7 +2086,7 @@ class Orch:
         now = datetime.datetime.now().astimezone()
         print(f"jig orch: {self.project}: activity: "
               f"{describe(read_activity(self.activity_file), now, poll)}")
-        for line in wait_lines(self.project, now, poll):
+        for line in wait_lines(self.project, orch_home(self.conf), now, poll):
             print(f"jig orch: {self.project}: {line}")
         return NO_LOOP if descriptor is not None else DONE
 

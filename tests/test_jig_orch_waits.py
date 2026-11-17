@@ -7,9 +7,11 @@ with the private tmux server and the double for claude of tests/test_jig_orch.py
 a few run jig orch as a command.
 """
 
+import contextlib
 import datetime
 import fcntl
 import getpass
+import io
 import os
 import pathlib
 import re
@@ -128,6 +130,19 @@ class TestRuleWithSessionName(unittest.TestCase):
         self.assertEqual(orch.activity_state(False, True, 0, labeled_screen(DONE_LINE)), "idle")
 
 
+def run_as_orchestrator(conf):
+    """Name the running account as the orchestrator account in a conf file of the fixture.
+
+    The activity files of other projects are read in the home of the orchestrator
+    account; naming the running account keeps that home the fixture's HOME, and no
+    real home is read.
+    """
+    text = conf.read_text(encoding="utf-8")
+    assert "ORCH_ACCOUNT=orchestrator\n" in text, text
+    conf.write_text(text.replace("ORCH_ACCOUNT=orchestrator\n",
+                                 f"ORCH_ACCOUNT={getpass.getuser()}\n"), encoding="utf-8")
+
+
 class TestUnitLock(TempTestCase):
     """The unit state, from the lock directory and the accounts of the conf file."""
 
@@ -170,6 +185,16 @@ class TestUnitLock(TempTestCase):
         (self.locks / f"{PROJECT}-specwriter.expected").write_text("60\n", encoding="utf-8")
         self.lock(f"{PROJECT}-somebody", at(0), 60)
         self.assertFalse(orch.unit_running(self.conf, PROJECT, at(1)))
+
+    def test_a_conf_file_without_the_account_reads_the_lock_of_orchestrator(self):
+        # A conf file with no ORCH_ACCOUNT takes the account orchestrator, as the stall
+        # check does, so a fresh lock of that account is a unit; a conf file that names
+        # another orchestrator account does not read that lock.
+        unnamed = {key: value for key, value in self.conf.items() if key != "ORCH_ACCOUNT"}
+        self.lock(f"{PROJECT}-orchestrator", at(0), 60)
+        self.assertTrue(orch.unit_running(unnamed, PROJECT, at(10)))
+        self.assertFalse(orch.unit_running({**unnamed, "ORCH_ACCOUNT": "boss"}, PROJECT,
+                                           at(10)))
 
 
 class TestSince(unittest.TestCase):
@@ -361,6 +386,63 @@ class TestStallAccount(OrchTestCase):
         self.assertEqual(unnamed, named)
 
 
+class TestOrchestratorHome(OrchTestCase):
+    """status and wait-on read the activity file of another project where the stall
+    check reads it: in the home of the account that ORCH_ACCOUNT names."""
+
+    def setUp(self):
+        super().setUp()
+        # The account database knows only the account boss, whose home is a fixture
+        # folder apart from HOME; the commands run in another account.
+        self.boss_home = self.tmp / "boss-home"
+        self.now = datetime.datetime.now().astimezone()
+        self.since = self.now - datetime.timedelta(hours=2)
+        theirs = self.boss_home / "ws" / "reviews" / OTHER / "orch"
+        theirs.mkdir(parents=True)
+        (theirs / "activity").write_text(
+            f"idle\t{orch.stamp(self.since)}\t{orch.stamp(self.now)}\n", encoding="utf-8")
+        # HOME holds the directory of the same project with no activity file: a command
+        # that read there would show no activity file, and wait-on would warn.
+        (self.home / "ws" / "reviews" / OTHER / "orch").mkdir(parents=True)
+        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
+        text = conf.read_text(encoding="utf-8")
+        self.assertIn("ORCH_ACCOUNT=orchestrator\n", text)
+        conf.write_text(text.replace("ORCH_ACCOUNT=orchestrator\n", "ORCH_ACCOUNT=boss\n"),
+                        encoding="utf-8")
+        (self.reviews / "orch").mkdir()
+        (self.reviews / "orch" / "waits").write_text(
+            f"{OTHER}\t{orch.stamp(self.now)}\ta block\n", encoding="utf-8")
+
+    def in_process(self, call):
+        """Run call with the fixture's environment and account database; return what it
+        printed."""
+        homes = {"boss": str(self.boss_home)}
+
+        def getpwnam(name):
+            if name not in homes:
+                raise KeyError(name)
+            return types.SimpleNamespace(pw_dir=homes[name])
+
+        env = self.base_env()
+        env.update(LOGNAME="fixture-runner", USER="fixture-runner")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("pwd.getpwnam", getpwnam), contextlib.redirect_stdout(out):
+            call()
+        return out.getvalue()
+
+    def test_status_and_wait_on_show_the_file_in_the_home_of_the_account(self):
+        shown = f"waits on {OTHER}: idle since {orch.stamp(self.since)};"
+        status = self.in_process(lambda: orch.Orch(PROJECT).status(POLL))
+        self.assertIn(shown, status)
+        listed = self.in_process(lambda: orch.wait_on(PROJECT, [], POLL))
+        self.assertIn(shown, listed)
+        # A write finds the directory and the fresh file there, so it gives no warning.
+        written = self.in_process(lambda: orch.wait_on(PROJECT, [OTHER, "a block"], POLL))
+        self.assertIn(f"waits on {OTHER}", written)
+        self.assertNotIn("warning", written)
+
+
 class TestQuietLines(OrchTestCase):
     def test_stall_line_is_no_change_for_the_next_hourly_tick(self):
         # A stall line goes from the queue into the event file. The hourly tick after it
@@ -397,6 +479,11 @@ class WaitsTestCase(TempTestCase):
         self.mine.mkdir(parents=True)
         self.theirs.mkdir(parents=True)
         self.fresh()
+        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
+        conf.parent.mkdir(parents=True)
+        conf.write_text("REPO=~/ws/src/demo\nBRANCH=master\nORCH_ACCOUNT=orchestrator\n",
+                        encoding="utf-8")
+        run_as_orchestrator(conf)
 
     def fresh(self, state="busy", since=None, written=None):
         """Write the other project's activity file as its running loop does."""
@@ -506,6 +593,10 @@ class TestWaitOn(WaitsTestCase):
 
 
 class TestStatusLines(OrchTestCase):
+    def setUp(self):
+        super().setUp()
+        run_as_orchestrator(self.home / ".config" / "jig" / f"{PROJECT}.conf")
+
     def test_status_prints_the_activity_and_each_wait(self):
         # No loop runs; the activity file is the one the last loop left, and the waits
         # file holds one wait on a project whose loop writes no activity file.
@@ -533,15 +624,7 @@ class LoopWaitsCase(OrchTestCase):
 
     def setUp(self):
         super().setUp()
-        # The loop reads the activity files of other projects in the home of the
-        # orchestrator account. Naming the running account there keeps that home the
-        # fixture's, and no real home is read.
-        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
-        text = conf.read_text(encoding="utf-8")
-        self.assertIn("ORCH_ACCOUNT=orchestrator\n", text)
-        conf.write_text(text.replace("ORCH_ACCOUNT=orchestrator\n",
-                                     f"ORCH_ACCOUNT={getpass.getuser()}\n"),
-                        encoding="utf-8")
+        run_as_orchestrator(self.home / ".config" / "jig" / f"{PROJECT}.conf")
 
     def base_env(self):
         env = super().base_env()
