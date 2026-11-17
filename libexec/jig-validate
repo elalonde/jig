@@ -22,6 +22,10 @@ A prompt whose first line names the implementer account must also name the
 sections "Comment standard" and "Commit message standard" of CLAUDE.md in its ROLE
 section: that session writes product code and its commit messages, and those
 sections hold the rules they follow.
+
+The words "Spec tag:" in the ROLE section stand on one line, because jig start reads
+the approved tag only from such a line; a ROLE section that ends one line with "Spec"
+and starts the next with "tag:" is refused (see lib/jig_spec_tag.py).
 """
 
 import argparse
@@ -38,6 +42,7 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 import jig_dirs  # noqa: E402
 import jig_ids  # noqa: E402
 import jig_profile  # noqa: E402
+import jig_spec_tag  # noqa: E402
 
 SECTIONS = ("UNATTENDED", "MODEL CHECK", "EFFORT", "ROLE", "STATE", "READ", "AUTHORITY",
             "PREMISE CHECK", "REQUIREMENTS", "PROOF", "SESSION ECONOMY", "STEPS", "ESCALATION",
@@ -169,6 +174,23 @@ def implementer_section_failures(lines):
             for name, pattern in IMPLEMENTER_SECTIONS if not pattern.search(text)]
 
 
+def split_tag_failures(lines):
+    """Refuse a ROLE section that splits "Spec tag:" over two lines, with one line.
+
+    jig start reads the approved tag only from "Spec tag:" on one line, so the split
+    leaves the unit without its tag. Only the first split is named, because the fix of
+    each is the same.
+    """
+    number, text = section_text(lines, "ROLE")
+    if number is None:
+        return []
+    index = jig_spec_tag.split_line(text)
+    if index is None:
+        return []
+    return [f"line {number + index}: the ROLE section splits 'Spec tag:' over two lines; "
+            f"write 'Spec tag:' on one line"]
+
+
 def read_section_lines(lines):
     """Yield the number and text of each line of READ, up to "DO NOT READ"."""
     in_read = False
@@ -266,6 +288,7 @@ def prompt_failures(lines):
     failures += section_failures(lines)
     failures += read_failures(lines, clean_room_on(lines))
     failures += implementer_section_failures(lines)
+    failures += split_tag_failures(lines)
     failures += last_line_failures(max(len(lines), 1), last, first_id)
     return failures
 

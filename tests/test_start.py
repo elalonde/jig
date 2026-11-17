@@ -425,6 +425,15 @@ class StartPreconditionTest(StartCase):
         self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: spec-p0, spec-p0r3.")
         self.assert_refused(self.start(), "tag")
 
+    def test_start_refuses_a_spec_tag_split_over_two_lines_before_it_reads_the_tag(self):
+        # "Spec" ends one line of the ROLE section and "tag:" starts the next, after the
+        # indent of a continuation line. jig start refuses at its check of the prompt's
+        # form, with the line that names the split, before it looks for a tag at all.
+        self.replace_in_prompt("Spec tag: spec-p0.", "Spec\n  tag: spec-p0.")
+        result = self.start()
+        self.assert_refused(result, "validate")
+        self.assertIn("splits 'Spec tag:' over two lines", result.stderr)
+
     def test_start_refuses_an_implementer_prompt_without_a_spec_tag(self):
         self.replace_in_prompt("Spec tag: spec-p0.", "Spec tag: none.")
         self.assert_refused(self.start(), "tag")

@@ -416,6 +416,45 @@ class ValidatePromptTest(ValidateCase):
                 self.assert_valid("prompt", text.replace("Spec tag: spec-p0.",
                                                          f"Spec tag: {tag}."))
 
+    def role_prompt(self, *continuation):
+        """Return the good prompt with its ROLE section's later lines replaced."""
+        first, blocks, last = prompt_parts()
+        blocks["ROLE"] = [blocks["ROLE"][0], *continuation]
+        return prompt_text(first, blocks, last)
+
+    def test_validate_prompt_refuses_spec_tag_split_over_two_lines_with_one_failure(self):
+        # "Spec" ends the second line of the ROLE section and "tag:" starts the third,
+        # once with no indent, once with the two spaces of a continuation line and once
+        # with a tab; a second split further down changes nothing. Each prompt fails
+        # with exactly one line, which names the line that ends with "Spec".
+        for indent in ("", "  ", "\t"):
+            with self.subTest(indent=indent):
+                text = self.role_prompt("  Commit message standard. Spec",
+                                        f"{indent}tag: spec-p0. Prohibited sources: none.",
+                                        "  Read the Spec",
+                                        "  tag: of the unit again.")
+                lines = self.assert_invalid("prompt", text)
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].endswith(
+                    ": line 8: the ROLE section splits 'Spec tag:' over two lines; "
+                    "write 'Spec tag:' on one line"), lines)
+
+    def test_validate_prompt_accepts_spec_tag_on_one_line_after_a_line_break(self):
+        # "Spec tag:" starts a continuation line of the ROLE section, right after the
+        # line before it ends: the words stand on one line, so the prompt passes.
+        self.assert_valid("prompt", self.role_prompt(
+            "  Commit message standard.", "  Spec tag: spec-p0. Prohibited sources: none."))
+
+    def test_validate_prompt_accepts_a_line_ending_in_spec_before_a_line_without_tag(self):
+        # A line of the ROLE section ends with the word "Spec", and the next line starts
+        # with another word, with "tags:", or with "tag" and no colon. None of these is
+        # the split, and each prompt passes.
+        for following in ("  of the unit.", "  tags: none.", "  tag of the unit."):
+            with self.subTest(following=following):
+                self.assert_valid("prompt", self.role_prompt(
+                    "  Commit message standard. Spec tag: spec-p0. Read the Spec",
+                    following))
+
     def test_validate_prompt_accepts_a_specwriter_prompt_without_the_comment_standard(self):
         first, blocks, last = prompt_parts()
         first = "# demo  paste into: jig-spec-demo (specwriter, ~/ws/src/jig-dev)"
