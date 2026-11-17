@@ -1080,8 +1080,8 @@ class ForkTestCase(OrchTestCase):
         self.until(lambda: len(self.calls()) == 2, what="the restart")
         self.until(self.ready, what="the restarted session's input bar")
 
-    def assert_ended(self, child, old):
-        self.until(lambda: child.poll() is not None, seconds=10.0,
+    def assert_ended(self, child, old, seconds=10.0):
+        self.until(lambda: child.poll() is not None, seconds=seconds,
                    what=f"the end of pid {child.pid}")
         self.assertEqual(child.returncode, -signal.SIGTERM)
         self.assertIn(f"sent SIGTERM to pid {child.pid}, a fork of the old Claude Code "
@@ -1146,21 +1146,91 @@ class TestForkWithinTheWindow(ForkTestCase):
         self.assert_ended(fork, old)
 
 
+def process_state(pid):
+    """Return the state letter of the process as /proc shows it, or None when it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            # The state follows the command name, which is in parentheses and may hold
+            # spaces.
+            return stream.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
 class TestForksWhenTheLoopEnds(ForkTestCase):
     """A loop that ends looks for forks of its last session twice, a window apart.
 
-    The window leaves a slow host time to start the fork between the two looks.
     Once the loop or stop has ended, nothing else ends a fork, so a fork that ends
     with SIGTERM and a log line for it was ended by the second look.
+
+    The fork has to start between the two looks, and a host that stalls the test for
+    a whole window would start it after the second look. So the test freezes the
+    process that looks with SIGSTOP as soon as the first look is in the log, starts
+    the fork, and lets the process go on. When the freeze itself came later than a
+    window after the first look, the second look may have passed already: the test
+    lets the process finish and runs its case again, a few times at most.
     """
 
     fork_window = "4"
+    attempts = 3
 
-    def first_look(self, session_id):
-        """Wait for the line of the loop's first look that names the session."""
-        self.until(lambda: any(line.split(" ", 1)[1].startswith("looked for forks of ")
-                               and session_id in line for line in self.log().splitlines()),
-                   what="the first look for forks")
+    def look_bound(self):
+        """Seconds within which a frozen process that goes on takes its second look
+        and ends: the window and a poll, with a margin of three times for a slow host."""
+        return round(3 * (float(self.fork_window) + float(POLL)), 1)
+
+    def first_look(self, session_id, offset):
+        """Wait for the line of the first look that names the session, and return it.
+
+        Only the log after offset counts, so that an earlier case is not read again.
+        """
+        found = []
+
+        def look():
+            found[:] = [line for line in self.log()[offset:].splitlines()
+                        if line.split(" ", 1)[1].startswith("looked for forks of ")
+                        and session_id in line]
+            return bool(found)
+
+        self.until(look, what="the first look for forks")
+        return found[0]
+
+    def fork_between_the_looks(self, pid, session_id, offset, *arguments):
+        """Start a fork with these arguments between the two looks of process pid.
+
+        Return the fork, or None when pid could not be frozen within a window of its
+        first look; pid then goes on as if the test had not touched it.
+        """
+        line = self.first_look(session_id, offset)
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            return None
+        # A process left frozen by a failed check would hold the cleanup up.
+        self.addCleanup(self.resume, pid)
+        # A process that has already exited is a zombie until its parent reaps it, and
+        # never stops.
+        self.until(lambda: process_state(pid) in ("T", "t", "Z", "X", None),
+                   seconds=self.look_bound(), what=f"the stop of pid {pid}")
+        # The line's time is cut to the second, so it is at or before the write, and
+        # the process began its wait for the second look only after the write.
+        written = datetime.datetime.fromisoformat(line.split(" ", 1)[0]).timestamp()
+        in_time = process_state(pid) in ("T", "t") \
+            and time.time() - written < float(self.fork_window)
+        fork = self.process(*[argument.format(session_id) for argument in arguments]) \
+            if in_time else None
+        self.resume(pid)
+        return fork
+
+    def resume(self, pid):
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+
+    def too_slow(self):
+        self.fail(f"the host never let the test freeze the process within the window of "
+                  f"{self.fork_window} s in {self.attempts} tries; log:\n{self.log()}")
 
     def stop_in_background(self):
         stop = subprocess.Popen([ORCH, PROJECT, "stop"], env=self.base_env(),
@@ -1173,46 +1243,65 @@ class TestForksWhenTheLoopEnds(ForkTestCase):
         # The loop is stopped while it runs. A fork of its last session starts only
         # after the loop's first look; the loop's second look, a window later, still
         # ends it, and stop waits for that before it returns.
-        self.start()
-        old = self.first_id()
-        stop = self.stop_in_background()
-        self.first_look(old)
-        fork = self.process("--resume", old)
-        out, err = stop.communicate(timeout=60)
-        self.assertEqual(stop.returncode, 0, err)
-        self.assertIn("jig orch: stopped the loop", out)
-        self.assert_ended(fork, old)
+        for _ in range(self.attempts):
+            offset = len(self.log())
+            self.start()
+            old = self.session_ids()[-1]
+            loop = self.loop_pid()
+            stop = self.stop_in_background()
+            fork = self.fork_between_the_looks(loop, old, offset, "--resume", "{}")
+            out, err = stop.communicate(timeout=60)
+            self.assertEqual(stop.returncode, 0, err)
+            self.assertIn("jig orch: stopped the loop", out)
+            if fork:
+                break
+        else:
+            self.too_slow()
+        self.assert_ended(fork, old, self.look_bound())
         self.assertIn(f"looked again for forks of Claude Code session {old}\n", self.log())
 
     def test_third_quick_exit_ends_a_fork_that_shows_up_after_the_first_look(self):
         # Each Claude Code exits at once, so the loop stops at the third exit. A fork
         # of the third session that starts after the first look is ended by the second.
         (self.home / "claude-exit-now").write_text("", encoding="utf-8")
-        self.orch("start")
-        self.until(lambda: len(self.calls()) == 3, what="the third start")
-        last = self.session_ids()[2]
-        self.first_look(last)
-        fork = self.process("--fork-session", "--resume", f"/tmp/x/{last}.jsonl")
-        self.until(lambda: not self.loop_runs(), what="the end of the loop")
-        self.assert_ended(fork, last)
+        for _ in range(self.attempts):
+            offset, calls = len(self.log()), len(self.calls())
+            self.orch("start")
+            self.until(lambda: len(self.calls()) == calls + 3, what="the third start")
+            last = self.session_ids()[calls + 2]
+            fork = self.fork_between_the_looks(self.loop_pid(), last, offset,
+                                               "--fork-session", "--resume",
+                                               "/tmp/x/{}.jsonl")
+            self.until(lambda: not self.loop_runs(), seconds=self.look_bound(),
+                       what="the end of the loop")
+            if fork:
+                break
+        else:
+            self.too_slow()
+        self.assert_ended(fork, last, self.look_bound())
 
     def test_stop_of_a_dead_loop_ends_claude_and_a_fork_that_shows_up_later(self):
         # The loop died, so Claude Code still runs and no loop will look for forks.
         # Stop ends Claude Code and takes both looks itself; a fork that starts after
         # the first look is ended by the second.
-        self.start()
-        old = self.first_id()
-        os.kill(self.loop_pid(), signal.SIGKILL)
-        self.until(lambda: not self.loop_runs(), what="the end of the killed loop")
-        stop = self.stop_in_background()
-        self.first_look(old)
-        fork = self.process("--resume", old)
-        out, err = stop.communicate(timeout=60)
-        self.assertEqual(stop.returncode, 0, err)
-        self.assertIn(f"looking for forks of Claude Code session {old} for 4 s", out)
-        self.assertIn("jig orch: no loop runs", out)
-        self.assertTrue(self.pane()["dead"])
-        self.assert_ended(fork, old)
+        for _ in range(self.attempts):
+            offset = len(self.log())
+            self.start()
+            old = self.session_ids()[-1]
+            os.kill(self.loop_pid(), signal.SIGKILL)
+            self.until(lambda: not self.loop_runs(), what="the end of the killed loop")
+            stop = self.stop_in_background()
+            fork = self.fork_between_the_looks(stop.pid, old, offset, "--resume", "{}")
+            out, err = stop.communicate(timeout=60)
+            self.assertEqual(stop.returncode, 0, err)
+            self.assertIn(f"looking for forks of Claude Code session {old} for 4 s", out)
+            self.assertIn("jig orch: no loop runs", out)
+            self.assertTrue(self.pane()["dead"])
+            if fork:
+                break
+        else:
+            self.too_slow()
+        self.assert_ended(fork, old, self.look_bound())
 
 
 class TestResumes(unittest.TestCase):
