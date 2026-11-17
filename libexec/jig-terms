@@ -40,13 +40,16 @@ it adds, and not for a match that the product already holds:
   --staged <work tree> reads only what the next commit of that work tree adds
     against HEAD: each line that the staged diff adds, where a changed line counts
     as removed and added, and each staged path that HEAD does not hold, as a commit
-    adds, copies or renames it. The diff finds renames at git's default threshold,
-    whatever the git config says, so a file that is only moved adds no line, and
-    only its new path is read. A file that the diff shows as binary is read whole
-    when the commit adds or changes it. Before the first commit, every staged line
-    and path counts. git reads the index that GIT_INDEX_FILE names when it is set,
-    as git sets it for a hook during git commit -a or git commit <path>, so the
-    check reads what that commit takes.
+    adds, copies or renames it. In such a path, a match that lies wholly in the
+    leading directories that HEAD already holds as directories does not count; a
+    new directory or a new file name does. The diff finds renames at git's default
+    threshold, whatever the git config says, so a file that is only moved adds no
+    line, and only its new path is read. A path whose type changes, as a file that
+    becomes a symbolic link, adds every line of its new content. A file that the
+    diff shows as binary is read whole when the commit adds or changes it. Before
+    the first commit, every staged line and path counts. git reads the index that
+    GIT_INDEX_FILE names when it is set, as git sets it for a hook during git
+    commit -a or git commit <path>, so the check reads what that commit takes.
   --message <file> reads every line of a commit message file, comment lines too.
 With either option, the product clone, the commit messages and <directory> are not
 read. A match in the staged tree prints as above, with the line number in the
@@ -209,11 +212,16 @@ def masked(text, finders):
     return "".join(pieces)
 
 
-def path_matches(shown, path, finders):
-    """Return the output lines for the private values in a path itself."""
+def path_matches(shown, path, finders, held=0):
+    """Return the output lines for the private values in a path itself.
+
+    A match that ends within the first held characters of the path is left out:
+    that part names directories that HEAD already holds.
+    """
     labels = set()
     for finder in finders:
-        labels.update((rank, label) for _, _, rank, label in finder.spans(path))
+        labels.update((rank, label) for _, end, rank, label in finder.spans(path)
+                      if end > held)
     return [f"{shown}: {label} in the path" for _, label in sorted(labels)]
 
 
@@ -377,16 +385,42 @@ def staged_base(root):
 # that the git config could change: an external diff or a text conversion would hide
 # the real lines, colour codes would break the parse, a path relative to a folder
 # would name a file wrongly, and the renames are found as git finds them by default,
-# also when the config turns rename detection off or to copies.
+# also when the config turns rename detection off or to copies. A submodule is shown
+# in the short form, one section that names its commit, as git does by default: the
+# log form has no header line, and the diff form has one for each file inside the
+# submodule, so either would break the count of sections. A submodule is shown also
+# when the config or .gitmodules says to ignore it, since a new one would otherwise
+# hide a match in its path. The rename limit is not fixed, because no one value is
+# right for every version of git. A config that lowers it makes git miss the rename
+# of an edited file, which then shows as a new file with its old matches: the commit
+# is refused, and no match is let through.
 DIFF_OPTIONS = ("diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv",
-                "--no-relative", "--find-renames")
+                "--no-relative", "--find-renames", "--submodule=short",
+                "--ignore-submodules=none")
 # A gitlink, the entry of a submodule, has no lines of its own in this repository.
 GITLINK = "160000"
+# The bits of a git mode that give the type of the entry: file, link or gitlink.
+MODE_TYPE = 0o170000
+ABSENT = "000000"
 HUNK = re.compile(r"@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@")
 
 
+def section_count(old_mode, new_mode):
+    """Return how many sections the patch of one entry of the raw diff has.
+
+    git shows a path whose type changes, as a file that becomes a link or a
+    submodule, as one entry of the raw diff but as two sections of the patch: the
+    old content deleted, then the new content created.
+    """
+    if ABSENT in (old_mode, new_mode):
+        return 1
+    if int(old_mode, 8) & MODE_TYPE == int(new_mode, 8) & MODE_TYPE:
+        return 1
+    return 2
+
+
 def staged_entries(root, base):
-    """Return (status, path, new mode, new object) for each file the commit changes.
+    """Return (status, path, new mode, new object, sections) for each changed file.
 
     The raw diff with -z gives each entry as a line of modes, objects and a status,
     then one path, or two for a rename or a copy, of which the second is the new one.
@@ -401,17 +435,20 @@ def staged_entries(root, base):
         meta = fields[index].lstrip(":").split()
         status = meta[4][:1]
         paths = 2 if status in ("R", "C") else 1
-        entries.append((status, fields[index + paths], meta[1], meta[3]))
+        entries.append((status, fields[index + paths], meta[1], meta[3],
+                        section_count(meta[0], meta[1])))
         index += 1 + paths
     return entries
 
 
-def staged_patches(root, base, count):
+def staged_patches(root, base, entries):
     """Return, for each entry of the raw diff in its order, the lines of its patch.
 
-    Every entry has one section that starts with a line "diff --git ", and no line
-    inside a section starts so, since each line of a hunk starts with a sign or a
-    space. No context is asked for, so a hunk holds only removed and added lines.
+    Each section of the patch starts with a line "diff --git ", and no line inside a
+    section starts so, since each line of a hunk starts with a sign or a space. No
+    context is asked for, so a hunk holds only removed and added lines. Of an entry
+    with two sections, the second is returned: it creates the new content whole, so
+    each of its lines is one that the commit adds.
     """
     result = git(root, *DIFF_OPTIONS, "--patch", "--unified=0", "--inter-hunk-context=0",
                  base)
@@ -423,10 +460,16 @@ def staged_patches(root, base, count):
             sections.append([])
         elif sections:
             sections[-1].append(line)
+    count = sum(entry[4] for entry in entries)
     if len(sections) != count:
-        raise Failed(f"the staged diff of {root} has {len(sections)} file sections "
-                     f"for {count} files")
-    return sections
+        raise Failed(f"the staged diff of {root} has {len(sections)} file sections, "
+                     f"not the {count} that its {len(entries)} files give")
+    chosen = []
+    end = 0
+    for entry in entries:
+        end += entry[4]
+        chosen.append(sections[end - 1])
+    return chosen
 
 
 def added_lines(section):
@@ -473,20 +516,53 @@ def staged_blob(root, name, obj):
     return decode(result.stdout)
 
 
+def head_directories(root):
+    """Return the set of paths that HEAD holds as directories."""
+    result = git(root, "ls-tree", "-r", "-t", "-z", "HEAD")
+    if result.returncode != 0:
+        raise Failed(f"git ls-tree failed in {root}")
+    directories = set()
+    for record in decode(result.stdout).split("\0"):
+        meta, _, path = record.partition("\t")
+        if meta.split()[1:2] == ["tree"]:
+            directories.add(path)
+    return directories
+
+
+def held_length(name, directories):
+    """Return the length of the leading directories of name that are in directories.
+
+    A new file in a directory that HEAD holds does not add that directory, so a
+    match in the name of the directory is not new. A directory that the commit
+    creates is new, and so is every directory below it.
+    """
+    parts = name.split("/")
+    held = 0
+    for depth in range(1, len(parts)):
+        leading = "/".join(parts[:depth])
+        if leading not in directories:
+            break
+        held = len(leading)
+    return held
+
+
 def staged(project, work_tree, finders):
     """Print and count the matches that the next commit of the work tree adds."""
     root = work_tree_root(work_tree)
     base = staged_base(root)
     entries = staged_entries(root, base)
+    directories = None
     count = 0
-    for (status, name, mode, obj), section in zip(entries,
-                                                  staged_patches(root, base, len(entries))):
+    for (status, name, mode, obj, _), section in zip(entries,
+                                                     staged_patches(root, base, entries)):
         if status == "D":
             continue
         shown = masked(f"{project}/{name}", finders)
         lines = []
         if status in ("A", "C", "R"):
-            lines += path_matches(shown, name, finders)
+            if directories is None:
+                directories = head_directories(root) if base == "HEAD" else set()
+            lines += path_matches(shown, name, finders, held_length(name, directories))
         if mode != GITLINK:
             binary, added = added_lines(section)
             if binary:

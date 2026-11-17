@@ -1281,6 +1281,42 @@ class StartHookTest(StartCase):
         self.assertEqual(self.exclude_bytes(), exclude)
         self.assertEqual(self.ok(["git", "-C", self.product, "status", "--porcelain"]), "")
 
+    def track_marked_msg_hook(self):
+        """Commit a hooks/commit-msg that carries jig's marker on its second line and
+        the product's own lines below it, with core.hooksPath at hooks."""
+        self.use_hooks_path().parent.mkdir()
+        hook = self.product / "hooks" / "commit-msg"
+        hook.write_text("#!/bin/sh\n# jig commit-msg hook\n# kept by the product\nexit 0\n",
+                        encoding="utf-8")
+        hook.chmod(0o755)
+        self.git_commit_all(self.product)
+        return hook
+
+    def assert_tracked_msg_hook_kept(self, hook, text):
+        self.assertEqual(hook.read_bytes(), text)
+        self.assertNotIn("/hooks/commit-msg", self.exclude_lines())
+        self.assertEqual(self.ok(["git", "-C", self.product, "status", "--porcelain"]), "")
+
+    def test_start_keeps_a_tracked_commit_msg_hook_with_the_marker_on_a_line_with_the_row(self):
+        # The product tracks a commit-msg hook whose second line is jig's marker. The
+        # marker alone would let jig start write its own hook there; the file belongs
+        # to the product, so it stays byte for byte, with no exclude line for it.
+        hook = self.track_marked_msg_hook()
+        text = hook.read_bytes()
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_tracked_msg_hook_kept(hook, text)
+
+    def test_start_keeps_a_tracked_commit_msg_hook_with_the_marker_on_a_line_without_the_row(self):
+        # The same tracked file on a line with no row terms: jig start would remove a
+        # hook with the marker there, but it leaves the product's file in place.
+        self.set_terms_row(False)
+        hook = self.track_marked_msg_hook()
+        text = hook.read_bytes()
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_tracked_msg_hook_kept(hook, text)
+
     def track_hooks_dir(self):
         """Commit a file under hooks/ other than pre-commit, as a product with its own
         hooks directory has, and set no core.hooksPath."""

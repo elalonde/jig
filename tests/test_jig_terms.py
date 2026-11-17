@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from tests.support import ROOT, TempTestCase, run
 
@@ -271,6 +272,119 @@ class TermsAddedTest(TermsCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.git("mv", "kept.txt", f"{SECOND}.txt")
         self.assert_found(self.staged(), [f"demo/***.txt: {SECOND_LINE} in the path"])
+
+    def link(self, name, target):
+        """Make name in the product a symbolic link to target, in place of a file."""
+        path = self.product / name
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        path.symlink_to(target)
+
+    def unlinked_write(self, name, text):
+        """Put a file at name in place of a link, never writing through the link."""
+        (self.product / name).unlink()
+        self.write(self.product, {name: text})
+
+    def nested_repository(self, name):
+        """Make a repository with two files and one commit at name in the product.
+
+        Staging it adds a gitlink, the entry of a submodule. Two files make a diff of
+        its own content show two file sections for that one entry.
+        """
+        path = self.product / name
+        if path.is_file():
+            path.unlink()
+        inner = self.git_init(path)
+        self.write(inner, {"a.txt": "inside\n", "b.txt": "also inside\n"})
+        self.git_commit_all(inner)
+
+    def stage_all(self):
+        self.git("-c", "advice.addEmbeddedRepo=false", "add", "-A")
+
+    def test_a_type_change_that_adds_no_match_passes(self):
+        # HEAD holds a link and a plain file beside old.txt, which holds a term. The
+        # commit makes old.txt a link, the link a file and the plain file a submodule,
+        # all with clean contents: the old term is only deleted, so nothing counts.
+        self.commit("Add a link and a module", {"module": "a placeholder\n"})
+        self.link("pointer", "README.md")
+        self.commit("Add the link", {"README.md": "A tool.\n"})
+        self.link("old.txt", "README.md")
+        self.unlinked_write("pointer", "plain text\n")
+        self.nested_repository("module")
+        self.stage_all()
+        result = self.staged()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_type_change_that_adds_a_match_is_refused_with_its_place(self):
+        # The new content of each changed type holds a term: the target of a link, a
+        # file in place of a link, a file in place of a submodule. A file after them
+        # adds one too, so a section paired with the wrong file would show.
+        self.link("pointer", "README.md")
+        self.nested_repository("module")
+        self.write(self.product, {"zeta.txt": "plain\n"})
+        self.stage_all()
+        self.git("commit", "-q", "--no-verify", "-m", "Add a link and a module")
+        self.link("old.txt", f"notes/{SECOND}")
+        self.unlinked_write("pointer", f"plain\n{SECOND}\n")
+        shutil.rmtree(self.product / "module")
+        self.write(self.product, {"module": f"one\n{FIRST}\n",
+                                  "zeta.txt": f"{SECOND}\nplain\n"})
+        self.stage_all()
+        self.assert_found(self.staged(), ["demo/module:2: " + FIRST_LINE,
+                                          "demo/old.txt:1: " + SECOND_LINE,
+                                          "demo/pointer:2: " + SECOND_LINE,
+                                          "demo/zeta.txt:1: " + SECOND_LINE])
+
+    def test_the_submodule_form_of_the_config_does_not_change_the_result(self):
+        # A new submodule and a new file with a term are staged. With the config's
+        # log form a submodule has no file section, and with its diff form it has one
+        # for each of its files; in each case the check finds the one match.
+        self.nested_repository("lib/inner")
+        self.write(self.product, {"zeta.txt": f"plain\n{SECOND}\n"})
+        self.stage_all()
+        for form in ("short", "log", "diff"):
+            with self.subTest(form=form):
+                self.git("config", "diff.submodule", form)
+                self.assert_found(self.staged(), ["demo/zeta.txt:2: " + SECOND_LINE])
+
+    def test_a_new_submodule_that_the_config_ignores_still_counts_its_path(self):
+        # The config tells git diff to leave out every submodule, which would hide
+        # a new one whose path holds a term.
+        self.git("config", "diff.ignoreSubmodules", "all")
+        self.nested_repository(f"{SECOND}-module")
+        self.stage_all()
+        self.assert_found(self.staged(), [f"demo/***-module: {SECOND_LINE} in the path"])
+
+    def test_a_term_in_a_directory_that_head_holds_does_not_count_in_a_new_path(self):
+        # HEAD holds the directory docs/<second term>. A new file in it and in a new
+        # directory below it pass, and so does a file moved into it, since their only
+        # match is in that old directory's name.
+        self.commit("Add notes", {f"docs/{SECOND}/a.txt": "notes\n"})
+        self.write(self.product, {f"docs/{SECOND}/b.txt": "more notes\n",
+                                  f"docs/{SECOND}/deeper/c.txt": "deeper notes\n"})
+        self.git("mv", "old.txt", f"docs/{SECOND}/old.txt")
+        self.stage_all()
+        result = self.staged()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_new_directory_whose_name_holds_a_term_is_refused(self):
+        # HEAD holds docs/<second term>, but not the longer directory name that starts
+        # with it, nor a directory with the first term below the old one: both are new.
+        self.commit("Add notes", {f"docs/{SECOND}/a.txt": "notes\n"})
+        self.write(self.product, {f"docs/{SECOND}x/c.txt": "notes\n",
+                                  f"docs/{SECOND}/{FIRST}-dir/d.txt": "notes\n"})
+        self.stage_all()
+        self.assert_found(self.staged(),
+                          [f"demo/docs/***/***-dir/d.txt: {FIRST_LINE} in the path",
+                           f"demo/docs/***x/c.txt: {SECOND_LINE} in the path"])
+
+    def test_a_renamed_file_whose_new_name_holds_a_term_is_refused(self):
+        # The file stays in a directory that HEAD holds, under a new name with a term.
+        self.commit("Add notes", {"docs/a.txt": "notes\n"})
+        self.git("mv", "docs/a.txt", f"docs/{SECOND}.txt")
+        self.assert_found(self.staged(), [f"demo/docs/***.txt: {SECOND_LINE} in the path"])
 
     def test_a_binary_file_that_the_commit_changes_is_read_whole(self):
         # git shows the file as binary, so its changed lines are not known: the whole
