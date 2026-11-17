@@ -5,6 +5,8 @@ that runs the tests. The kickoff records are text, with fixture homes for the ac
 """
 
 import contextlib
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -188,6 +190,188 @@ class TrustMarkTest(TrustMarkCase):
         self.assertEqual(len(lines), 2)
         self.assertIn(f"{self.state} of implementer", lines[0])
         self.assertEqual(lines[1], "trust implementer: not marked")
+
+
+class TrustMarkAllTest(TrustMarkCase):
+    """The marks of one start: the -dev clone and two added folders, in one write.
+
+    A Claude Code session writes the whole file from its own read, so a write of the
+    file by the step can lose a write of a session. These tests stand in for such a
+    session by changing the file while the step runs.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.added = [str(self.tmp / "notes"), str(self.tmp / "data")]
+        self.folders = [self.folder, *self.added]
+
+    def mark_all(self):
+        return jig_trust.mark_all([(folder, jig_trust.TRUST_KEY) for folder in self.folders],
+                                  "implementer", home=self.home)
+
+    def counting(self, name, calls, then=None):
+        """Patch a function of the module so that each call is counted, then runs then."""
+        real = getattr(jig_trust, name) if name != "replace" else os.replace
+
+        def wrapper(*args):
+            result = real(*args)
+            calls.append(name)
+            if then:
+                then(len([call for call in calls if call == name]))
+            return result
+
+        if name == "replace":
+            return mock.patch.object(jig_trust.os, "replace", wrapper)
+        return mock.patch.object(jig_trust, name, wrapper)
+
+    def session_writes(self, key):
+        """Write the file as a session would: from a read, with one more key."""
+        state = self.read()
+        state[key] = True
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_one_start_writes_the_file_once_for_all_its_marks(self):
+        self.write({"theme": "dark"})
+        calls = []
+        with self.counting("replace", calls):
+            results = self.mark_all()
+        self.assertEqual(results, [(folder, "trusted", None) for folder in self.folders])
+        self.assertEqual(calls, ["replace"])
+        self.assertEqual(self.read(), {"theme": "dark", "projects": {
+            folder: {"hasTrustDialogAccepted": True} for folder in self.folders}})
+
+    def test_a_change_after_the_read_and_before_the_check_is_kept_with_the_marks(self):
+        # The session writes just after the new file is made: the check before the
+        # rename sees it, so the step reads the file again and keeps the session's key.
+        self.write({"theme": "dark"})
+        calls = []
+
+        def write_once(count):
+            if count == 1:
+                self.session_writes("sessionKey")
+
+        with self.counting("make_new_file", calls, write_once), \
+                self.counting("replace", calls):
+            results = self.mark_all()
+        self.assertEqual(results, [(folder, "trusted", None) for folder in self.folders])
+        self.assertEqual(calls, ["make_new_file", "make_new_file", "replace"])
+        state = self.read()
+        self.assertIs(state["sessionKey"], True)
+        self.assertEqual(state["projects"], {
+            folder: {"hasTrustDialogAccepted": True} for folder in self.folders})
+        self.assertEqual(sorted(path.name for path in self.home.iterdir()), [".claude.json"])
+
+    def test_a_change_at_both_checks_gives_one_more_read_and_then_the_rename(self):
+        # The session writes after each new file: the step reads once more, and then
+        # renames all the same. The first write is kept, the second one is lost.
+        self.write({"theme": "dark"})
+        calls = []
+
+        def write_each(count):
+            self.session_writes(f"sessionKey{count}")
+
+        with self.counting("load", calls), self.counting("make_new_file", calls, write_each), \
+                self.counting("replace", calls):
+            results = self.mark_all()
+        self.assertEqual(results, [(folder, "trusted", None) for folder in self.folders])
+        # The two reads before the rename, and the read after it.
+        self.assertEqual(calls, ["load", "make_new_file", "load", "make_new_file", "replace",
+                                 "load"])
+        state = self.read()
+        self.assertIs(state["sessionKey1"], True)
+        self.assertNotIn("sessionKey2", state)
+        self.assertEqual(len(state["projects"]), 3)
+
+    def test_every_mark_there_writes_nothing(self):
+        self.write({"projects": {folder: {"hasTrustDialogAccepted": True}
+                                 for folder in self.folders}})
+        before = os.stat(self.state)
+        calls = []
+        with self.counting("make_new_file", calls):
+            results = self.mark_all()
+        self.assertEqual(results, [(folder, "kept", None) for folder in self.folders])
+        self.assertEqual(calls, [])
+        after = os.stat(self.state)
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+
+    def test_an_entry_that_is_not_an_object_leaves_the_file_and_names_each_folder(self):
+        # The -dev clone's mark is there; the first added folder's entry is unusable, so
+        # nothing is written and both added folders are reported as not marked.
+        self.write({"projects": {self.folder: {"hasTrustDialogAccepted": True},
+                                 self.added[0]: True}})
+        before = self.state.read_bytes()
+        results = self.mark_all()
+        self.assertEqual([value for _, value, _ in results], ["kept", "not marked", "not marked"])
+        for _, _, problem in results[1:]:
+            self.assertIn(f"{self.state} of implementer", problem)
+            self.assertIn(f"the entry of {self.added[0]} is not an object", problem)
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_the_worker_of_jig_start_marks_its_folders_with_one_write(self):
+        # The worker part runs this module's text in the worker's account; its lines
+        # name each folder whose mark it set.
+        self.write({"theme": "dark"})
+        worker = load_worker()
+        out = io.StringIO()
+        calls = []
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                self.counting("replace", calls), contextlib.redirect_stdout(out):
+            worker.set_trust_marks("implementer", self.folder, self.added)
+        self.assertEqual(calls, ["replace"])
+        self.assertEqual(out.getvalue().splitlines(),
+                         [f"trust implementer {folder}: trusted" for folder in self.folders])
+
+
+class RemoveEntriesTest(TrustMarkCase):
+    """The removal of entries of "projects", by the same one read and one rename."""
+
+    def remove(self, prefix):
+        return jig_trust.remove_entries(lambda name: name.startswith(prefix), "implementer",
+                                        home=self.home)
+
+    def test_the_selected_entries_go_and_every_other_key_stays(self):
+        gone = [str(self.tmp / "run" / "a"), str(self.tmp / "run" / "b")]
+        self.write({"theme": "dark", "projects": {
+            self.folder: {"hasTrustDialogAccepted": True},
+            **{folder: {"hasTrustDialogAccepted": True} for folder in gone}}})
+        calls = []
+        real_replace = os.replace
+
+        def replace(source, target):
+            calls.append("replace")
+            real_replace(source, target)
+
+        with mock.patch.object(jig_trust.os, "replace", replace):
+            removed, problem = self.remove(str(self.tmp / "run"))
+        self.assertEqual((sorted(removed), problem), (gone, None))
+        self.assertEqual(calls, ["replace"])
+        self.assertEqual(self.read(), {"theme": "dark", "projects": {
+            self.folder: {"hasTrustDialogAccepted": True}}})
+
+    def test_nothing_to_remove_writes_nothing(self):
+        self.write({"projects": {self.folder: {}}})
+        before = os.stat(self.state)
+        self.assertEqual(self.remove(str(self.tmp / "run")), ([], None))
+        after = os.stat(self.state)
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+
+    def test_a_file_that_is_not_json_is_left_with_one_line(self):
+        self.write("{oops")
+        removed, problem = self.remove(str(self.tmp))
+        self.assertEqual(removed, [])
+        self.assertIn(f"{self.state} of implementer: it is not JSON", problem)
+        self.assertEqual(len(problem.splitlines()), 1)
+        self.assertEqual(self.state.read_text(encoding="utf-8"), "{oops")
+
+
+def load_worker():
+    """Load the worker part of jig start, which has no .py name, as a module."""
+    loader = importlib.machinery.SourceFileLoader("jig_start_worker_under_test",
+                                                  str(ROOT / "libexec" / "jig-start-worker"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,
+                                                                             loader))
+    loader.exec_module(module)
+    return module
 
 
 class DirectoriesCase(unittest.TestCase):

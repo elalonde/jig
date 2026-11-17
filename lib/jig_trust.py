@@ -12,7 +12,10 @@ only that key. It writes a new file beside the old one and renames it into
 place, so that no reader ever sees half a file, and reads it again
 after the rename: Claude Code takes no lock on the file, and a session
 that saves an older copy can drop the mark again. The step runs as the
-account whose file it is, so that the file keeps its owner.
+account whose file it is, so that the file keeps its owner. A start
+sets all of its marks with one read and one rename, and reads the
+status of the file again before the rename, in update; the same
+step removes the entries of folders that a test run made.
 
 jig start and the supervisor run this module in the account itself: jig
 start sends its text to a worker that imports nothing from jig's tree, and
@@ -47,39 +50,76 @@ class Unusable(Exception):
     """The file cannot take the mark; the message says why."""
 
 
+def file_status(info):
+    """Return what tells two versions of the file apart.
+
+    Claude Code replaces the file or writes it in place, so a write by a
+    session changes the inode, the size or the modification time.
+    """
+    return info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def status_of(path):
+    """Return the status of the file at path, or None if missing."""
+    try:
+        return file_status(os.stat(path))
+    except FileNotFoundError:
+        return None
+
+
+def load(path):
+    """Return the state in the file and the status of the file it read.
+
+    A missing file gives an empty state and the status None. The status
+    comes from the open file, so that it belongs to the text that was
+    read even when the file is replaced during the read.
+    """
+    try:
+        with open(path, encoding="utf-8") as stream:
+            status = file_status(os.fstat(stream.fileno()))
+            text = stream.read()
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, UnicodeDecodeError) as error:
+        raise Unusable(f"cannot read it: {error}") from None
+    try:
+        state = json.loads(text)
+    except ValueError:
+        raise Unusable("it is not JSON") from None
+    if not isinstance(state, dict):
+        raise Unusable("its top level is not an object")
+    return state, status
+
+
+def projects_of(state):
+    """Return the object "projects" of the state, made when missing."""
+    projects = state.setdefault(PROJECTS, {})
+    if not isinstance(projects, dict):
+        raise Unusable(f'its value of "{PROJECTS}" is not an object')
+    return projects
+
+
+def entry_of(state, folder):
+    """Return the entry of a folder in the state, made when missing."""
+    entry = projects_of(state).setdefault(folder, {})
+    if not isinstance(entry, dict):
+        raise Unusable(f"the entry of {folder} is not an object")
+    return entry
+
+
 def read_state(path, folder, key):
     """Return the state, the entry of the folder and whether it is marked.
 
     A missing file, key "projects" or entry comes back as an empty object
     that the caller fills in.
     """
-    try:
-        with open(path, encoding="utf-8") as stream:
-            text = stream.read()
-    except FileNotFoundError:
-        text = None
-    except (OSError, UnicodeDecodeError) as error:
-        raise Unusable(f"cannot read it: {error}") from None
-    if text is None:
-        state = {}
-    else:
-        try:
-            state = json.loads(text)
-        except ValueError:
-            raise Unusable("it is not JSON") from None
-    if not isinstance(state, dict):
-        raise Unusable("its top level is not an object")
-    projects = state.setdefault(PROJECTS, {})
-    if not isinstance(projects, dict):
-        raise Unusable(f'its value of "{PROJECTS}" is not an object')
-    entry = projects.setdefault(folder, {})
-    if not isinstance(entry, dict):
-        raise Unusable(f"the entry of {folder} is not an object")
+    state = load(path)[0]
+    entry = entry_of(state, folder)
     return state, entry, entry.get(key) is True
 
 
-def write_state(path, state):
-    """Put the state in place of the file at path by a rename.
+def make_new_file(path, state):
+    """Write the state to a new file beside path; return its name.
 
     The new file has the mode of the old one, or 600 for a file that did
     not exist, since the file holds the account's own settings. A file
@@ -110,13 +150,66 @@ def write_state(path, state):
             # holds the whole Claude Code state of the account.
             stream.flush()
             os.fsync(stream.fileno())
+    except BaseException:
+        discard(temporary)
+        raise
+    return temporary
+
+
+def discard(temporary):
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+
+
+def put_in_place(temporary, path):
+    """Rename the new file over the old one; remove it when that fails."""
+    try:
         os.replace(temporary, path)
     except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
+        discard(temporary)
         raise
+
+
+def write_state(path, state):
+    """Put the state in place of the file at path by a rename."""
+    put_in_place(make_new_file(path, state), path)
+
+
+def update(path, change):
+    """Change the file with one read and one rename; say if it wrote.
+
+    change(state) changes the state in place and returns whether the
+    file needs a write. Claude Code writes the whole file from its own
+    read and takes no lock, so a write of a session between this read and
+    the rename is lost. To keep that time short, the status of the file
+    is read again just before the rename. When the file changed since
+    the read, it is read, changed and made again, once; when it changed
+    again by then, the new file goes into place all the same, and the
+    read after the rename shows what was lost.
+    """
+    for again in (False, True):
+        state, status = load(path)
+        if not change(state):
+            return False
+        temporary = make_new_file(path, state)
+        if again or status_of(path) == status:
+            put_in_place(temporary, path)
+            return True
+        discard(temporary)
+    return True
+
+
+def locate(home):
+    """Return the file of an account as it is shown and as it is written.
+
+    home is the home of the account, the home of this process when it is
+    None. A link stays a link: the file it names is the one to replace.
+    """
+    home = os.path.expanduser("~") if home is None else str(home)
+    shown = os.path.join(home, STATE_FILE)
+    return shown, os.path.realpath(shown)
 
 
 def mark(folder, account, home=None, key=TRUST_KEY):
@@ -126,14 +219,11 @@ def mark(folder, account, home=None, key=TRUST_KEY):
     step set the mark and read it back, KEPT when the mark was there, and
     NOT_MARKED otherwise; then the problem is one line that names the
     account and the file, and else it is None. The step changes nothing
-    in a file that it cannot use. home is the home of the account, the
-    home of this process when it is None.
+    in a file that it cannot use. jig new and its block set one mark this
+    way; a start sets all of its marks with mark_all.
     """
-    home = os.path.expanduser("~") if home is None else str(home)
     folder = os.path.abspath(os.path.expanduser(folder))
-    shown = os.path.join(home, STATE_FILE)
-    # A link stays a link: the file it names is the one to replace.
-    path = os.path.realpath(shown)
+    shown, path = locate(home)
 
     def problem(reason):
         return (f"jig: cannot set the trust mark of {folder} in {shown} "
@@ -157,6 +247,98 @@ def mark(folder, account, home=None, key=TRUST_KEY):
         return NOT_MARKED, problem(
             "the mark is not there when the file is read again")
     return TRUSTED, None
+
+
+def mark_all(marks, account, home=None):
+    """Set the marks of several folders with one read and one rename.
+
+    marks holds (folder, key) pairs. Return (folder, value, problem) for
+    each pair, with the value and the problem of mark(). A file that the
+    step cannot use, also for one entry, is left as it is. With every
+    mark there, nothing is written.
+    """
+    marks = [(os.path.abspath(os.path.expanduser(folder)), key)
+             for folder, key in marks]
+    shown, path = locate(home)
+    found = set()
+
+    def change(state):
+        found.clear()
+        bad = None
+        for folder, key in marks:
+            try:
+                entry = entry_of(state, folder)
+            except Unusable as error:
+                bad = bad or error
+                continue
+            if entry.get(key) is True:
+                found.add((folder, key))
+            else:
+                entry[key] = True
+        if bad:
+            raise bad
+        return any(pair not in found for pair in marks)
+
+    reason, after = None, set()
+    try:
+        if update(path, change):
+            state = load(path)[0]
+            after = {(folder, key) for folder, key in marks
+                     if entry_of(state, folder).get(key) is True}
+    except Unusable as error:
+        reason = str(error)
+    except OSError as error:
+        reason = f"cannot write it: {error}"
+    results = []
+    for folder, key in marks:
+        if (folder, key) in found:
+            results.append((folder, KEPT, None))
+        elif not reason and (folder, key) in after:
+            results.append((folder, TRUSTED, None))
+        else:
+            why = reason or \
+                "the mark is not there when the file is read again"
+            results.append((folder, NOT_MARKED,
+                            f"jig: cannot set the trust mark of {folder} "
+                            f"in {shown} of {account}: {why}"))
+    return results
+
+
+def remove_entries(select, account, home=None):
+    """Remove the entries of "projects" whose names select accepts.
+
+    The same one read and one rename as for the marks. Return the names
+    that were removed and a problem: None, or one line that names the
+    account and the file. A file that the step cannot use is left as it
+    is.
+    """
+    shown, path = locate(home)
+    removed = []
+
+    def change(state):
+        projects = projects_of(state)
+        removed[:] = [name for name in projects if select(name)]
+        for name in removed:
+            del projects[name]
+        return bool(removed)
+
+    def problem(reason):
+        return (f"jig: cannot remove the entries of folders from {shown} "
+                f"of {account}: {reason}")
+
+    try:
+        if update(path, change):
+            left = [name for name in projects_of(load(path)[0])
+                    if select(name)]
+            if left:
+                return removed, problem(
+                    f"{len(left)} of them are there at the read after "
+                    "the rename")
+    except Unusable as error:
+        return [], problem(error)
+    except OSError as error:
+        return [], problem(f"cannot write it: {error}")
+    return removed, None
 
 
 def main(argv):

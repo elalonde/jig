@@ -771,6 +771,24 @@ class TestSessionFolders(OrchTestCase):
         self.assertEqual(passed, self.role_dirs)
         self.assertEqual(self.marked(), sorted([str(self.clone), *self.role_dirs]))
 
+    def test_prepare_sets_all_marks_of_a_start_with_one_rename(self):
+        # The -dev clone and the role's folders have no mark: one new file goes into
+        # place for all of them, so a session's write can be lost only once.
+        renames = []
+        real_replace = os.replace
+
+        def replace(source, target):
+            renames.append(target)
+            real_replace(source, target)
+
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(os, "replace", replace):
+            orch = self.in_process()
+            passed, refused = orch.prepare(lambda line: None, lambda line: None)
+        self.assertIsNone(refused)
+        self.assertEqual(len(renames), 1)
+        self.assertEqual(self.marked(), sorted([str(self.clone), *passed]))
+
     def test_loop_starts_no_session_at_a_refused_folder_and_logs_it(self):
         # The test before each session the loop starts after an exit: no session, the
         # line in the log, and a result that ends the loop.

@@ -59,7 +59,8 @@ jig cannot read is ignored, with one line on stderr at start and in the log in t
 loop. A folder outside the approved list of the orchestrator account is refused with
 one line: start then starts no loop and no session, and the loop starts no session,
 writes the line to the log and stops. Then the -dev clone and each folder passed get
-the trust mark of Claude Code in ~/.claude.json, by lib/jig_trust.py, with one line
+the trust mark of Claude Code in ~/.claude.json, by lib/jig_trust.py, all in one read
+and one rename of the file, with one line
 "trust <account> <folder>: trusted" or "not marked" for each mark set or not set, on
 stdout at start and in the log in the loop; a mark that is there gives no line.
 
@@ -1080,8 +1081,8 @@ class Orch:
         passed = worker.existing_dirs(candidates)
         marks = [(str(self.clone), jig_trust.TRUST_KEY)]
         marks += [(folder, jig_trust.ADDED_FOLDER_KEY) for folder in passed]
-        for folder, key in marks:
-            value, problem = jig_trust.mark(folder, self.account, key=key)
+        # One read and one rename for all the marks, as jig start does.
+        for folder, value, problem in jig_trust.mark_all(marks, self.account):
             if value == jig_trust.KEPT:
                 continue
             if problem:

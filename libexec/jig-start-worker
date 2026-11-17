@@ -44,7 +44,8 @@ it, and for each folder of --add-dir that it does not know, and the session then
 waits with no output until someone answers. So, before the session starts, the
 launch sets the trust mark of the -dev clone and of each folder it passes in
 ~/.claude.json of this account, by lib/jig_trust.py, which comes as --trust for the
-same reason as the other module. It prints "trust <account> <folder>: trusted" or
+same reason as the other module. One read and one rename of the file set all of
+these marks. It prints "trust <account> <folder>: trusted" or
 "not marked" for each folder whose mark it sets or cannot set, after the line that
 names the file it could not use, and nothing for a mark that is there; none of this
 changes the exit code. A dialog that still comes stops the start: the folder-trust
@@ -445,8 +446,9 @@ def set_trust_marks(account, clone, directories):
     trust = trust_module()
     folders = [(clone, trust["TRUST_KEY"])]
     folders += [(folder, trust["ADDED_FOLDER_KEY"]) for folder in directories]
-    for folder, key in folders:
-        value, problem = trust["mark"](folder, account, key=key)
+    # One read and one rename for all the marks: each write of the file can lose a
+    # write of a running Claude Code session, so a start writes it once.
+    for folder, value, problem in trust["mark_all"](folders, account):
         if value == trust["KEPT"]:
             continue
         if problem:
