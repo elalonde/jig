@@ -307,6 +307,43 @@ class TrustMarkAllTest(TrustMarkCase):
             self.assertIn(f"the entry of {self.added[0]} is not an object", problem)
         self.assertEqual(self.state.read_bytes(), before)
 
+    def test_a_folder_given_twice_is_marked_once_with_one_trusted_result(self):
+        # The -dev clone is also passed as an added folder, and the first added folder
+        # comes once with "~" and a "/" at its end and once as an absolute path. The
+        # file gets each mark with one write, and each folder has one result.
+        self.write({"theme": "dark"})
+        notes = str(self.home / "notes")
+        marks = [(self.folder, jig_trust.TRUST_KEY),
+                 (self.folder, jig_trust.ADDED_FOLDER_KEY),
+                 ("~/notes/", jig_trust.ADDED_FOLDER_KEY),
+                 (notes, jig_trust.ADDED_FOLDER_KEY)]
+        calls = []
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                self.counting("replace", calls):
+            results = jig_trust.mark_all(marks, "implementer", home=self.home)
+        self.assertEqual(results, [(self.folder, "trusted", None), (notes, "trusted", None)])
+        self.assertEqual(calls, ["replace"])
+        self.assertEqual(self.read()["projects"], {
+            self.folder: {"hasTrustDialogAccepted": True},
+            notes: {"hasTrustDialogAccepted": True}})
+
+    def test_the_worker_prints_one_trusted_line_for_a_folder_given_twice(self):
+        # jig start passes the -dev clone again among its added folders, and one added
+        # folder in two forms: each folder gets one line, and its mark is in the file.
+        self.write({"theme": "dark"})
+        notes = str(self.home / "notes")
+        worker = load_worker()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                contextlib.redirect_stdout(out):
+            worker.set_trust_marks("implementer", self.folder, [self.folder, "~/notes/", notes])
+        self.assertEqual(out.getvalue().splitlines(),
+                         [f"trust implementer {self.folder}: trusted",
+                          f"trust implementer {notes}: trusted"])
+        self.assertEqual(self.read()["projects"], {
+            self.folder: {"hasTrustDialogAccepted": True},
+            notes: {"hasTrustDialogAccepted": True}})
+
     def test_the_worker_of_jig_start_marks_its_folders_with_one_write(self):
         # The worker part runs this module's text in the worker's account; its lines
         # name each folder whose mark it set.

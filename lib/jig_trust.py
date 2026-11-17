@@ -253,12 +253,23 @@ def mark_all(marks, account, home=None):
     """Set the marks of several folders with one read and one rename.
 
     marks holds (folder, key) pairs. Return (folder, value, problem) for
-    each pair, with the value and the problem of mark(). A file that the
-    step cannot use, also for one entry, is left as it is. With every
-    mark there, nothing is written.
+    each different pair, in the order of their first place in marks, with
+    the value and the problem of mark(). A file that the step cannot use,
+    also for one entry, is left as it is. With every mark there, nothing
+    is written.
     """
-    marks = [(os.path.abspath(os.path.expanduser(folder)), key)
-             for folder, key in marks]
+    # A folder can come twice: the -dev clone or a folder of the role's
+    # list can also be a folder that the kickoff record adds, once as
+    # "~/..." and once as an absolute path. A pair kept twice would find
+    # its own new mark at its second place and count it as there, so
+    # nothing would be written and the session would stop at the trust
+    # dialog.
+    unique = []
+    for folder, key in marks:
+        pair = (os.path.abspath(os.path.expanduser(folder)), key)
+        if pair not in unique:
+            unique.append(pair)
+    marks = unique
     shown, path = locate(home)
     found = set()
 
