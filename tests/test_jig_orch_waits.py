@@ -307,10 +307,10 @@ class TestStallTime(TempTestCase):
 
 
 class TestQuietLines(OrchTestCase):
-    def test_stall_line_does_not_turn_the_next_hourly_tick_into_an_hourly_update(self):
+    def test_stall_line_is_no_change_for_the_next_hourly_tick(self):
         # A stall line goes from the queue into the event file. The hourly tick after it
-        # finds no change: it writes the idle line and queues no hourly update, and the
-        # line goes into no record of the loop.
+        # finds no change: it writes the idle line and queues nothing, and the line goes
+        # into no record of the loop.
         (self.reviews / "orch").mkdir()
         environment = {"HOME": str(self.home), "JIG_SRV": str(self.srv),
                        "JIG_LOCK_DIR": str(self.tmp / "lock")}

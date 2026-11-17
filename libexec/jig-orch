@@ -121,18 +121,17 @@ yet, the first fetch that works takes the log commits already on origin as annou
 except those whose commit time is at or after the loop's start, so a report that lands
 while the first fetches fail is not lost.
 
-Hourly. Every JIG_ORCH_HOURLY seconds the loop ticks, and each tick does one of two
-things. When something changed since the last tick, the tick queues the event "hourly
-update", which asks the orchestrator to write its update; the queue holds at most one
-such line, so ticks while an append keeps failing add none. When nothing changed, the
-tick does not wake the model: it appends one idle line to impl/orch/updates.log in the
-project's clone, and no event. Something changed when the loop appended an inbox,
-readback or report line to the event file (a line still waiting in the queue, the
-hourly update line itself and the reminders do not count), or when
-refs/jig-orch/<BRANCH> moved and git diff --name-only
-from its last position names a file other than impl/orch/updates.log. The first fetch
-that works only sets that position, as it sets the report record; a failed fetch
-changes nothing. The idle line reads
+Hourly. Every JIG_ORCH_HOURLY seconds the loop ticks. The tick never wakes the model:
+the orchestrator writes its updates when a result changes what Eric expects, not by the
+clock, so the tick appends no event of its own. When something changed since the last
+tick, the tick writes nothing, because the hour was not idle. When nothing changed, it
+appends one idle line to impl/orch/updates.log in the project's clone, so that a quiet
+hour still leaves a mark in the log. Something changed when the loop appended an
+inbox, readback or report line to the event file (a line still waiting in the queue
+and the reminders do not count), or when refs/jig-orch/<BRANCH> moved and git diff
+--name-only from its last position names a file other than impl/orch/updates.log. The
+first fetch that works only sets that position, as it sets the report record; a
+failed fetch changes nothing. The idle line reads
 
   <date -Iseconds> idle: waits for <what> since <time>
 
@@ -254,15 +253,14 @@ SRV_ROOT = "/srv/jig"
 POLL_SECONDS = 5.0
 REPORT_POLL_SECONDS = 60.0
 HOURLY_SECONDS = 3600.0
-HOURLY_LINE = "hourly update"
 # The event file of the session, under orch/, and the line that the loop appends to it
 # before each start of a session.
 EVENTS_FILE = "events.log"
 START_LINE = re.compile(rb"start \S+")
 # How often the watcher looks for new lines, and whether its parent still runs.
 FOLLOW_SECONDS = 0.2
-# The orchestrator's log of hourly updates in its clone, where the loop also writes idle
-# lines; a commit that changes only this file is not news for the hourly update.
+# The orchestrator's log of its updates in its clone, where the loop also writes idle
+# lines; a commit that changes only this file is no change for the hourly tick.
 UPDATES_LOG = "impl/orch/updates.log"
 STATUS_LOG = "impl/log/status.log"
 # A fetch that hangs on the network is ended after this, so that the next poll tries again.
@@ -1558,11 +1556,11 @@ class Orch:
             self.pending.add(commit)
             self.queue.append((f"report: {unit} {status}", commit))
 
-    # The hourly tick. Something changed since the last tick when the loop appended a
-    # line to the event file, other than the hourly update itself, or when origin got a
-    # commit that changes a file other than the update log. Then the tick wakes the
-    # model with "hourly update"; else the loop writes the idle line itself, so that a
-    # quiet hour costs no model time.
+    # The hourly tick. Something changed since the last tick when the loop appended an
+    # inbox, readback or report line to the event file, or when origin got a commit that
+    # changes a file other than the update log. Then the tick writes nothing; else the
+    # loop writes the idle line itself. Neither wakes the model, so that a quiet hour
+    # costs no model time.
 
     def note_change(self):
         self.changed = True
@@ -1578,8 +1576,8 @@ class Orch:
         if old is None:
             return
         changed = worker.git(self.clone, "diff", "--name-only", "--no-renames", old, head)
-        # When the two cannot be compared, a change is the safer guess: it costs one
-        # hourly update, where a wrong idle line would hide work.
+        # When the two cannot be compared, a change is the safer guess: it costs at most
+        # one missing idle line, where a wrong idle line would hide work.
         if changed.returncode != 0 or any(name != UPDATES_LOG
                                           for name in changed.stdout.splitlines()):
             self.note_change()
@@ -1592,12 +1590,8 @@ class Orch:
         self.remind()
         if self.changed:
             self.changed = False
-            # One hourly update at a time: ticks while an append keeps failing add none.
-            if any(line == HOURLY_LINE for line, _ in self.queue):
-                self.log("hourly: something changed; the hourly update still waits in the queue")
-            else:
-                self.queue.append((HOURLY_LINE, None))
-                self.log("hourly: something changed; queued the hourly update")
+            self.log(f"hourly: something changed since the last tick, at {self.last_change}; "
+                     f"no idle line")
             return
         shown = worker.git(self.clone, "show", f"{self.watch_ref}:{STATUS_LOG}")
         line = (f"{now_text()} idle: waits for "
@@ -1652,8 +1646,8 @@ class Orch:
         """Append the queued events to the event file, oldest first."""
         while self.queue and not self.stopping:
             # The mark of a line is its report commit, the (item, date) pair of a
-            # reminder, the FileMark of an inbox file or readback, QUIET for a stall or
-            # resumed line, or None.
+            # reminder, the FileMark of an inbox file or readback, or QUIET for a stall
+            # or resumed line.
             line, mark = self.queue[0]
             failure = self.append_event(line)
             if failure:
@@ -1669,7 +1663,7 @@ class Orch:
             again = " after a failure" if self.held == line else ""
             self.held = None
             self.log(f"appended{again}: {line}")
-            if line != HOURLY_LINE and not isinstance(mark, (tuple, QuietMark)):
+            if not isinstance(mark, (tuple, QuietMark)):
                 self.note_change()
             # A report commit, a reminder or a file goes into its record only once its
             # line is appended, so that a line that a stop drops while it waits in the

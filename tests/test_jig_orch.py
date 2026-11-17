@@ -1551,7 +1551,7 @@ class TestWatcher(TempTestCase):
         # With two start lines and more, the lines between the last two; with one, the
         # lines before it; with none, nothing; with no file, nothing. Each exits 0.
         self.write("report: a1 OK", "start s1", "inbox: one", "start s2", "readback: b1",
-                   "start s3", "report: a2 OK", "reminder: two", "start s4", "hourly update")
+                   "start s3", "report: a2 OK", "reminder: two", "start s4", "inbox: two")
         self.assertEqual(self.once(), ["report: a2 OK", "reminder: two"])
         self.write("report: a1 OK", "inbox: one", "start s1", "readback: b1")
         self.assertEqual(self.once(), ["report: a1 OK", "inbox: one"])
@@ -1564,9 +1564,9 @@ class TestWatcher(TempTestCase):
         # Two sessions have started; the follow read gives only the lines after the
         # second start line, then nothing more until a line is appended.
         self.write("inbox: one", "start s1", "readback: b1", "start s2", "report: a1 OK",
-                   "hourly update")
+                   "inbox: two")
         watcher = self.follow()
-        self.assertEqual(self.first_lines(watcher, 2), ["report: a1 OK", "hourly update"])
+        self.assertEqual(self.first_lines(watcher, 2), ["report: a1 OK", "inbox: two"])
         self.assertEqual(read_line(watcher.stdout, 1), b"")
 
     def test_follow_read_with_one_start_line_and_with_none(self):
@@ -1662,7 +1662,7 @@ def running(pid):
 STAMP = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d"
 # The pattern that counts idle lines in the update log, as a person would count them.
 IDLE_PATTERN = "^[0-9T:+-]* idle: "
-QUEUED = "hourly: something changed"
+CHANGED = "hourly: something changed"
 IDLE = "hourly: nothing changed"
 
 
@@ -1688,7 +1688,8 @@ class HourlyChecks:
         return int(counted.stdout.strip() or 0)
 
     def hourly_lines(self):
-        return [line for line in self.events() if line == "hourly update"]
+        """Return each line of the event file that holds the words "hourly update"."""
+        return [line for line in self.events() if "hourly update" in line]
 
     def ticks(self):
         """Return the log's record of each tick, oldest first."""
@@ -1725,24 +1726,26 @@ class TestHourly(HourlyChecks, OrchTestCase):
         for line in self.log().splitlines():
             self.assertRegex(line, rf"^{STAMP} ")
 
-    def test_inbox_line_before_a_tick_gives_one_hourly_update_and_no_idle_line(self):
+    def test_inbox_line_before_a_tick_gives_no_idle_line_and_no_hourly_update(self):
         # An inbox line goes into the event file between two ticks. The next tick
-        # appends "hourly update" and writes no idle line; the ticks after it, with
-        # nothing new, write idle lines again, since the time of that inbox line, and
-        # append no event.
+        # writes no idle line and appends no event; the ticks after it, with nothing
+        # new, write idle lines again, since the time of that inbox line. The event file
+        # holds the inbox line and never a line with "hourly update".
         self.start()
         path = self.srv / "in" / PROJECT / "note.md"
         path.write_text("hello\n", encoding="utf-8")
-        self.until(lambda: self.hourly_lines(), what="the hourly update")
+        self.until(lambda: any(CHANGED in tick for tick in self.ticks()),
+                   what="the tick after the inbox line")
         self.until(lambda: IDLE in self.ticks()[-1], what="a quiet tick after it")
         self.stop_loop()
-        self.assertEqual(self.hourly_lines(), ["hourly update"])
+        self.assertEqual(self.hourly_lines(), [])
+        self.assertIn(self.inbox_line(path), self.events())
         log = self.log().splitlines()
         delivered = next(index for index, line in enumerate(log)
                          if f"appended: {self.inbox_line(path)}" in line)
         after = [line for line in log[delivered:] if " hourly: " in line]
-        self.assertIn(QUEUED, after[0])
-        self.assertEqual(len([tick for tick in self.ticks() if QUEUED in tick]), 1)
+        self.assertIn(CHANGED, after[0])
+        self.assertEqual(len([tick for tick in self.ticks() if CHANGED in tick]), 1)
         self.assertEqual(self.idle_count(), len([tick for tick in self.ticks() if IDLE in tick]))
         # The idle line gives the time of the inbox line, which the log also stamps.
         since = self.read(self.updates()).splitlines()[-1].rsplit(" since ", 1)[1]
@@ -1784,20 +1787,23 @@ class TestHourlyOrigin(HourlyChecks, ReportTestCase):
         self.wait_for_fetch(commit)
         seen = len(self.ticks())
         self.until(lambda: len(self.ticks()) >= seen + 2, what="two ticks after the fetch")
-        self.assertEqual([tick for tick in self.ticks() if QUEUED in tick], [])
+        self.assertEqual([tick for tick in self.ticks() if CHANGED in tick], [])
         self.assertEqual(self.hourly_lines(), [])
 
     def test_pushed_commit_that_changes_another_file_is_a_change(self):
         # A commit that changes a spec reaches origin after the first fetch: the next
-        # tick appends "hourly update".
+        # tick finds the change, so it writes no idle line, and the event file never
+        # gets a line with "hourly update".
         self.start()
         self.wait_for_fetch()
         path = self.writer / "specs" / "spec.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("a new rule\n", encoding="utf-8")
         self.push("spec: a new rule")
-        self.until(lambda: self.hourly_lines() == ["hourly update"], seconds=30,
-                   what="the hourly update")
+        self.until(lambda: any(CHANGED in tick for tick in self.ticks()), seconds=30,
+                   what="the tick that finds the change")
+        self.stop_loop()
+        self.assertEqual(self.hourly_lines(), [])
 
     def test_idle_line_names_the_unit_that_runs(self):
         # On origin, the newest line of the status log starts unit a1, so a quiet tick

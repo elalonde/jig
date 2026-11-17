@@ -212,9 +212,9 @@ the exit code.
   have no record, in this session or in `state.md` and `handoff.md`, of
   having handled it. The supervisor types nothing into this
   session: it appends each event as one line to the event file,
-  `~/ws/reviews/@PROJECT@/orch/events.log` (the line `hourly update`, the
-  `inbox:` and `readback:` lines, the lines `report: <ID> <status>` and the
-  reminders), and the line `start <session ID>` before it starts a session.
+  `~/ws/reviews/@PROJECT@/orch/events.log` (the `inbox:` and `readback:`
+  lines, the lines `report: <ID> <status>` and the reminders), and the line
+  `start <session ID>` before it starts a session.
   The watcher prints each line after the last start line, then each new
   line. Then read, once, the events of the old session, the lines between
   the last two start lines: `jig orch @PROJECT@ events --old`. Act on each

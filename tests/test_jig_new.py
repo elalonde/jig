@@ -376,6 +376,15 @@ class JigNewTest(JigNewCase):
                      "the version."):
             self.assertIn(line, part)
 
+    def test_standing_prompt_lists_the_events_without_an_hourly_update_line(self):
+        # The supervisor appends no "hourly update" event, so the standing prompt lists
+        # the events it does append and names no such line, which the orchestrator would
+        # otherwise wait for.
+        text = " ".join(self.made_text("impl/orch/ORCHESTRATOR.md").split())
+        self.assertIn("(the `inbox:` and `readback:` lines, the lines `report: <ID> <status>` "
+                      "and the reminders)", text)
+        self.assertNotIn("`hourly update`", text)
+
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
         # form of the table that jig tag reads, or the first revision tag is refused.
