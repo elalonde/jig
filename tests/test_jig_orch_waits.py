@@ -9,6 +9,7 @@ a few run jig orch as a command.
 
 import datetime
 import fcntl
+import getpass
 import os
 import pathlib
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 import uuid
 from unittest import mock
@@ -306,6 +308,59 @@ class TestStallTime(TempTestCase):
         self.assertIn("cannot read", problem)
 
 
+class TestStallAccount(OrchTestCase):
+    """The home in which the stall check reads the activity files of other projects."""
+
+    def stall_lines(self, conf_text):
+        """Run one activity poll of an in-process loop with this conf file and return the
+        lines it queues. The account database knows only the account orchestrator,
+        whose home is a fixture folder apart from HOME, and the loop runs in another
+        account."""
+        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
+        conf.write_text(conf_text, encoding="utf-8")
+        homes = {"orchestrator": str(self.orch_home)}
+
+        def getpwnam(name):
+            if name not in homes:
+                raise KeyError(name)
+            return types.SimpleNamespace(pw_dir=homes[name])
+
+        env = self.base_env()
+        env.update(LOGNAME="fixture-runner", USER="fixture-runner")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("pwd.getpwnam", getpwnam):
+            loop = orch.Orch(PROJECT)
+            # A stall time of one minute, with polls of a minute.
+            loop.stalls = orch.Stalls(60, POLL)
+            loop.queue = []
+            loop.waits_file.parent.mkdir(parents=True, exist_ok=True)
+            loop.waits_file.write_text(f"{OTHER}\t{orch.stamp(self.now)}\tthe block\n",
+                                       encoding="utf-8")
+            loop.watch_waits(self.now)
+        return [line for line, _ in loop.queue]
+
+    def test_a_conf_file_without_the_account_reads_the_home_of_orchestrator(self):
+        # The other project has sat idle for two hours by its file in the home of the
+        # account orchestrator, and HOME holds no such file. A conf file without
+        # ORCH_ACCOUNT gives the same stall line, idle and not down, as one with
+        # ORCH_ACCOUNT=orchestrator.
+        self.now = datetime.datetime.now().astimezone()
+        self.orch_home = self.tmp / "orchestrator-home"
+        theirs = self.orch_home / "ws" / "reviews" / OTHER / "orch"
+        theirs.mkdir(parents=True)
+        since = self.now - datetime.timedelta(hours=2)
+        (theirs / "activity").write_text(
+            f"idle\t{orch.stamp(since)}\t{orch.stamp(self.now)}\n", encoding="utf-8")
+        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
+        text = conf.read_text(encoding="utf-8")
+        self.assertIn("ORCH_ACCOUNT=orchestrator\n", text)
+        named = self.stall_lines(text)
+        unnamed = self.stall_lines(text.replace("ORCH_ACCOUNT=orchestrator\n", ""))
+        self.assertEqual(named, [f"stall: {OTHER} idle since {orch.clock(since, self.now)} "
+                                 f"(waits on: the block)"])
+        self.assertEqual(unnamed, named)
+
+
 class TestQuietLines(OrchTestCase):
     def test_stall_line_is_no_change_for_the_next_hourly_tick(self):
         # A stall line goes from the queue into the event file. The hourly tick after it
@@ -475,6 +530,18 @@ class LoopWaitsCase(OrchTestCase):
 
     activity = "0.3"
     stall = "1.5"
+
+    def setUp(self):
+        super().setUp()
+        # The loop reads the activity files of other projects in the home of the
+        # orchestrator account. Naming the running account there keeps that home the
+        # fixture's, and no real home is read.
+        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
+        text = conf.read_text(encoding="utf-8")
+        self.assertIn("ORCH_ACCOUNT=orchestrator\n", text)
+        conf.write_text(text.replace("ORCH_ACCOUNT=orchestrator\n",
+                                     f"ORCH_ACCOUNT={getpass.getuser()}\n"),
+                        encoding="utf-8")
 
     def base_env(self):
         env = super().base_env()

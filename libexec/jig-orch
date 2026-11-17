@@ -218,11 +218,13 @@ transcripts/orch/<run>/. In the project's clone: the idle lines in impl/orch/upd
 
 import datetime
 import fcntl
+import getpass
 import hashlib
 import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import pwd
 import re
 import shlex
 import shutil
@@ -492,6 +494,21 @@ def try_lock(path):
 
 def orch_dir(project):
     return pathlib.Path.home() / "ws" / "reviews" / project / "orch"
+
+
+def account_home(account):
+    """Return the home of an account, or None when the account database does not know it.
+
+    The loop runs in the orchestrator account, so its own home answers for that account.
+    Asking the account database only for another account keeps a home that HOME sets,
+    as a test sets it.
+    """
+    if account == getpass.getuser():
+        return pathlib.Path.home()
+    try:
+        return pathlib.Path(pwd.getpwnam(account).pw_dir)
+    except KeyError:
+        return None
 
 
 def stamp(moment):
@@ -1879,8 +1896,18 @@ class Orch:
             self.problem("waits", f"{self.waits_file}: {bad} line(s) do not parse and are "
                                   f"left out")
 
+        # The activity files are in the home of the orchestrator account; a conf file
+        # without ORCH_ACCOUNT gets the account orchestrator, as for its approved list.
+        account = self.account.split()[0]
+        home = account_home(account)
+
         def read(other):
-            path = orch_dir(other) / ACTIVITY_FILE
+            if home is None:
+                self.problem("activity home", f"the account {account} is not known, so "
+                                              f"no activity file can be read; each "
+                                              f"project waited on counts as down")
+                return None, "missing"
+            path = home / "ws" / "reviews" / other / "orch" / ACTIVITY_FILE
             found = read_activity(path)
             if found[1] == "unparsed":
                 self.problem(f"activity {other}", f"{path} cannot be read or does not "
