@@ -1841,6 +1841,9 @@ class TestWatcherOfAnEndedSession(OrchTestCase):
         self.tmux("new-session", "-d", "-s", "fixture", sys.executable, "-c", runner)
         self.until(lambda: self.read(pid_file), what="the watcher")
         pid = int(self.read(pid_file))
+        # Once the session is gone, nothing else would end a watcher that this test
+        # leaves when it fails, and the watcher would follow a deleted file for good.
+        self.addCleanup(end_watcher, pid)
         self.assertTrue(running(pid))
         # The watcher notes its parent only once it has loaded and started to follow
         # the file; a session killed before that, on a slow host, leaves no change of
@@ -1850,6 +1853,24 @@ class TestWatcherOfAnEndedSession(OrchTestCase):
         self.until(lambda: "inbox: ready" in self.screen("fixture"), what="the first line")
         self.tmux("kill-session", "-t", "=fixture")
         self.until(lambda: not running(pid), seconds=5, what="the end of the watcher")
+
+
+def end_watcher(pid):
+    """End the watcher with this pid if it still runs.
+
+    Its command line is read first, so that a later process that got the same pid is
+    left alone.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            arguments = stream.read().split(b"\0")
+    except OSError:
+        return
+    if b"events" in arguments and PROJECT.encode() in arguments:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def running(pid):
