@@ -438,6 +438,20 @@ class JigNewTest(JigNewCase):
                       "and the reminders)", text)
         self.assertNotIn("`hourly update`", text)
 
+    def test_orchestrator_templates_hold_no_hourly_update(self):
+        # Nothing starts an update each hour any more, so neither the standing prompt
+        # nor the handoff template may give the orchestrator a rule for one; the
+        # standing prompt says instead when an update is written.
+        self.made()
+        texts = {}
+        for name in ("ORCHESTRATOR.md", "handoff.md"):
+            path = self.home / "ws/src/demo-dev/impl/orch" / name
+            texts[name] = " ".join(path.read_text(encoding="utf-8").split())
+            self.assertNotIn("hourly update", texts[name].lower(), name)
+        self.assertIn("- Update: write one as the first message to the console in each "
+                      "session, and when a result changes what Eric expects or something "
+                      "needs him; never by the clock.", texts["ORCHESTRATOR.md"])
+
     def test_standing_prompt_gives_the_tag_block_and_the_row_of_a_closed_loop(self):
         # An orchestrator of a new project must learn the tag block line and the exact
         # form of the table that jig tag reads, or the first revision tag is refused.
@@ -646,7 +660,9 @@ class JigNewTest(JigNewCase):
         for rule in ("After each step, run `jig ctx`.", "3, at about 250k tokens: roll over.",
                      "4, at about 280k tokens: exit after the current tool call.",
                      "a rollover does not affect it",
-                     "Its first hourly update cites the commit of `handoff.md`."):
+                     "Its first message to the console is its first update: a summary of "
+                     "the last session and the next steps, which cites the commit of "
+                     "`handoff.md`."):
             self.assertIn(rule, flat)
         self.assertNotIn("120k", orchestrator)
         self.assertNotIn("150k", orchestrator)

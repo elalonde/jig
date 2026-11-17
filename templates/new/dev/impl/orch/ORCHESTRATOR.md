@@ -87,7 +87,7 @@ blocks that need sudo or his GitHub login.
 
 All in `impl/orch/`, committed after every unit: `ORCHESTRATOR.md` (this
 file), `state.md` (always current, at most about 200 lines), `briefs/<ID>.md`,
-`updates.log` (every hourly update, with a timestamp), `handoff.md` (written
+`updates.log` (every update, with a timestamp), `handoff.md` (written
 at rollover).
 
 `jig orch` appends its own idle line to `updates.log` when an hour passes with
@@ -259,7 +259,7 @@ closed every worker. No unit is cancelled for an upgrade.
     run `jig orch @PROJECT@ rollover`.
   - 2, no size: go on. A fresh session has none until its status line first
     writes, within about a minute. When it lasts longer, name it in the next
-    hourly update.
+    update.
 - Roll over only when `jig ctx` exits 3 or 4, never at a batch boundary.
 - End the session only with `jig orch @PROJECT@ rollover`, never by asking
   Eric to type `/exit`. It ends the session at once, so stop every background
@@ -275,9 +275,9 @@ closed every worker. No unit is cancelled for an upgrade.
 - A fresh session reads this file, `state.md`, `handoff.md`, the jig change
   log since the pinned version, the newest report if a unit runs, and the
   events of the old session (`jig orch @PROJECT@ events --old`); nothing
-  else unless `state.md` names a file. Its first message to the console is a
-  summary of the last session and the next steps. Its first hourly update
-  cites the commit of `handoff.md`.
+  else unless `state.md` names a file. Its first message to the console is its
+  first update: a summary of the last session and the next steps, which cites
+  the commit of `handoff.md`.
 - End every response with `orch <ID>`.
 - Never force-push, rewrite history, or delete tags or releases.
 
@@ -305,7 +305,7 @@ Stop the item and ask Eric for:
 - Semver. Each unit records its change class; the version changes only at a
   release, from the highest class since the last tag.
 - `jig release @PROJECT@ prepare | publish | verify`, run as @IMPL@. A patch
-  release publishes at once when `prepare` passes, and the hourly update
+  release publishes at once when `prepare` passes, and the next update
   reports it. A minor or major release waits for Eric's yes.
 - A row of `checks.tsv` whose account is not @IMPL@: `prepare` does not run
   it, but reads the copy of its exit file that `jig run-check` writes in
@@ -326,9 +326,11 @@ Stop the item and ask Eric for:
 
 Updates and celebrations:
 
-- Hourly update: plain English, at most 12 lines: what the project does now
-  and why; the running item `k/n <name>` with its elapsed time; what happened
-  in the last hour; what comes next; anything that needs Eric. Every ID
+- Update: write one as the first message to the console in each session, and
+  when a result changes what Eric expects or something needs him; never by
+  the clock. Plain English, at most 12 lines: what the project does now and
+  why; the running item `k/n <name>` with its elapsed time; what happened
+  since the last update; what comes next; anything that needs Eric. Every ID
   mentioned carries a one-sentence meaning. Append it to `updates.log`.
 - Celebrations: at every phase close, a short text block in the console and
   in `updates.log`: what was achieved, with the numbers.

@@ -2,8 +2,7 @@
 
 Written at each rollover, by the session that ends, for the session that the
 supervisor starts next. Write it with `state.md`, commit both together, then
-exit. The fresh session cites the commit of this file in its first hourly
-update.
+exit. The fresh session cites the commit of this file in its first update.
 
 ## Session
 
