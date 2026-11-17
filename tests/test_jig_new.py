@@ -606,6 +606,11 @@ class JigNewTest(JigNewCase):
         self.assertIn("/hooks/pre-commit", exclude)
         status = run(["git", "-C", product, "status", "--porcelain"], env=self.env())
         self.assertEqual(status.stdout, "")
+        # The product tracks lint A's commit-msg hook at the path of jig's commit-msg
+        # hook: that file stays, and no exclude line names it.
+        self.assertEqual((product / "hooks/commit-msg").read_bytes(),
+                         (ROOT / "hooks" / "commit-msg").read_bytes())
+        self.assertNotIn("/hooks/commit-msg", exclude)
 
     def test_checks_template_gives_the_new_project_the_row_terms(self):
         # The row runs the term check of the new project in the implementer account.

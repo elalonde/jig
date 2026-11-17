@@ -23,6 +23,9 @@ JIG = ROOT / "bin" / "jig"
 WORKER = ROOT / "libexec" / "jig-start-worker"
 START = ROOT / "libexec" / "jig-start"
 HOOK = ROOT / "hooks" / "pre-commit"
+# jig's commit-msg hook is the pre-commit hook's text with another second line.
+MSG_HOOK_TEXT = "".join(["# jig commit-msg hook\n" if number == 1 else line for number, line
+                         in enumerate(HOOK.read_text(encoding="utf-8").splitlines(True))])
 GOOD_PROMPT = ROOT / "tests" / "fixtures" / "validate" / "good-prompt.md"
 TEMPLATE = ROOT / "templates" / "project.conf"
 
@@ -1142,6 +1145,10 @@ class StartHookTest(StartCase):
         self.assertEqual(path.read_bytes(), HOOK.read_bytes())
         self.assertTrue(os.access(path, os.X_OK))
 
+    def assert_jigs_msg_hook(self, path):
+        self.assertEqual(path.read_text(encoding="utf-8"), MSG_HOOK_TEXT)
+        self.assertTrue(os.access(path, os.X_OK))
+
     def test_start_installs_the_hook_where_git_looks_for_it(self):
         # No hook yet, no hooks path, and the row on origin: jig start writes jig's hook
         # into the git directory, so it needs no exclude line.
@@ -1149,6 +1156,9 @@ class StartHookTest(StartCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_jigs_hook(self.default_hook())
         self.assertNotIn("/hooks/pre-commit", self.exclude_lines())
+        # The commit-msg hook, with no other hook there, goes beside it the same way.
+        self.assert_jigs_msg_hook(self.product / ".git" / "hooks" / "commit-msg")
+        self.assertNotIn("/hooks/commit-msg", self.exclude_lines())
 
     def test_start_installs_the_hook_at_the_hooks_path_and_excludes_it(self):
         # With core.hooksPath, git looks in the work tree: the hook goes there, its path
@@ -1156,9 +1166,25 @@ class StartHookTest(StartCase):
         hook = self.use_hooks_path()
         self.assertEqual(self.start().returncode, 0)
         self.assert_jigs_hook(hook)
+        self.assert_jigs_msg_hook(self.product / "hooks" / "commit-msg")
         self.assertFalse(self.default_hook().exists())
         self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 1)
+        self.assertEqual(self.exclude_lines().count("/hooks/commit-msg"), 1)
         self.assertEqual(self.ok(["git", "-C", self.product, "status", "--porcelain"]), "")
+
+    def test_start_keeps_another_commit_msg_hook_and_starts(self):
+        # The project keeps its own commit-msg hook, untracked, where git looks: jig
+        # start does not refuse, leaves that file as it is and adds no exclude line for
+        # it, and still installs the pre-commit hook.
+        hook = self.use_hooks_path()
+        hook.parent.mkdir()
+        own = self.product / "hooks" / "commit-msg"
+        own.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(own.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+        self.assert_jigs_hook(hook)
+        self.assertNotIn("/hooks/commit-msg", self.exclude_lines())
 
     def test_start_replaces_an_older_hook_with_the_marker(self):
         hook = self.use_hooks_path()
@@ -1236,7 +1262,8 @@ class StartHookTest(StartCase):
         exclude = self.exclude_bytes()
         self.assertEqual(self.start().returncode, 0)
         self.assertEqual(hook.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
-        self.assertEqual(self.exclude_bytes(), exclude)
+        # The commit-msg hook is not tracked, so it goes in, with its one exclude line.
+        self.assertEqual(self.exclude_bytes(), exclude + b"/hooks/commit-msg\n")
 
     def test_start_keeps_a_tracked_hook_with_the_marker_on_a_line_without_the_row(self):
         # jig's own product tracks jig's hook, marker included. On a line whose
@@ -1279,6 +1306,10 @@ class StartHookTest(StartCase):
         self.assert_jigs_hook(hook)
         self.assertFalse(self.default_hook().exists())
         self.assertEqual(self.exclude_lines().count("/hooks/pre-commit"), 1)
+        # The product tracks its own hooks/commit-msg: it stays, with no exclude line.
+        self.assertEqual((self.product / "hooks" / "commit-msg").read_text(encoding="utf-8"),
+                         "#!/bin/sh\nexit 0\n")
+        self.assertNotIn("/hooks/commit-msg", self.exclude_lines())
 
     def test_start_keeps_a_hooks_path_that_is_already_set(self):
         # The product tracks hooks/, but the clone names another hooks directory: jig
@@ -1326,17 +1357,21 @@ class StartHookTest(StartCase):
     def test_start_removes_its_hook_without_the_row_and_keeps_the_exclude_line(self):
         # A line of the -dev repo without the term check: jig's hook goes, so that the
         # unit can commit, and the exclude line from an earlier install stays.
+        # jig's commit-msg hook goes the same way.
         self.set_terms_row(False)
         hook = self.use_hooks_path()
         hook.parent.mkdir()
         shutil.copy2(HOOK, hook)
+        message_hook = self.product / "hooks" / "commit-msg"
+        message_hook.write_text(MSG_HOOK_TEXT, encoding="utf-8")
         exclude = self.product / ".git" / "info" / "exclude"
         exclude.parent.mkdir(exist_ok=True)
-        exclude.write_text("/hooks/pre-commit\n", encoding="utf-8")
+        exclude.write_text("/hooks/pre-commit\n/hooks/commit-msg\n", encoding="utf-8")
         result = self.start()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(hook.exists())
-        self.assertEqual(self.exclude_lines(), ["/hooks/pre-commit"])
+        self.assertFalse(message_hook.exists())
+        self.assertEqual(self.exclude_lines(), ["/hooks/pre-commit", "/hooks/commit-msg"])
 
     def test_start_worker_alone_installs_the_hook_beside_it(self):
         # Run alone from a jig tree, the worker takes the hook of that tree.

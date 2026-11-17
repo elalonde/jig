@@ -19,6 +19,10 @@ and makes its releases.
 - `tools/`: the install script, lint A, the CI check and the seeded-break
   runner.
 - `hooks/commit-msg`: the commit message check that `make check` installs.
+- `hooks/pre-commit`: jig's term hook, which `jig start` and `jig new` install
+  in a product clone as its pre-commit hook and, with another second line, as
+  its commit-msg hook. With jig 0.8.2 or newer for the project, it refuses a
+  commit only for a private term that the commit adds.
 - `templates/`: the files that `jig new` writes into a new project (with
   `--existing`, for a product already on GitHub, only the sidecar and a block
   of its own form, and no file into the product), and the forms of a unit
@@ -45,7 +49,8 @@ part of the source.
 
 The hooks path that `make check` sets also runs the tracked `hooks/pre-commit`,
 which runs the term check of the `-dev` clone beside this clone, `../jig-dev`, so a
-clone of jig with no `-dev` clone cannot commit after `make hook`.
+clone of jig with no `-dev` clone cannot commit after `make hook`. A linked work
+tree of this clone uses the `-dev` clone beside this clone.
 
 ## Release files
 

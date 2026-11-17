@@ -1,16 +1,38 @@
 #!/usr/bin/env python3
 # jig pre-commit hook
 # jig start and jig new find their own file by the exact line above.
-"""Refuse a commit to the product while the project's term check does not pass.
+"""Refuse a commit to the product that adds a private term of the project.
 
 The term check looks for the project's private terms, the lines of terms.txt, in
-the product. The -dev clone of a product clone named demo is demo-dev beside it,
-and no other place counts. The check is the row "terms" of checks.tsv at the root of
-that -dev clone: name, command, account, time cap in seconds, and an optional weight,
-heavy or light, separated by tabs. This hook runs the row's command with sh -c from
-that root and refuses the commit when the command does not exit 0, when it runs past
-its cap, or when there is no such row. The check names the place of each match and
-never the term, so its output is safe to show here.
+the product. It is the row "terms" of checks.tsv at the root of the project's -dev
+clone: name, command, account, time cap in seconds, and an optional weight, heavy or
+light, separated by tabs. The -dev clone of a product clone named demo is demo-dev
+beside it, and no other place counts. A linked work tree of the product clone (git
+worktree add), in any folder, has the -dev clone of the main work tree of its
+repository: the folder that holds the .git directory that git rev-parse
+--git-common-dir names. When that directory is not named .git, the repository has
+no main work tree, and the commit is refused. So is a commit with no -dev clone or
+no such row.
+
+This one file is two hooks, told apart by its second line. jig start and jig new
+install it as the pre-commit hook, and as the commit-msg hook with the second line
+"# jig commit-msg hook" in place of the one above.
+
+When the row's command is "jig terms check <project>" and the jig that the
+dispatcher runs for the project is 0.8.2 or newer, the hooks check only what the
+commit adds, so that a match already in the product does not stop every commit: the
+pre-commit hook adds --staged and the root of the work tree, and the commit-msg hook
+adds --message and the message file that git gives it. That version is the name of
+the installed tree that "jig which <project>" prints from the -dev clone, after
+symbolic links are followed. When jig which fails or the name is not a version, the
+version counts as older, because an older jig has neither option: the pre-commit
+hook then runs the row's command as it is, the check of the whole product, and the
+commit-msg hook checks nothing. With any other command in the row, the pre-commit
+hook runs that command as it is and the commit-msg hook checks nothing.
+
+A command runs with sh -c from the root of the -dev clone, and the commit is refused
+when it does not exit 0 or runs past its cap. The check names the place of each
+match and never the term, so its output is safe to show here.
 
 When the row is heavy and the host config sets HEAVY_SLOTS, the hook first takes a
 heavy slot of the host, as jig run-check does, and waits while every slot is held;
@@ -18,8 +40,8 @@ the cap counts from the start of the command, after the wait. On SIGTERM, SIGHUP
 SIGINT while the command runs, it kills the command's group before it exits, so that
 the slot is free only once the command is gone.
 
-jig start and jig new replace or remove a hook only when its second line is the
-marker line, so a project's own pre-commit hook is never lost.
+jig start and jig new replace or remove a hook only when its second line is one of
+the two marker lines, so a project's own hook is never lost.
 
 The hook is a single file with no import from jig's tree, because jig start
 copies it into clones of accounts that cannot read that tree. So dev_clone below
@@ -35,12 +57,25 @@ import os
 import pathlib
 import pwd
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import time
 
 ROW = "terms"
+# The second line of this file as each of the two hooks.
+PRE_COMMIT_MARKER = "# jig pre-commit hook"
+COMMIT_MSG_MARKER = "# jig commit-msg hook"
+# The command of the row that jig's own term check has, with the project's name.
+TERMS_COMMAND = re.compile(r"jig terms check ([a-z0-9][a-z0-9._-]*)")
+# The first jig whose term check has the options --staged and --message.
+FIRST_ADDED_ONLY = (0, 8, 2)
+# The name of an installed tree: numbers with a dot between each two.
+VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)+")
+WHICH_SECONDS = 30
+# The name of the git directory inside a main work tree.
+GIT_DIR_NAME = ".git"
 HEAVY = "heavy"
 LIGHT = "light"
 SHAPE = ("is not name, command, account, cap in seconds, and an optional weight, "
@@ -63,6 +98,10 @@ class SlotError(Exception):
     """A heavy slot cannot be taken; the message names the file or the key."""
 
 
+class NoRoot(Exception):
+    """git cannot name the root of the work tree of the commit."""
+
+
 class Stopped(Exception):
     """A signal asked the hook to stop; it carries the signal number."""
 
@@ -76,8 +115,22 @@ def git(*args, env=None):
                           stdin=subprocess.DEVNULL, check=False)
 
 
+def hook_name():
+    """Return "pre-commit" or "commit-msg", by the second line of this file."""
+    try:
+        with open(os.path.realpath(__file__), encoding="utf-8", errors="replace") as stream:
+            stream.readline()
+            second = stream.readline().rstrip("\r\n")
+    except OSError:
+        second = ""
+    return "commit-msg" if second == COMMIT_MSG_MARKER else "pre-commit"
+
+
+NAME = hook_name()
+
+
 def refuse(reason):
-    print(f"jig pre-commit hook: {reason}; the commit is refused", file=sys.stderr)
+    print(f"jig {NAME} hook: {reason}; the commit is refused", file=sys.stderr)
     return 1
 
 
@@ -91,12 +144,57 @@ def environment_without_git():
     return {key: value for key, value in os.environ.items() if key not in listed}
 
 
-def dev_clone(product):
-    """Return the -dev clone of the product clone at product, or None when it has none."""
-    product = os.path.realpath(product)
-    parent, name = os.path.split(product)
+def dev_clone():
+    """Return the -dev clone of this repository, or None and the line that says why not.
+
+    It is the -dev clone of the main work tree, so a linked work tree in any folder
+    finds the same one as the clone itself.
+    """
+    named = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if named.returncode != 0 or not named.stdout.strip():
+        return None, "git cannot name the git directory of this clone"
+    common = os.path.realpath(named.stdout.strip())
+    if os.path.basename(common) != GIT_DIR_NAME:
+        return None, (f"the git directory {common} is not named {GIT_DIR_NAME}, so the "
+                      "repository has no main work tree and no -dev clone")
+    main = os.path.dirname(common)
+    parent, name = os.path.split(main)
     beside = os.path.join(parent, name + "-dev")
-    return beside if os.path.isdir(beside) else None
+    if not os.path.isdir(beside):
+        return None, (f"no -dev clone beside {main}: {beside} is not a directory, so "
+                      "there is no checks.tsv to read")
+    return beside, None
+
+
+def jig_version(project, dev, env):
+    """Return the version of the jig that the dispatcher runs for the project, or None.
+
+    It is the name of the tree that jig which prints, with symbolic links followed, as
+    a tuple of numbers. None means that it cannot be read.
+    """
+    try:
+        shown = subprocess.run(["jig", "which", project], cwd=dev, env=env,
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                               timeout=WHICH_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    tree = shown.stdout.strip()
+    if shown.returncode != 0 or not tree or "\n" in tree:
+        return None
+    name = os.path.basename(os.path.realpath(os.path.join(dev, tree)))
+    if not VERSION.fullmatch(name):
+        return None
+    return tuple(int(part) for part in name.split("."))
+
+
+def checks_added_only(command, dev, env):
+    """Say whether the row's command is jig's term check, run by a jig that has the
+    options for only what a commit adds."""
+    found = TERMS_COMMAND.fullmatch(command.strip())
+    if not found:
+        return False
+    version = jig_version(found.group(1), dev, env)
+    return version is not None and version >= FIRST_ADDED_ONLY
 
 
 def parse_row(line):
@@ -248,7 +346,7 @@ def describe(path):
 
 
 def say(text):
-    print(f"jig pre-commit hook: {text}", file=sys.stderr, flush=True)
+    print(f"jig {NAME} hook: {text}", file=sys.stderr, flush=True)
 
 
 def take_slot(dev, env):
@@ -322,19 +420,45 @@ def run_check(command, dev, env, cap):
         raise
 
 
-def main():
+def hook_command(command, dev, env):
+    """Return the command this hook runs and its environment, or None to check nothing.
+
+    The variables that git sets for a hook are left out, so that every git command of
+    the check reads the repository it runs in. The pre-commit hook gives the index of
+    the commit back, as an absolute path, to the check of what the commit stages: git
+    commit -a and git commit <path> stage in an index of their own.
+    """
+    added_only = checks_added_only(command, dev, env)
+    if NAME == "commit-msg":
+        if not added_only or len(sys.argv) < 2:
+            return None, env
+        return f"{command.strip()} --message {shlex.quote(os.path.abspath(sys.argv[1]))}", env
+    if not added_only:
+        return command, env
     shown = git("rev-parse", "--show-toplevel")
-    if shown.returncode != 0 or not shown.stdout.strip():
-        return refuse("cannot find the root of this clone")
-    product = shown.stdout.strip()
+    top = shown.stdout.strip()
+    if shown.returncode != 0 or not top:
+        raise NoRoot("cannot find the root of this work tree")
+    if os.environ.get("GIT_INDEX_FILE"):
+        env = dict(env, GIT_INDEX_FILE=os.path.abspath(os.environ["GIT_INDEX_FILE"]))
+    return f"{command.strip()} --staged {shlex.quote(top)}", env
+
+
+def main():
     env = environment_without_git()
-    dev = dev_clone(product)
+    dev, problem = dev_clone()
     if dev is None:
-        return refuse(f"no -dev clone beside {product}, so there is no checks.tsv to read")
+        return refuse(problem)
     row, problem = read_row(dev)
     if problem:
         return refuse(problem)
     command, cap, weight = row
+    try:
+        command, env = hook_command(command, dev, env)
+    except NoRoot as problem:
+        return refuse(str(problem))
+    if command is None:
+        return 0
     for signum in STOP_SIGNALS:
         signal.signal(signum, on_signal)
     try:

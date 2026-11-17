@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that no private term of a project appears in what its release publishes.
 
-usage: jig terms check <project> [<directory>]
+usage: jig terms check <project> [<directory> | --staged <work tree> | --message <file>]
 
 The terms are the lines of terms.txt at the top of the project's -dev clone, the
 clone that REPO names in ~/.config/jig/<project>.conf. A line that is blank, or whose
@@ -35,10 +35,28 @@ has each term in it replaced by "***", also in the part of <directory>, where a
 term is not a match. A line or a message that holds one term twice prints one line
 for it.
 
+jig's two term hooks use the two options, so that a commit is refused only for what
+it adds, and not for a match that the product already holds:
+  --staged <work tree> reads only what the next commit of that work tree adds
+    against HEAD: each line that the staged diff adds, where a changed line counts
+    as removed and added, and each staged path that HEAD does not hold, as a commit
+    adds, copies or renames it. The diff finds renames at git's default threshold,
+    whatever the git config says, so a file that is only moved adds no line, and
+    only its new path is read. A file that the diff shows as binary is read whole
+    when the commit adds or changes it. Before the first commit, every staged line
+    and path counts. git reads the index that GIT_INDEX_FILE names when it is set,
+    as git sets it for a hook during git commit -a or git commit <path>, so the
+    check reads what that commit takes.
+  --message <file> reads every line of a commit message file, comment lines too.
+With either option, the product clone, the commit messages and <directory> are not
+read. A match in the staged tree prints as above, with the line number in the
+staged file; a match in a message prints as
+  message:<line>: terms.txt line <n>
+
 Exits 0 with no match; 1 with a match, or when the check cannot be made: no
 terms.txt, one that cannot be read or holds no term, no product clone, a directory
-that does not exist, a file that cannot be read (one line on stderr names it); 2 on
-a usage error. Changes no file.
+that does not exist, a file that cannot be read, a work tree that git cannot read
+(one line on stderr names it); 2 on a usage error. Changes no file.
 """
 
 import bisect
@@ -56,7 +74,8 @@ import jig_clones  # noqa: E402
 import jig_units  # noqa: E402
 import lint_a  # noqa: E402
 
-USAGE = "usage: jig terms check <project> [<directory>]"
+USAGE = ("usage: jig terms check <project> "
+         "[<directory> | --staged <work tree> | --message <file>]")
 TERMS_FILE = "terms.txt"
 # What a private value in a printed path is replaced with.
 MASK = "***"
@@ -64,6 +83,9 @@ FAILED = 1
 # Terms come first among the kinds of match on a line, in the order of terms.txt.
 TERM_RANK = 0
 USAGE_ERROR = 2
+# The options of the two hooks: what a commit stages, and its message.
+STAGED = "--staged"
+MESSAGE = "--message"
 
 
 class Failed(Exception):
@@ -330,6 +352,175 @@ def scan_messages(product, line, finders):
     return count
 
 
+def work_tree_root(work_tree):
+    """Return the root of the git work tree that holds the directory work_tree."""
+    if not pathlib.Path(work_tree).is_dir():
+        raise Failed(f"{work_tree} is not a directory")
+    lines = git_lines(work_tree, "rev-parse", "--show-toplevel")
+    if not lines or not lines[0]:
+        raise Failed(f"{work_tree} is not in a git work tree")
+    return pathlib.Path(lines[0])
+
+
+def staged_base(root):
+    """Return HEAD, or the empty tree before the first commit, so that all of it counts."""
+    if git(root, "rev-parse", "--verify", "-q", "HEAD").returncode == 0:
+        return "HEAD"
+    empty = subprocess.run(["git", "-C", str(root), "hash-object", "-t", "tree", "--stdin"],
+                           input=b"", capture_output=True, check=False)
+    if empty.returncode != 0:
+        raise Failed(f"git hash-object failed in {root}")
+    return decode(empty.stdout).strip()
+
+
+# The options of every staged diff that this check reads. Each one fixes a setting
+# that the git config could change: an external diff or a text conversion would hide
+# the real lines, colour codes would break the parse, a path relative to a folder
+# would name a file wrongly, and the renames are found as git finds them by default,
+# also when the config turns rename detection off or to copies.
+DIFF_OPTIONS = ("diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv",
+                "--no-relative", "--find-renames")
+# A gitlink, the entry of a submodule, has no lines of its own in this repository.
+GITLINK = "160000"
+HUNK = re.compile(r"@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@")
+
+
+def staged_entries(root, base):
+    """Return (status, path, new mode, new object) for each file the commit changes.
+
+    The raw diff with -z gives each entry as a line of modes, objects and a status,
+    then one path, or two for a rename or a copy, of which the second is the new one.
+    """
+    result = git(root, *DIFF_OPTIONS, "--raw", "-z", "--no-abbrev", base)
+    if result.returncode != 0:
+        raise Failed(f"git diff failed in {root}")
+    fields = decode(result.stdout).split("\0")
+    entries = []
+    index = 0
+    while index < len(fields) and fields[index]:
+        meta = fields[index].lstrip(":").split()
+        status = meta[4][:1]
+        paths = 2 if status in ("R", "C") else 1
+        entries.append((status, fields[index + paths], meta[1], meta[3]))
+        index += 1 + paths
+    return entries
+
+
+def staged_patches(root, base, count):
+    """Return, for each entry of the raw diff in its order, the lines of its patch.
+
+    Every entry has one section that starts with a line "diff --git ", and no line
+    inside a section starts so, since each line of a hunk starts with a sign or a
+    space. No context is asked for, so a hunk holds only removed and added lines.
+    """
+    result = git(root, *DIFF_OPTIONS, "--patch", "--unified=0", "--inter-hunk-context=0",
+                 base)
+    if result.returncode != 0:
+        raise Failed(f"git diff failed in {root}")
+    sections = []
+    for line in decode(result.stdout).split("\n"):
+        if line.startswith("diff --git "):
+            sections.append([])
+        elif sections:
+            sections[-1].append(line)
+    if len(sections) != count:
+        raise Failed(f"the staged diff of {root} has {len(sections)} file sections "
+                     f"for {count} files")
+    return sections
+
+
+def added_lines(section):
+    """Return whether git shows the file as binary, and [(line, text)] that it adds.
+
+    The line numbers are those of the staged file. A context line, which a config of
+    git can still add between hunks, moves the count on and adds nothing.
+    """
+    added = []
+    number = None
+    for line in section:
+        if number is None:
+            if line.startswith("Binary files "):
+                return True, []
+            found = HUNK.match(line)
+            if found:
+                number = int(found.group(1))
+            continue
+        found = HUNK.match(line)
+        if found:
+            number = int(found.group(1))
+        elif line.startswith("+"):
+            added.append((number, line[1:]))
+            number += 1
+        elif line.startswith(" ") or line == "":
+            number += 1
+    return False, added
+
+
+def staged_line_matches(shown, added, finders):
+    """Return the output lines for the added lines that hold a private value."""
+    found = set()
+    text = "\n".join(line for _, line in added)
+    for finder in finders:
+        for place, rank, label in finder.lines(text):
+            found.add((added[place - 1][0], rank, label))
+    return [f"{shown}:{line}: {label}" for line, _, label in sorted(found)]
+
+
+def staged_blob(root, name, obj):
+    result = git(root, "cat-file", "blob", obj)
+    if result.returncode != 0:
+        raise Failed(f"cannot read the staged {name} in {root}")
+    return decode(result.stdout)
+
+
+def staged(project, work_tree, finders):
+    """Print and count the matches that the next commit of the work tree adds."""
+    root = work_tree_root(work_tree)
+    base = staged_base(root)
+    entries = staged_entries(root, base)
+    count = 0
+    for (status, name, mode, obj), section in zip(entries,
+                                                  staged_patches(root, base, len(entries))):
+        if status == "D":
+            continue
+        shown = masked(f"{project}/{name}", finders)
+        lines = []
+        if status in ("A", "C", "R"):
+            lines += path_matches(shown, name, finders)
+        if mode != GITLINK:
+            binary, added = added_lines(section)
+            if binary:
+                lines += text_matches(shown, staged_blob(root, shown, obj), finders)
+            else:
+                lines += staged_line_matches(shown, added, finders)
+        for line in lines:
+            print(line, flush=True)
+        count += len(lines)
+    return count
+
+
+def message(path, finders):
+    """Print and count the lines of a commit message file that hold a private value."""
+    text = decode(read_bytes(path, path))
+    found = set()
+    for finder in finders:
+        found.update(finder.lines(text))
+    for line, _, label in sorted(found):
+        print(f"message:{line}: {label}", flush=True)
+    return len(found)
+
+
+def check_added(project, option, place):
+    """Run the check of one hook: --staged on a work tree, or --message on a file."""
+    conf = jig_units.read_conf(project)
+    finders = [term_finder(pathlib.Path(conf["REPO"]) / TERMS_FILE)]
+    if option == STAGED:
+        count = staged(project, place, finders)
+    else:
+        count = message(place, finders)
+    return 1 if count else 0
+
+
 def check(project, directory=None):
     conf = jig_units.read_conf(project)
     repo = pathlib.Path(conf["REPO"])
@@ -348,11 +539,15 @@ def main(argv):
     if argv[:1] in (["-h"], ["--help"]):
         print(__doc__.strip())
         return 0
-    if len(argv) not in (2, 3) or argv[0] != "check" \
-            or not jig_units.PROJECT.fullmatch(argv[1]):
+    hook_form = len(argv) == 4 and argv[2] in (STAGED, MESSAGE)
+    if len(argv) not in (2, 3) and not hook_form or argv[0] != "check" \
+            or not jig_units.PROJECT.fullmatch(argv[1]) \
+            or len(argv) == 3 and argv[2] in (STAGED, MESSAGE):
         print(USAGE, file=sys.stderr)
         return USAGE_ERROR
     try:
+        if hook_form:
+            return check_added(*argv[1:])
         return check(*argv[1:])
     except (Failed, jig_units.Refused) as error:
         print(f"jig terms: {error}", file=sys.stderr)

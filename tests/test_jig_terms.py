@@ -96,7 +96,8 @@ class TermsCleanTest(TermsCase):
     def test_help_gives_the_usage_and_exits_zero(self):
         result = self.terms("--help")
         self.assertEqual(result.returncode, 0)
-        self.assertIn("usage: jig terms check <project> [<directory>]", result.stdout)
+        self.assertIn("usage: jig terms check <project> [<directory> | --staged <work tree> "
+                      "| --message <file>]", result.stdout)
 
 
 class TermsMatchTest(TermsCase):
@@ -226,10 +227,104 @@ class TermsFailureTest(TermsCase):
         self.assert_failed(self.terms("check", "absent"), "absent.conf")
 
 
+class TermsAddedTest(TermsCase):
+    """The options of the hooks: what the next commit stages, and its message.
+
+    HEAD holds the first term in old.txt, and the product's history holds it in a
+    message.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.commit(f"Note {FIRST}", {"old.txt": f"plain\nan old {FIRST}\n"})
+
+    def staged(self, env=None):
+        return run([TERMS, "check", "demo", "--staged", self.product],
+                   env=env or self.env())
+
+    def test_the_check_without_the_options_still_reads_the_whole_product(self):
+        # A staged file adds the second term. The check of the whole product prints the
+        # old match, the new one and the message, in the same lines as before the
+        # options; the staged check prints only the new match.
+        self.write(self.product, {"new.txt": f"one\n{SECOND}\n"})
+        self.git("add", "new.txt")
+        head = self.git("rev-parse", "HEAD")
+        self.assert_found(self.terms(), ["demo/new.txt:2: " + SECOND_LINE,
+                                         "demo/old.txt:2: " + FIRST_LINE,
+                                         f"commit {head}: {FIRST_LINE}"])
+        self.assert_found(self.staged(), ["demo/new.txt:2: " + SECOND_LINE])
+
+    def test_a_staged_tree_that_adds_no_match_exits_zero(self):
+        self.write(self.product, {"README.md": "A tool.\nMore.\n"})
+        self.git("add", "-A")
+        result = self.staged()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_moved_file_adds_only_its_path_whatever_the_config_says(self):
+        # The account's config turns rename detection off, which would show the move as
+        # a new file with the old match in it. The check finds the rename all the same:
+        # a clean new path exits 0, and a new path with a term names only the path.
+        self.git("config", "diff.renames", "false")
+        self.git("mv", "old.txt", "kept.txt")
+        result = self.staged()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.git("mv", "kept.txt", f"{SECOND}.txt")
+        self.assert_found(self.staged(), [f"demo/***.txt: {SECOND_LINE} in the path"])
+
+    def test_a_binary_file_that_the_commit_changes_is_read_whole(self):
+        # git shows the file as binary, so its changed lines are not known: the whole
+        # staged file is read, and its old match counts too.
+        self.commit("Add data", {"data.bin": b"\x00\x01\n" + FIRST.encode() + b"\n"})
+        self.write(self.product, {"data.bin": b"\x00\x02\n" + FIRST.encode() + b"\n"})
+        self.git("add", "-A")
+        self.assert_found(self.staged(), ["demo/data.bin:2: " + FIRST_LINE])
+
+    def test_a_deleted_file_with_a_match_adds_nothing(self):
+        self.git("rm", "-q", "old.txt")
+        result = self.staged()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_index_that_git_index_file_names_is_read(self):
+        # The default index is clean; another index stages the second term, as git
+        # commit -a does for its hook.
+        self.write(self.product, {"README.md": f"A tool by {SECOND}.\n"})
+        index = self.tmp / "other-index"
+        env = self.env(GIT_INDEX_FILE=str(index))
+        self.assertEqual(run(["git", "-C", self.product, "read-tree", "HEAD"],
+                             env=env).returncode, 0)
+        self.assertEqual(run(["git", "-C", self.product, "add", "README.md"],
+                             env=env).returncode, 0)
+        self.assertEqual(self.staged().returncode, 0)
+        self.assert_found(self.staged(env), ["demo/README.md:1: " + SECOND_LINE])
+
+    def test_a_message_file_counts_every_line_comments_too(self):
+        # git adds comment lines to a message made in an editor, and they hold the
+        # paths of the commit, so they are read like the others.
+        message = self.tmp / "message.txt"
+        message.write_text(f"Change the tool\n\n# {SECOND} in a comment\n{FIRST}\n",
+                           encoding="utf-8")
+        result = run([TERMS, "check", "demo", "--message", message], env=self.env())
+        self.assert_found(result, ["message:3: " + SECOND_LINE, "message:4: " + FIRST_LINE])
+        message.write_text("Change the tool\n", encoding="utf-8")
+        result = run([TERMS, "check", "demo", "--message", message], env=self.env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_place_that_cannot_be_read_fails_with_one_line(self):
+        self.assert_failed(run([TERMS, "check", "demo", "--message", self.tmp / "absent"],
+                               env=self.env()), "cannot read")
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.assert_failed(run([TERMS, "check", "demo", "--staged", plain], env=self.env()),
+                           "git rev-parse failed")
+
+
 class TermsUsageTest(TermsCase):
     def test_usage_errors_exit_two(self):
         for args in ([], ["check"], ["scan", "demo"], ["check", "Bad/Name"],
-                     ["check", "demo", "a", "b"]):
+                     ["check", "demo", "a", "b"], ["check", "demo", "--staged"],
+                     ["check", "demo", "--message"], ["check", "demo", "--other", "x"],
+                     ["check", "demo", "--staged", "a", "b"]):
             with self.subTest(args=args):
                 result = run([TERMS, *args], env=self.env())
                 self.assertEqual(result.returncode, 2, result.stderr)

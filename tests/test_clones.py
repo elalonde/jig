@@ -25,6 +25,18 @@ class OtherCloneTest(TempTestCase):
                 expected = None if case.expected is None else (base / case.expected).resolve()
                 self.assertEqual(found, expected)
 
+    def test_other_clone_finds_the_dev_clone_of_each_git_layout(self):
+        # A linked work tree in another folder gives the -dev clone beside its main
+        # clone; a clone whose git directory is not named .git gives none, although a
+        # -dev clone stands beside it.
+        for number, case in enumerate(clone_cases.GIT_CASES):
+            with self.subTest(case=case.name):
+                base = self.tmp / f"git{number}"
+                start = case.build(base, self.env())
+                found = jig_clones.other_clone(start)
+                expected = None if case.expected is None else (base / case.expected).resolve()
+                self.assertEqual(found, expected)
+
     def test_other_clone_reads_a_relative_path_from_the_working_directory(self):
         # A tool may hand over the -dev clone as ".", the directory it runs in; the
         # product clone beside it is still found.

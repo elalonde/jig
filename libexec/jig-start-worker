@@ -17,8 +17,8 @@ A change to
 impl/orch/updates.log alone does not make the tree dirty, because jig orch appends
 idle lines there between the orchestrator's commits. The launch
 stage takes the lock, brings the clone to origin, installs or removes jig's
-pre-commit hook in the product clone, sets the effort, places the prompt,
-refreshes the approved worktree and starts the session. The default runs
+pre-commit and commit-msg hooks in the product clone, sets the effort, places the
+prompt, refreshes the approved worktree and starts the session. The default runs
 both, so the script can run alone in the account. A refusal in the launch stage
 keeps the lock when jig start has pushed the unit's start line (it passes
 --head), or when the session is still there, so that jig close --dead finds
@@ -48,8 +48,13 @@ holds the row terms, the launch writes the hook, and adds its path to
 the hook never becomes a product file. Without that row, the launch removes jig's
 hook, so that a unit on a line without the term check can still commit, and leaves
 the exclude line. A hook path that git tracks in the product clone belongs to the
-product, and is left as it is. When the product tracks files in hooks/ and git has
-no core.hooksPath in any scope, the check stage first sets core.hooksPath to hooks in
+product, and is left as it is. jig's commit-msg hook, which checks the message of a
+commit for the terms, is the same text with another marker as its second line. It
+goes to the path that git names for hooks/commit-msg by the same rules, with one
+difference: another commit-msg hook at that path, or a path that git tracks, gets no
+file and stops nothing, since a product may keep its own commit-msg hook and git runs
+only one. When the product tracks files in hooks/ and git has no core.hooksPath in
+any scope, the check stage first sets core.hooksPath to hooks in
 the product clone, since the product's own make check sets it too and git then no
 longer runs a hook in .git/hooks. A start that a later check refuses keeps that value.
 Exits 1 on a refusal, naming what refused on stderr; 2 on a usage error.
@@ -102,6 +107,9 @@ SESSION_GROUP = "jig"
 # The second line of jig's pre-commit hook, by which a file at the hook's path is
 # known to be jig's own.
 HOOK_MARKER = "# jig pre-commit hook"
+# The same for jig's commit-msg hook: the text of the pre-commit hook with this second
+# line, since one file holds both hooks and tells them apart by that line.
+MSG_HOOK_MARKER = "# jig commit-msg hook"
 # The row of checks.tsv that the hook runs: the term check, which looks for the
 # project's private terms in the product.
 TERMS_ROW = "terms"
@@ -400,19 +408,19 @@ def is_clone(path):
     return (pathlib.Path(path) / ".git").exists()
 
 
-def hook_place(product):
-    """Return the path of the clone's pre-commit hook, and that path relative to the work
-    tree when it lies there, or None when it lies in the git directory.
+def hook_place(product, hook="pre-commit"):
+    """Return the path of the clone's hook of that name, and that path relative to the
+    work tree when it lies there, or None when it lies in the git directory.
 
     A hook path outside the clone, such as an absolute core.hooksPath from the account's
     global git config, is refused: a hook written there would run for every repository
     that shares the path, and would refuse their commits, since no -dev clone holds them.
     """
-    named = git_out(product, "rev-parse", "--git-path", "hooks/pre-commit")
+    named = git_out(product, "rev-parse", "--git-path", f"hooks/{hook}")
     git_dir = git_out(product, "rev-parse", "--absolute-git-dir")
     common_dir = git_out(product, "rev-parse", "--git-common-dir")
     if not named or not git_dir or not common_dir:
-        refuse("hook", f"git cannot name the pre-commit hook of {product}")
+        refuse("hook", f"git cannot name the {hook} hook of {product}")
     path = pathlib.Path(os.path.realpath(pathlib.Path(product) / named))
     top = pathlib.Path(os.path.realpath(product))
     # A linked worktree keeps its hooks in the git directory that all its worktrees share.
@@ -420,7 +428,7 @@ def hook_place(product):
     if any(path.is_relative_to(directory) for directory in git_dirs):
         return path, None
     if not path.is_relative_to(top):
-        refuse("hook", f"{path} is the pre-commit hook path that git names, and it lies "
+        refuse("hook", f"{path} is the {hook} hook path that git names, and it lies "
                        f"outside the clone {product}; jig start writes no hook there. Set "
                        "core.hooksPath of the clone to a path inside it, then start again")
     return path, path.relative_to(top).as_posix()
@@ -430,14 +438,15 @@ def is_tracked(product, relative):
     return bool(git_out(product, "ls-files", "--", f":(literal){relative}"))
 
 
-def is_jigs_hook(path):
-    """Say whether the file at the path is jig's pre-commit hook, by its second line."""
+def is_jigs_hook(path, marker=HOOK_MARKER):
+    """Say whether the file at the path is jig's hook with that marker, by its second
+    line."""
     if path.is_symlink() or not path.is_file():
         return False
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
             stream.readline()
-            return stream.readline().rstrip("\r\n") == HOOK_MARKER
+            return stream.readline().rstrip("\r\n") == marker
     except OSError:
         return False
 
@@ -477,9 +486,27 @@ def set_hooks_path(product):
         refuse("hook", f"cannot set core.hooksPath of {product}: {last_line(result)}")
 
 
+def msg_hook_place(product):
+    """Return the path of the commit-msg hook and its place in the work tree when jig's
+    commit-msg hook may be written or removed there, or None.
+
+    A product may keep its own commit-msg hook, such as the one of lint A, and git runs
+    one file for each hook. So a path that git tracks, or a file there that is not
+    jig's, is left as it is, and the start goes on: that clone gets no check of the
+    message before a commit, and the term check before a push still reads it.
+    """
+    path, relative = hook_place(product, "commit-msg")
+    if relative is not None and is_tracked(product, relative):
+        return None
+    if os.path.lexists(path) and not is_jigs_hook(path, MSG_HOOK_MARKER):
+        return None
+    return path, relative
+
+
 def check_hook(product):
     if product is not None and is_clone(product):
         foreign_hook(product)
+        hook_place(product, "commit-msg")
 
 
 def has_terms_row(clone, branch):
@@ -509,18 +536,20 @@ def exclude_from_product(product, relative):
         refuse("hook", f"cannot add {line} to {exclude}: {error.strerror}")
 
 
-def install_hook(product, text):
-    """Write jig's pre-commit hook into the product clone, unless the product tracks the
-    path; another hook at the path is refused and stays as it is."""
-    found = foreign_hook(product)
-    if found is None:
-        return
-    path, relative = found
-    if text is None or text.splitlines()[1:2] != [HOOK_MARKER]:
-        refuse("hook", "no text of jig's pre-commit hook was given")
+def msg_hook_text(text):
+    """Return the text of jig's commit-msg hook: the pre-commit hook's text with the
+    other marker as its second line."""
+    lines = text.splitlines(keepends=True)
+    lines[1] = MSG_HOOK_MARKER + "\n"
+    return "".join(lines)
+
+
+def write_hook(product, path, relative, text):
+    """Write the text as an executable file at the path, in one rename, and keep a path
+    in the work tree out of the product."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=".pre-commit.")
+        descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(text)
         os.chmod(name, 0o755)
@@ -531,14 +560,42 @@ def install_hook(product, text):
         exclude_from_product(product, relative)
 
 
-def remove_hook(product):
-    """Remove jig's pre-commit hook from the product clone; leave every other file."""
+def install_hook(product, text):
+    """Write jig's pre-commit and commit-msg hooks into the product clone.
+
+    A pre-commit hook path that the product tracks is left as it is; another hook there
+    is refused and stays as it is. The commit-msg hook goes only where msg_hook_place
+    allows it, and is skipped without a refusal elsewhere.
+    """
     found = foreign_hook(product)
-    if found is not None and os.path.lexists(found[0]):
+    message = msg_hook_place(product)
+    if found is None and message is None:
+        return
+    if text is None or text.splitlines()[1:2] != [HOOK_MARKER]:
+        refuse("hook", "no text of jig's pre-commit hook was given")
+    if found is not None:
+        write_hook(product, *found, text)
+    if message is not None:
+        write_hook(product, *message, msg_hook_text(text))
+
+
+def unlink_hook(path):
+    if os.path.lexists(path):
         try:
-            found[0].unlink()
+            path.unlink()
         except OSError as error:
-            refuse("hook", f"cannot remove {found[0]}: {error.strerror}")
+            refuse("hook", f"cannot remove {path}: {error.strerror}")
+
+
+def remove_hook(product):
+    """Remove jig's pre-commit and commit-msg hooks from the product clone; leave every
+    other file."""
+    found = foreign_hook(product)
+    if found is not None:
+        unlink_hook(found[0])
+    message = msg_hook_place(product)
+    if message is not None:
+        unlink_hook(message[0])
 
 
 def place_hook(conf, project, text):

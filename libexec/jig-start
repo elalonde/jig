@@ -29,7 +29,8 @@ a refused push gets one fetch and one rebase with --autostash, so an uncommitted
 change in that clone, such as those idle lines, stays in place. Then the prompt
 and its inbox directory go to the worker account, and the worker part starts the
 session, with the text of jig's pre-commit hook from this tree, which the worker
-installs in its product clone or removes from it, and the text of lib/jig_clones.py,
+installs in its product clone or removes from it, as the pre-commit hook and as the
+commit-msg hook, and the text of lib/jig_clones.py,
 by which the worker finds that clone beside its -dev clone. The session gets the
 role's directories of lib/jig_dirs.py that exist in the worker account as --add-dir,
 the product clone among them. JIG_SSH holds the ssh command, and tests set it. Exits 1 on a refusal; 2 on a usage error.
