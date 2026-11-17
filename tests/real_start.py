@@ -339,6 +339,8 @@ class FixtureProjectCase(unittest.TestCase):
                              f"IMPL_ACCOUNT={getpass.getuser()}\n", encoding="utf-8")
         self.prompt = self.base / "prompt.md"
         self.prompt.write_text("Say OK, then stop.\n", encoding="utf-8")
+        # The trust lines of the first start of a test show the marks it set.
+        self.first_start = True
 
     def git(self, *args):
         result = capture("git", *args)
@@ -362,7 +364,6 @@ class FixtureProjectCase(unittest.TestCase):
         lock = self.lock_dir / f"{HOOK_PROJECT}-{getpass.getuser()}"
         lock.unlink(missing_ok=True)
         lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
-        self.first_start = True
 
     def run_worker(self, *tag_args, add_dirs=()):
         """Run the worker part alone; accept only a start that reached no dialog.
