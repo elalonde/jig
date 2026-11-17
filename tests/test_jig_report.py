@@ -236,6 +236,78 @@ class ReportCommitsTest(ReportCase):
         self.assert_refused_unchanged(self.report(), "commits", before)
 
 
+class ReportProductLineTest(ReportCase):
+    """Report commits checked against a product that may not have the conf's branch.
+
+    The conf's branch here is master. A product before its version lines keeps its work
+    on another branch, trunk in these tests, and has no master at all.
+    """
+
+    def push_product(self, branch):
+        """Push a new product commit made in another clone to branch; return its hash."""
+        (self.product_seed / f"{branch}.py").write_text(f"{branch}\n", encoding="utf-8")
+        self.git_commit_all(self.product_seed)
+        self.ok(["git", "-C", self.product_seed, "push", "-q", "origin", f"HEAD:{branch}"])
+        return self.ok(["git", "-C", self.product_seed, "rev-parse", "HEAD"])
+
+    def move_product_to_trunk(self):
+        """Leave the product's origin with trunk and no master, in every clone."""
+        self.ok(["git", "-C", self.product_origin, "branch", "-q", "trunk", "master"])
+        self.ok(["git", "-C", self.product_origin, "symbolic-ref", "HEAD", "refs/heads/trunk"])
+        self.ok(["git", "-C", self.product_origin, "branch", "-q", "-D", "master"])
+        self.ok(["git", "-C", self.product, "fetch", "-q", "--prune", "origin"])
+        self.ok(["git", "-C", self.product_seed, "fetch", "-q", "--prune", "origin"])
+        self.ok(["git", "-C", self.product_seed, "checkout", "-q", "-B", "trunk",
+                 "origin/trunk"])
+
+    def test_a_product_without_the_branch_accepts_a_commit_on_another_origin_branch(self):
+        self.move_product_to_trunk()
+        commit = self.push_product("trunk")
+        self.begin()
+        self.push_report(report_text(commits=commit[:10]))
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.origin_subjects()[0], "report: demo")
+
+    def test_a_product_without_the_branch_refuses_a_commit_on_no_origin_branch(self):
+        # The commit is only in the orchestrator's product clone; no origin branch has it.
+        self.move_product_to_trunk()
+        (self.product / "local.py").write_text("local\n", encoding="utf-8")
+        self.git_commit_all(self.product)
+        local = self.ok(["git", "-C", self.product, "rev-parse", "HEAD"])
+        self.begin()
+        before = self.push_report(report_text(commits=local[:12]))
+        result = self.report()
+        self.assert_refused_unchanged(result, "commits", before)
+        self.assertIn("origin/master of the -dev clone or on origin/trunk of the product",
+                      result.stderr)
+        self.assertIn(local[:12], result.stderr)
+
+    def test_a_product_with_the_branch_refuses_a_commit_only_on_another_branch(self):
+        # The product has master, so a commit left on a side branch does not count.
+        side = self.push_product("side")
+        self.begin()
+        before = self.push_report(report_text(commits=side[:10]))
+        result = self.report()
+        self.assert_refused_unchanged(result, "commits", before)
+        self.assertIn("origin/master of the -dev clone or on origin/master of the product",
+                      result.stderr)
+
+    def test_a_dev_commit_only_on_another_dev_branch_is_refused(self):
+        # The product has no master, yet -dev does: there only origin/master counts.
+        self.move_product_to_trunk()
+        self.ok(["git", "-C", self.seed, "checkout", "-q", "-b", "side"])
+        (self.seed / "side.md").write_text("side\n", encoding="utf-8")
+        self.ok(["git", "-C", self.seed, "add", "side.md"])
+        self.ok(["git", "-C", self.seed, "commit", "-q", "--no-verify", "-m", "side"])
+        self.ok(["git", "-C", self.seed, "push", "-q", "origin", "side"])
+        side = self.ok(["git", "-C", self.seed, "rev-parse", "HEAD"])
+        self.ok(["git", "-C", self.seed, "checkout", "-q", "master"])
+        self.begin()
+        before = self.push_report(report_text(commits=side[:10]))
+        self.assert_refused_unchanged(self.report(), "commits", before)
+
+
 class ReportOnceTest(ReportCase):
     def test_a_second_report_commits_nothing(self):
         self.begin()

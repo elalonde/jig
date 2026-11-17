@@ -149,23 +149,49 @@ def read_report(clone, branch, unit):
     return lines
 
 
-def is_known(repo, branch, value):
-    """Say whether a hash names one commit that origin's branch of the repo holds."""
+def held_by(repo, refs, value):
+    """Say whether a hash names one commit that one of the given refs of the repo holds."""
     full = helpers.git_out(repo, "rev-parse", "--verify", "-q", f"{value}^{{commit}}")
     if not full:
         return False
-    return helpers.git(repo, "merge-base", "--is-ancestor", full,
-                       f"refs/remotes/origin/{branch}").returncode == 0
+    return any(helpers.git(repo, "merge-base", "--is-ancestor", full, ref).returncode == 0
+               for ref in refs)
+
+
+def is_known(repo, branch, value):
+    """Say whether a hash names one commit that origin's branch of the repo holds."""
+    return held_by(repo, [f"refs/remotes/origin/{branch}"], value)
+
+
+def product_refs(product, branch):
+    """Return the origin branches of the product clone that may hold a report's commits.
+
+    The product can start its version lines later than -dev does, so before that it has
+    no branch of the conf's name, and its units commit to the branch their prompt names.
+    Any origin branch counts then. Once the product has the branch, only it counts, as
+    in -dev, so that a commit left on a side branch is still refused.
+    """
+    own = f"refs/remotes/origin/{branch}"
+    if helpers.git_out(product, "rev-parse", "--verify", "-q", own):
+        return [own]
+    listed = helpers.git_out(product, "for-each-ref", "--format=%(refname)",
+                             "refs/remotes/origin/")
+    # origin/HEAD only points at another of these branches.
+    return [ref for ref in listed.splitlines() if ref and ref != "refs/remotes/origin/HEAD"]
 
 
 def check_commits(lines, clone, product, branch):
     value = lines[4][len("commits: "):]
     if value == PLACEHOLDER:
         return
+    refs = product_refs(product, branch)
     unknown = [entry for entry in value.split(" ")
-               if not (is_known(clone, branch, entry) or is_known(product, branch, entry))]
+               if not (is_known(clone, branch, entry) or held_by(product, refs, entry))]
     if unknown:
-        refuse("commits", f"not on origin/{branch} of the -dev or the product clone: "
+        names = ", ".join(ref[len("refs/remotes/"):] for ref in refs)
+        read = f"on {names} of the product clone" if refs \
+            else "on an origin branch of the product clone, which has none"
+        refuse("commits", f"not on origin/{branch} of the -dev clone or {read}: "
                           f"{' '.join(unknown)}")
 
 
