@@ -238,8 +238,11 @@ def check_vectors(lines, conf, account, clone, product, branch):
     directory = vector_directory(clone, branch)
     if directory is None:
         return
+    # The same origin branches as for the commits: line, so that a product that has no
+    # branch of the conf's name yet still has its listed commits read.
+    refs = product_refs(product, branch)
     for entry in value.split(" "):
-        if not is_known(product, branch, entry):
+        if not held_by(product, refs, entry):
             continue
         paths = vector_paths(product, entry, directory)
         if paths:
@@ -285,9 +288,16 @@ def check_unnamed_vectors(lines, conf, account, clone, product, branch, unit, lo
     named = set() if value == PLACEHOLDER else {
         helpers.git_out(product, "rev-parse", "--verify", "-q", f"{entry}^{{commit}}")
         for entry in value.split(" ")}
-    listed = helpers.git(product, "log", "--format=%H %ct", f"refs/remotes/origin/{branch}")
+    # Before the product has a branch of the conf's name, its units commit to the branch
+    # their prompt names, so every origin branch is read; a product with no origin branch
+    # at all has no pushed commit to read.
+    refs = product_refs(product, branch)
+    if not refs:
+        return
+    listed = helpers.git(product, "log", "--format=%H %ct", *refs, "--")
     if listed.returncode != 0:
-        refuse("vectors", f"cannot list origin/{branch} in {product}: "
+        names = ", ".join(ref[len("refs/remotes/"):] for ref in refs)
+        refuse("vectors", f"cannot list {names} in {product}: "
                           f"{helpers.last_line(listed)}")
     for line in listed.stdout.splitlines():
         commit, committed = line.split(" ")

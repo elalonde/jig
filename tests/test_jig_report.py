@@ -74,6 +74,16 @@ class ReportCase(StartCase):
     def push_report(self, text=None):
         return self.push_files({REPORT: text or report_text()}, "log: demo")
 
+    def move_product_to_trunk(self):
+        """Leave the product's origin with trunk and no master, in every clone."""
+        self.ok(["git", "-C", self.product_origin, "branch", "-q", "trunk", "master"])
+        self.ok(["git", "-C", self.product_origin, "symbolic-ref", "HEAD", "refs/heads/trunk"])
+        self.ok(["git", "-C", self.product_origin, "branch", "-q", "-D", "master"])
+        self.ok(["git", "-C", self.product, "fetch", "-q", "--prune", "origin"])
+        self.ok(["git", "-C", self.product_seed, "fetch", "-q", "--prune", "origin"])
+        self.ok(["git", "-C", self.product_seed, "checkout", "-q", "-B", "trunk",
+                 "origin/trunk"])
+
     def exit_file(self, name, code, mtime=None):
         path = self.reviews / name
         path.write_text(f"{code}\n", encoding="utf-8")
@@ -249,16 +259,6 @@ class ReportProductLineTest(ReportCase):
         self.git_commit_all(self.product_seed)
         self.ok(["git", "-C", self.product_seed, "push", "-q", "origin", f"HEAD:{branch}"])
         return self.ok(["git", "-C", self.product_seed, "rev-parse", "HEAD"])
-
-    def move_product_to_trunk(self):
-        """Leave the product's origin with trunk and no master, in every clone."""
-        self.ok(["git", "-C", self.product_origin, "branch", "-q", "trunk", "master"])
-        self.ok(["git", "-C", self.product_origin, "symbolic-ref", "HEAD", "refs/heads/trunk"])
-        self.ok(["git", "-C", self.product_origin, "branch", "-q", "-D", "master"])
-        self.ok(["git", "-C", self.product, "fetch", "-q", "--prune", "origin"])
-        self.ok(["git", "-C", self.product_seed, "fetch", "-q", "--prune", "origin"])
-        self.ok(["git", "-C", self.product_seed, "checkout", "-q", "-B", "trunk",
-                 "origin/trunk"])
 
     def test_a_product_without_the_branch_accepts_a_commit_on_another_origin_branch(self):
         self.move_product_to_trunk()
@@ -536,8 +536,8 @@ def local_time(seconds):
     return datetime.datetime.fromtimestamp(seconds).astimezone().isoformat(timespec="seconds")
 
 
-class ReportUnitVectorTest(ReportCase):
-    """Product commits made during a unit and left out of its report.
+class UnitVectorCase(ReportCase):
+    """A project with the row recompute, whose unit began some minutes before now.
 
     The unit's first start line is some minutes before now and its log commit is made
     now, so a product commit's committer time places it before, during or after the unit.
@@ -548,24 +548,36 @@ class ReportUnitVectorTest(ReportCase):
         self.now = int(time.time())
         self.push_files({"checks.tsv": VECTOR_CHECKS_TSV}, "checks")
 
-    def product_commit_at(self, seconds, files):
-        """Push a product commit whose committer time is the given time; return its hash."""
+    def product_commit_at(self, seconds, files, branch="master", clone=None):
+        """Make a product commit with the given committer time; return its hash.
+
+        By default the commit is made in the seed clone and pushed to the branch of
+        origin. Made in another clone, such as the orchestrator's product clone, it is
+        not pushed, so no origin branch holds it.
+        """
+        clone = clone or self.product_seed
         for name, text in files.items():
-            path = self.product_seed / name
+            path = clone / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
         env = self.env(GIT_COMMITTER_DATE=f"@{seconds} +0000")
-        for command in (["add", "-A"], ["commit", "-q", "--no-verify", "-m", "fixture"],
-                        ["push", "-q", "origin", "master"]):
-            result = run(["git", "-C", self.product_seed, *command], env=env)
+        commands = [["add", "-A"], ["commit", "-q", "--no-verify", "-m", "fixture"]]
+        if clone == self.product_seed:
+            commands.append(["push", "-q", "origin", f"HEAD:{branch}"])
+        for command in commands:
+            result = run(["git", "-C", clone, *command], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
-        return self.ok(["git", "-C", self.product_seed, "rev-parse", "HEAD"])
+        return self.ok(["git", "-C", clone, "rev-parse", "HEAD"])
 
     def unit_ran(self, *starts, commits="none"):
         """Push a start commit for each start time, then the unit's log commit."""
         for seconds in starts:
             self.begin(at=local_time(seconds))
         return self.push_report(report_text(commits=commits))
+
+
+class ReportUnitVectorTest(UnitVectorCase):
+    """Product commits made during a unit and left out of its report."""
 
     def test_an_unnamed_vector_commit_made_during_the_unit_is_refused(self):
         commit = self.product_commit_at(self.now - 1000, {"tests/vectors/a.bin": "vector\n"})
@@ -630,3 +642,53 @@ class ReportUnitVectorTest(ReportCase):
         result = self.report()
         self.assert_refused_unchanged(result, "vectors", before)
         self.assertIn("no start line of demo", result.stderr)
+
+
+class ReportProductLineVectorTest(UnitVectorCase):
+    """The vector directory read in a product that has no branch of the conf's name.
+
+    The conf's branch is master; the product keeps its work on trunk and has no master,
+    as a product does before its version lines begin.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.move_product_to_trunk()
+
+    def test_a_listed_vector_commit_on_another_origin_branch_is_refused(self):
+        commit = self.product_commit_at(self.now - 1000, {"tests/vectors/a.bin": "vector\n"},
+                                        branch="trunk")
+        before = self.unit_ran(self.now - 2000, commits=commit[:10])
+        result = self.report()
+        self.assert_refused_unchanged(result, "vectors", before)
+        self.assertIn(f"{commit[:10]} changes tests/vectors/a.bin", result.stderr)
+        self.assertNotIn("not named", result.stderr)
+
+    def test_an_unnamed_vector_commit_on_another_origin_branch_is_refused(self):
+        commit = self.product_commit_at(self.now - 1000, {"tests/vectors/a.bin": "vector\n"},
+                                        branch="trunk")
+        before = self.unit_ran(self.now - 2000)
+        result = self.report()
+        self.assert_refused_unchanged(result, "vectors", before)
+        self.assertIn(f"{commit[:12]} changes tests/vectors/a.bin", result.stderr)
+        self.assertIn("not named in commits:", result.stderr)
+
+    def test_a_listed_commit_that_touches_no_vector_is_accepted_without_a_listing_error(self):
+        # Reading only origin/master, which this product lacks, would fail to list.
+        commit = self.product_commit_at(self.now - 1000, {"tool.py": "print('changed')\n"},
+                                        branch="trunk")
+        self.unit_ran(self.now - 2000, commits=commit[:10])
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("cannot list", result.stderr)
+        self.assertEqual(self.origin_subjects()[0], "report: demo")
+
+    def test_a_vector_commit_on_no_origin_branch_is_not_read(self):
+        # The commit is only in the orchestrator's product clone, made during the unit;
+        # no origin branch holds it, so it is not the unit's pushed work.
+        self.product_commit_at(self.now - 1000, {"tests/vectors/a.bin": "vector\n"},
+                               clone=self.product)
+        self.unit_ran(self.now - 2000)
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.origin_subjects()[0], "report: demo")
