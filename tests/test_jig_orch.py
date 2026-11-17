@@ -754,6 +754,23 @@ class TestSessionFolders(OrchTestCase):
         self.assertIsNone(self.pane())
         self.assertFalse(self.state.exists())
 
+    def test_a_conf_file_without_the_orchestrator_account_still_passes_its_folders(self):
+        # A hand-written conf file with no ORCH_ACCOUNT line: the supervisor takes the
+        # orchestrator account, and its own folders are in the approved list of that
+        # account, so the start finds no folder to refuse.
+        conf = self.home / ".config" / "jig" / f"{PROJECT}.conf"
+        text = conf.read_text(encoding="utf-8")
+        conf.write_text("".join(line for line in text.splitlines(keepends=True)
+                                if not line.startswith("ORCH_ACCOUNT=")), encoding="utf-8")
+        said = []
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            orch = self.in_process()
+            passed, refused = orch.prepare(said.append, said.append)
+        self.assertEqual(orch.account, "orchestrator")
+        self.assertIsNone(refused)
+        self.assertEqual(passed, self.role_dirs)
+        self.assertEqual(self.marked(), sorted([str(self.clone), *self.role_dirs]))
+
     def test_loop_starts_no_session_at_a_refused_folder_and_logs_it(self):
         # The test before each session the loop starts after an exit: no session, the
         # line in the log, and a result that ends the loop.

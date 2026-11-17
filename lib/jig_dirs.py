@@ -172,11 +172,15 @@ def approved_list(conf, account, project, folders, srv_root=None):
 
     That is the -dev clone, the list of each role that runs in the account by the
     conf file, the orchestrator's list with the jig root of srv_root, and the folders
-    of the account in the section Directories, which come absolute.
+    of the account in the section Directories, which come absolute. A conf file
+    without the key of one of the three accounts gives that account its own word,
+    as homes_of does, so that a hand-written conf file without ORCH_ACCOUNT still
+    gives the orchestrator account its own list.
     """
+    defaults = {key: word for word, key in ACCOUNT_KEYS.items()}
     listed = [f"~/ws/src/{project}-dev"]
     for role, key in ROLE_KEYS:
-        if account in conf.get(key, "").split():
+        if account in (conf.get(key) or defaults.get(key, "")).split():
             listed.extend(with_srv(of_role(role, project), srv_root))
     return [*listed, *folders]
 

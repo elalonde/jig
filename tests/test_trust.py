@@ -299,6 +299,20 @@ class ApprovedListTest(unittest.TestCase):
         spec = jig_dirs.approved_list(self.conf, "specwriter", PROJECT, [])
         self.assertIn("~/ws/ref/demo", spec)
 
+    def test_a_conf_file_without_the_key_of_an_account_gives_it_its_own_word(self):
+        # A hand-written conf file may leave out the account keys. Each of the three
+        # accounts then has its own word as its account, as elsewhere in jig, so the
+        # orchestrator account still gets the orchestrator's list; a reviewer, which
+        # has no word of its own, gets nothing.
+        conf = {"REV_ACCOUNT": "specwriter"}
+        orch = jig_dirs.approved_list(conf, "orchestrator", PROJECT, [])
+        self.assertEqual(orch, ["~/ws/src/demo-dev", *jig_dirs.of_role("orch", PROJECT)])
+        impl = jig_dirs.approved_list({}, "implementer", PROJECT, [])
+        self.assertEqual(impl, ["~/ws/src/demo-dev", *jig_dirs.of_role("impl", PROJECT)])
+        # A key that is there still decides, also against the default.
+        moved = jig_dirs.approved_list({"ORCH_ACCOUNT": "boss"}, "orchestrator", PROJECT, [])
+        self.assertEqual(moved, ["~/ws/src/demo-dev"])
+
     def test_the_orchestrators_list_follows_the_jig_root(self):
         listed = jig_dirs.approved_list(self.conf, "orchestrator", PROJECT, [], "/tmp/root")
         self.assertIn("/tmp/root/in/demo", listed)
