@@ -17,6 +17,15 @@ def prompt_with(read, role="impl", account=None, project="jig"):
 
 
 class ReadCheckCase(ValidateCase):
+    def use_profile(self, *records):
+        """Point the jig conf at a -dev clone of its own, with one kickoff tag per record."""
+        self.profiles = getattr(self, "profiles", 0) + 1
+        origin, work, clone = make_dev_repos(self.tmp / f"profile{self.profiles}", self.env())
+        for number, record in enumerate(records, 1):
+            push_kickoff(self.env(), work, number, record)
+        write_conf(self.home, "jig", clone)
+        return origin, clone
+
     def assert_passes(self, path, role="impl", **given):
         with self.subTest(path=path, role=role):
             self.assert_valid("prompt", prompt_with(f"READ: {path} by grep.", role, **given))
@@ -185,15 +194,6 @@ class ReadOtherTextTest(ReadCheckCase):
 class ReadCleanRoomTest(ReadCheckCase):
     """The ~/ws/ref rule follows the clean room of the project's profile."""
 
-    def use_profile(self, *records):
-        """Point the jig conf at a -dev clone of its own, with one kickoff tag per record."""
-        self.profiles = getattr(self, "profiles", 0) + 1
-        origin, work, clone = make_dev_repos(self.tmp / f"profile{self.profiles}", self.env())
-        for number, record in enumerate(records, 1):
-            push_kickoff(self.env(), work, number, record)
-        write_conf(self.home, "jig", clone)
-        return origin, clone
-
     def assert_no_value(self, read="READ: ~/ws/ref/jig/x.", role="spec"):
         # As with the clean room on: the path is refused, and stderr says why.
         result = self.validate("prompt", prompt_with(read, role))
@@ -266,6 +266,53 @@ class ReadCleanRoomTest(ReadCheckCase):
         self.assert_passes("~/ws/ref/jig/x", "spec")
         self.assert_refused("~/ws/ref/my-app/x", "spec", project="my-app")
 
+
+
+def with_directories(record, *lines):
+    """Return a kickoff record with a section Directories of these lines at its end."""
+    return record + "\n".join(["## Directories", "", "The extra folders of each account.",
+                               "", *lines, ""])
+
+
+class ReadDirectoriesTest(ReadCheckCase):
+    """The folders that the kickoff record gives the prompt's account join its role's list."""
+
+    def use_folders(self, *lines, clean_room="on"):
+        self.use_profile(with_directories(kickoff_record(f"clean room: {clean_room}"), *lines))
+
+    def test_read_path_in_a_folder_of_the_prompts_account_passes(self):
+        # The section gives the implementer account a data folder and the orchestrator
+        # account one more inbox. A READ path in such a folder passes for a prompt of
+        # that account, in each role that runs there.
+        data, inbox = self.tmp / "oracle", self.tmp / "inbox2"
+        self.use_folders(f"implementer: {data}", f"orchestrator: {inbox}/")
+        for role in ("impl", "rev"):
+            self.assert_passes(f"{data}/vectors.txt", role)
+            self.assert_passes(str(data), role)
+        self.assert_passes(f"{inbox}/note.md", "orch", account="orchestrator")
+
+    def test_the_same_path_for_a_prompt_of_another_account_is_refused(self):
+        # The folders of one account are not in the list of a prompt for another, and a
+        # folder whose name only starts like the given one is not in it either.
+        data, inbox = self.tmp / "oracle", self.tmp / "inbox2"
+        self.use_folders(f"implementer: {data}", f"orchestrator: {inbox}")
+        self.assert_refused(f"{data}/vectors.txt", "spec")
+        self.assert_refused(f"{data}/vectors.txt", "orch", account="orchestrator")
+        self.assert_refused(f"{inbox}/note.md", "impl")
+        self.assert_refused(f"{data}-old/vectors.txt", "impl")
+
+    def test_a_folder_under_ws_ref_for_the_spec_writer_is_refused_with_the_clean_room_on(self):
+        # The section may give the spec writer a folder under ~/ws/ref beside the
+        # project's reference. With the clean room off a READ path in it passes, so the
+        # section is read; with it on, the path is refused as under ~/ws/ref all the same.
+        line = "specwriter: /home/specwriter/ws/ref/oracle-data"
+        path = "~/ws/ref/oracle-data/x"
+        self.use_folders(line, clean_room="off")
+        self.assert_passes(path, "spec")
+        self.use_folders(line)
+        failures = self.assert_invalid("prompt", prompt_with(f"READ: {path} by grep.", "spec"),
+                                       f"READ path {path} is under ~/ws/ref")
+        self.assertEqual(len(failures), 1, failures)
 
 if __name__ == "__main__":
     unittest.main()

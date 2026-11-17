@@ -18,6 +18,12 @@ room: off" a path under ~/ws/ref is judged like any other, against the role's li
 When there is no value to read, a line on stderr says so and the rule holds, as with
 the clean room on.
 
+The list of a role also holds the folders that the kickoff record gives the prompt's
+account, the account on its first line, in its section "Directories" (see
+lib/jig_dirs.py): a session of that account gets them from jig start, so its prompt
+may name them. The rule for ~/ws/ref comes first, so such a folder under ~/ws/ref is
+still refused while the clean room is on, for the spec writer too.
+
 A prompt whose first line names the implementer account must also name the
 sections "Comment standard" and "Commit message standard" of CLAUDE.md in its ROLE
 section: that session writes product code and its commit messages, and those
@@ -254,6 +260,29 @@ def clean_room_on(lines):
     return jig_profile.clean_room_on_for(match["project"])
 
 
+def section_folders(project, account, working_directory):
+    """Return the folders of an account in the section Directories of the kickoff record.
+
+    They are read as jig start reads them, at the newest kickoff tag on origin, through
+    the project's conf file, and written as READ paths are compared. With no conf file,
+    no record, or an account that the conf file does not name, there are none. A line
+    of the section that jig cannot read gives no folder; jig start names it when it
+    starts a session, so it is not repeated here.
+    """
+    import jig_units  # loads jig start's worker part, which only this check needs
+
+    try:
+        conf = jig_units.read_conf(project)
+    except jig_units.Refused:
+        return []
+    word = jig_dirs.word_of(conf, account)
+    if word is None:
+        return []
+    found, _ = jig_dirs.read_directories(jig_profile.read_record(conf["REPO"]),
+                                         jig_dirs.homes_of(conf), project)
+    return [from_home(folder, account, working_directory) for folder in found[word]]
+
+
 def read_failures(lines, clean_room):
     """Check each READ path against the working directory and the list of the first line's role."""
     match = FIRST_LINE.fullmatch(lines[0]) if lines else None
@@ -265,7 +294,8 @@ def read_failures(lines, clean_room):
         return []
     role = match["name"][len(head):-len(tail)]
     working_directory = f"~/ws/src/{project}-dev"
-    allowed = [working_directory, *jig_dirs.of_role(role, project)]
+    allowed = [working_directory, *jig_dirs.of_role(role, project),
+               *section_folders(project, match["account"], working_directory)]
 
     failures = []
     for number, text in read_section_lines(lines):
