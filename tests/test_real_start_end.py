@@ -20,7 +20,9 @@ import subprocess
 import textwrap
 import time
 import unittest
+from unittest import mock
 
+from tests import real_start_end
 from tests.support import ROOT, TempTestCase, clean_env, run
 
 SESSION = "endfx-session"
@@ -89,6 +91,43 @@ SESSION_SCRIPT = textwrap.dedent('''
     while True:
         time.sleep(1)
 ''')
+
+
+class SessionMembersProcTest(TempTestCase):
+    """session_members reads every process of the host, and one odd entry must not stop it.
+
+    A fixture folder stands in for /proc; the leader is a made-up session number.
+    """
+
+    LEADER = 4000
+
+    def setUp(self):
+        super().setUp()
+        self.proc = self.tmp / "proc"
+        patcher = mock.patch.object(real_start_end, "PROC", self.proc)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def entry(self, pid, data):
+        folder = self.proc / str(pid)
+        folder.mkdir(parents=True)
+        (folder / "stat").write_bytes(data)
+
+    def test_a_process_whose_name_is_not_utf8_is_still_a_member(self):
+        # A live process of the session has a name of bytes that are not UTF-8, and
+        # another a name cut in the middle of a character: both are members.
+        self.entry(4001, b"4001 (odd\xff\xfe name) S 1 4001 4000 0")
+        self.entry(4002, b"4002 (cut\xe2\x82) S 1 4002 4000 0")
+        self.assertEqual(sorted(real_start_end.session_members(self.LEADER)), [4001, 4002])
+
+    def test_entries_that_cannot_be_read_are_skipped(self):
+        # One entry has no closing parenthesis, one has no fields after the name, and
+        # one a session that is no number; one live member is left to find.
+        self.entry(4001, b"4001 (no end S 1 1 4000 0")
+        self.entry(4002, b"4002 (empty)")
+        self.entry(4003, b"4003 (word) S 1 1 many 0")
+        self.entry(4004, b"4004 (sleep) S 1 4004 4000 0")
+        self.assertEqual(real_start_end.session_members(self.LEADER), [4004])
 
 
 class RealStartEndTest(TempTestCase):

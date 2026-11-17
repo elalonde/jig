@@ -167,6 +167,42 @@ class KillGroupTest(TempTestCase):
         self.assertFalse(runs(child))
 
 
+class GroupRunsProcTest(TempTestCase):
+    """group_runs reads every process of the host, and one odd entry must not stop it.
+
+    A fixture folder stands in for /proc. The test's own process group is the group, so
+    that killpg finds it and the reader is asked.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.module = load_run_check()
+        self.module.PROC = self.tmp / "proc"
+        self.group = os.getpgrp()
+
+    def entry(self, pid, data):
+        folder = self.module.PROC / str(pid)
+        folder.mkdir(parents=True)
+        (folder / "stat").write_bytes(data)
+
+    def test_a_process_whose_name_is_not_utf8_is_still_read(self):
+        # The only live process of the group has a name of bytes that are not UTF-8,
+        # and a name cut in the middle of a character: the group still runs.
+        self.entry(4001, b"4001 (odd\xff\xfe name) S 1 %d %d 0" % (self.group, self.group))
+        self.entry(4002, b"4002 (cut\xe2\x82) S 1 1 1 0")
+        self.assertTrue(self.module.group_runs(self.group))
+
+    def test_entries_that_cannot_be_read_are_skipped_and_the_group_has_ended(self):
+        # One entry has no closing parenthesis, one has no fields after the name, and
+        # one a group that is no number; the group's own process is a zombie. The
+        # reader skips the three and finds no live process of the group.
+        self.entry(4001, b"4001 (no end S 1 1 1 0")
+        self.entry(4002, b"4002 (empty)")
+        self.entry(4003, b"4003 (word) S 1 many 1 0")
+        self.entry(4004, b"4004 (gone) Z 1 %d %d 0" % (self.group, self.group))
+        self.assertFalse(self.module.group_runs(self.group))
+
+
 class RunCheckCase(TempTestCase):
     """A -dev root with checks.tsv, its conf file, and a private tmux server for the unit."""
 

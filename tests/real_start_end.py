@@ -36,6 +36,8 @@ STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 # saves its state as it exits. What is left after that is killed.
 SESSION_EXIT_SECONDS = 20
 KILLED_EXIT_SECONDS = 2
+# The process table that session_members reads; tests point it at a fixture folder.
+PROC = pathlib.Path("/proc")
 
 
 def capture(*command):
@@ -55,17 +57,20 @@ def session_members(leader):
     the pane that did not leave it carries that number.
     """
     members = []
-    for entry in pathlib.Path("/proc").iterdir():
+    for entry in PROC.iterdir():
         if not entry.name.isdigit():
             continue
+        # The name in parentheses can hold spaces, and it is bytes that need not be
+        # UTF-8; the fields after it are plain. An entry that still cannot be read is
+        # skipped, so that one odd process of the host never stops the end of the run
+        # before the worktree is put back.
         try:
-            text = (entry / "stat").read_text(encoding="utf-8")
-        except OSError:
+            text = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            fields = text.rsplit(")", 1)[1].split()
+            if fields[0] != "Z" and int(fields[3]) == leader:
+                members.append(int(entry.name))
+        except (OSError, ValueError, IndexError):
             continue
-        # The name in parentheses can hold spaces; the fields after it are plain.
-        fields = text.rsplit(")", 1)[1].split()
-        if fields[0] != "Z" and int(fields[3]) == leader:
-            members.append(int(entry.name))
     return members
 
 
