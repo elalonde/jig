@@ -4,10 +4,13 @@ A run of real-start starts real Claude Code sessions in this account, makes temp
 folders, and moves the approved worktree ~/ws/src/jig-dev-approved to the tag of its
 test. The start marks each folder that it passes as trusted in ~/.claude.json, and a
 session adds an entry for the folder it works in. At its end, after a pass, after a
-failure, and when the run gets SIGTERM, SIGHUP or SIGINT, the run ends the sessions that
-it started, removes its temporary folders, puts the approved worktree back at the commit
+failure, and when the run gets SIGTERM, SIGHUP or SIGINT, the run first ends the worker
+processes that still run, then ends the sessions that it started, removes its temporary
+folders and the other files it made, puts the approved worktree back at the commit
 where it found it, and then removes the entries of its folders from "projects" of
-~/.claude.json. The entries go last because a session that still runs writes the whole
+~/.claude.json. A worker goes first because it would otherwise go on after the end: it
+could move the worktree after the end put it back, or start a session after the end
+looked for it. The entries go last because a session that still runs writes the whole
 file from its own read and could put an entry back. The next make check in the account
 reads the approved worktree, so it must be back at the commit of the running work.
 SIGKILL cannot be caught, so a killed run has no end.
@@ -36,6 +39,8 @@ STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 # saves its state as it exits. What is left after that is killed.
 SESSION_EXIT_SECONDS = 20
 KILLED_EXIT_SECONDS = 2
+# How long a worker process that the end stops gets to exit before it is killed.
+CHILD_EXIT_SECONDS = 5
 # The process table that session_members reads; tests point it at a fixture folder.
 PROC = pathlib.Path("/proc")
 
@@ -90,11 +95,23 @@ def remove_tree(path):
         shutil.rmtree(path, ignore_errors=True)
 
 
+def remove_path(path):
+    """Remove a file of the run, or a folder of it whose entries need no removal."""
+    if os.path.isdir(path) and not os.path.islink(path):
+        remove_tree(path)
+    else:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 class RunEnd:
     """What one run started and made, and the end that removes it.
 
-    A test registers a session before it starts it and a folder when it makes it, so
-    that the end touches only what this run made.
+    A test registers a session before it starts it, a folder or a file when it makes
+    it, and runs each worker process through run, so that the end touches only what
+    this run made.
     """
 
     def __init__(self, approved, home=None, tmux=("tmux",)):
@@ -106,6 +123,8 @@ class RunEnd:
         self.found_at = None
         self.sessions = []
         self.folders = []
+        self.files = []
+        self.children = []
         self.problems = []
         self.ending = False
 
@@ -127,6 +146,53 @@ class RunEnd:
 
     def make_folder(self):
         return self.folder(tempfile.mkdtemp(prefix=PREFIX))
+
+    def file(self, path):
+        """Register a path outside the temporary folders that the run makes.
+
+        It can be a folder too: unlike the folders above, the end looks for no entry of
+        it in ~/.claude.json.
+        """
+        if str(path) not in self.files:
+            self.files.append(str(path))
+        return pathlib.Path(path)
+
+    def run(self, *command, env=None):
+        """Run a command to its end, as subprocess.run with captured text output.
+
+        The command runs in a terminal session of its own, so that the end can stop it
+        with all the processes it started, also when a signal reached this process
+        alone.
+        """
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, env=env,
+                                 start_new_session=True)
+        self.children.append(child)
+        out, err = child.communicate()
+        self.children.remove(child)
+        return subprocess.CompletedProcess(command, child.returncode, out, err)
+
+    def stop_child(self, child):
+        """End a worker that still runs, with what it started, and wait until it is gone."""
+        leader = child.pid
+        try:
+            os.killpg(leader, signal.SIGTERM)
+        except OSError:
+            pass
+        if not wait_until_gone([leader], CHILD_EXIT_SECONDS):
+            for pid in session_members(leader):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            if not wait_until_gone([leader], KILLED_EXIT_SECONDS):
+                self.problems.append(f"real-start: the worker {leader} did not end")
+        # The end may have cut into the wait of run, so the exit is collected here
+        # without blocking.
+        try:
+            child.poll()
+        except OSError:
+            pass
 
     def stop_session(self, name):
         """End a tmux session and wait until its processes are gone.
@@ -157,6 +223,9 @@ class RunEnd:
             return
         tree = str(self.approved)
         if capture("git", "-C", tree, "rev-parse", "HEAD").stdout.strip() == self.found_at:
+            # A worker stopped between opening the tree and moving it leaves it open at
+            # the old commit; the start leaves it read-only.
+            capture("chmod", "-R", "a-w", tree)
             return
         # The start leaves the worktree read-only; it goes back to read-only here too.
         capture("chmod", "-R", "u+w", tree)
@@ -184,10 +253,14 @@ class RunEnd:
             return self.problems
         self.ending = True
         ignore_stop_signals()
+        for child in list(self.children):
+            self.stop_child(child)
         for name in self.sessions:
             self.stop_session(name)
         for folder in self.folders:
             remove_tree(folder)
+        for path in self.files:
+            remove_path(path)
         self.put_back()
         self.remove_entries()
         return self.problems

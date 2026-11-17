@@ -150,7 +150,7 @@ class RealStartTest(unittest.TestCase):
         self.beside = self.lock.with_name(self.lock.name + ".expected")
 
     def run_worker(self, prompt):
-        return capture(str(WORKER), PROJECT, "impl", UNIT, str(prompt), "--expected", EXPECTED,
+        return END.run(str(WORKER), PROJECT, "impl", UNIT, str(prompt), "--expected", EXPECTED,
                        "--model", MODEL, "--approved-tag", TAG, "--tag", TAG, env=self.env)
 
     def stop_session(self):
@@ -171,6 +171,9 @@ class RealStartTest(unittest.TestCase):
                          f"{self.lock} belongs to another unit; this test leaves it")
         self.assertFalse(session_alive(), f"{SESSION} is running")
         END.session(SESSION)
+        # The lock was free, so the lock and its file of expected minutes are the run's.
+        END.file(self.lock)
+        END.file(self.beside)
         size_before = TEE.stat().st_size if TEE.exists() else 0
         self.addCleanup(self.stop_session)
         scratch = END.make_folder()
@@ -224,6 +227,7 @@ class RealCloseTest(unittest.TestCase):
         self.assertFalse(session_alive(CLOSE_SESSION), f"{CLOSE_SESSION} is running")
         self.assertFalse(CLOSE_TRANSCRIPTS.exists(), f"{CLOSE_TRANSCRIPTS} is not this test's")
         END.session(CLOSE_SESSION)
+        END.file(CLOSE_TRANSCRIPTS)
         dialog = load_start_worker().TRUST_DIALOG
         folder = str(END.make_folder())
         lock_dir = END.make_folder()
@@ -252,7 +256,7 @@ class RealCloseTest(unittest.TestCase):
         lock.write_text(f"session={CLOSE_SESSION}\nstart=now\n", encoding="utf-8")
         beside = lock.with_name(lock.name + ".expected")
         beside.write_text(f"{EXPECTED}\n", encoding="utf-8")
-        closed = capture(str(CLOSE_WORKER), PROJECT, "impl", CLOSE_UNIT, "--dead",
+        closed = END.run(str(CLOSE_WORKER), PROJECT, "impl", CLOSE_UNIT, "--dead",
                          env={**os.environ, "JIG_LOCK_DIR": str(lock_dir)})
         self.assertEqual(closed.returncode, 0, closed.stderr)
         print(closed.stdout.strip())
@@ -302,6 +306,7 @@ class FixtureProjectCase(unittest.TestCase):
         # These places were checked to be free, so the run makes them and may remove them.
         for path in (HOOK_PROMPTS, HOOK_REVIEWS):
             END.folder(path)
+        END.file(HOOK_CONF)
         self.base = END.make_folder()
         self.addCleanup(self.remove_base)
         if self.IN_HOME:
@@ -397,7 +402,7 @@ class FixtureProjectCase(unittest.TestCase):
         command of the session's pane, read before the session ends.
         """
         tag_args = tag_args or ("--approved-tag", HOOK_TAG, "--tag", HOOK_TAG)
-        result = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
+        result = END.run(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
                          "--expected", EXPECTED, "--model", MODEL, *tag_args, *add_dirs,
                          env=self.env)
         print(f"worker: exit {result.returncode}")
@@ -626,7 +631,7 @@ class RealKickoffTagTest(FixtureProjectCase):
         self.stop_session()
         self.git("-C", str(self.seed), "tag", "-a", "-m", "approve the specs", HOOK_TAG)
         self.git("-C", str(self.seed), "push", "-q", "origin", HOOK_TAG)
-        refused = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
+        refused = END.run(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
                           "--expected", EXPECTED, "--model", MODEL, "--tag", KICKOFF_TAG,
                           "--approved-tag", KICKOFF_TAG, env=self.env)
         print(f"worker with a spec tag on origin: {refused.stderr.strip()}")
