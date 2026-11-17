@@ -33,7 +33,16 @@ installs in its product clone or removes from it, as the pre-commit hook and as 
 commit-msg hook, and the text of lib/jig_clones.py,
 by which the worker finds that clone beside its -dev clone. The session gets the
 role's directories of lib/jig_dirs.py that exist in the worker account as --add-dir,
-the product clone among them. JIG_SSH holds the ssh command, and tests set it. Exits 1 on a refusal; 2 on a usage error.
+the product clone among them, and the folders of that account in the section
+Directories of the kickoff record at the newest kickoff tag on origin. A line of that
+section that jig cannot read is ignored, with one line on stderr. Before anything
+changes, a folder that is not in the approved list of the account, the -dev clone and
+the lists of the roles that run there with those folders, stops the start: the lists
+give no such folder today, and the check keeps a later change of them from handing a
+session a folder that its account must not read. The worker also gets the text of
+lib/jig_trust.py, by which it marks the -dev clone and each folder it passes as
+trusted in Claude Code before the session starts, so that no session waits at a
+dialog that nobody answers. JIG_SSH holds the ssh command, and tests set it. Exits 1 on a refusal; 2 on a usage error.
 """
 
 import argparse
@@ -56,10 +65,13 @@ VALIDATE = ROOT / "libexec" / "jig-validate"
 HOOK = ROOT / "hooks" / "pre-commit"
 # The worker part cannot import from this tree, so it gets this module as text.
 CLONES = ROOT / "lib" / "jig_clones.py"
+# The same for the step that marks a folder as trusted in Claude Code.
+TRUST = ROOT / "lib" / "jig_trust.py"
 sys.path.insert(0, str(ROOT / "lib"))
 
 import jig_dirs  # noqa: E402
 import jig_ids  # noqa: E402
+import jig_profile  # noqa: E402
 import jig_push  # noqa: E402
 
 # The worker script is the one place for what both parts need.
@@ -137,9 +149,10 @@ def run_worker(account, args, stage, extra, tags, approved_tag):
     """Run a stage of the worker part in the worker account; refuse when it fails."""
     target = f"~/ws/prompts/{args.project}/{args.unit}.md"
     clones = base64.b64encode(CLONES.read_bytes()).decode("ascii")
+    trust = base64.b64encode(TRUST.read_bytes()).decode("ascii")
     words = ["python3", "-I", "-", args.project, args.role, args.unit, target,
              "--stage", stage, "--account", account, "--effort", args.effort,
-             "--clones", clones, *extra]
+             "--clones", clones, "--trust", trust, *extra]
     for tag in tags:
         words += ["--tag", tag]
     if approved_tag:
@@ -177,6 +190,29 @@ def select_model(text, given):
     if wrong_family or (named.startswith("claude-") and given != named):
         refuse("model", f"the prompt names {named}, not {given}")
     return given
+
+
+def session_folders(conf, project, account, role):
+    """Return the folders to pass to a session of a role in an account, as written.
+
+    They are the role's list and the account's folders in the section Directories of
+    the kickoff record. Each line of that section that jig cannot read is reported on
+    stderr. A folder outside the approved list of the account is refused.
+    """
+    homes = jig_dirs.homes_of(conf)
+    word = jig_dirs.word_of(conf, account)
+    found, problems = jig_dirs.read_directories(jig_profile.read_record(conf["REPO"]),
+                                                homes, project)
+    for line in problems:
+        print(line, file=sys.stderr, flush=True)
+    extra = found.get(word, [])
+    candidates = [*jig_dirs.of_role(role, project), *extra]
+    approved = jig_dirs.approved_list(conf, account, project, extra)
+    outside = jig_dirs.first_outside(candidates, approved, homes.get(word))
+    if outside is not None:
+        refuse("folders", f"{outside} is not in the approved list of the folders of "
+                          f"{account}; no session was started")
+    return candidates
 
 
 def push_status(clone, branch):
@@ -271,12 +307,12 @@ def start(args):
     list_role = args.role
     if args.role == "rev" and account in worker.role_accounts(conf, "spec"):
         list_role = "spec"
-    add_dirs = [word for directory in jig_dirs.of_role(list_role, args.project)
-                for word in ("--add-dir", directory)]
 
     branch = ["--branch", conf["BRANCH"]]
     run_worker(account, args, "check", branch, tags, approved_tag)
     model = select_model(text, args.model)
+    add_dirs = [word for directory in session_folders(conf, args.project, account, list_role)
+                for word in ("--add-dir", directory)]
 
     hook = base64.b64encode(HOOK.read_bytes()).decode("ascii")
     head = write_status(conf, args.unit)

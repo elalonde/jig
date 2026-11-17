@@ -53,6 +53,37 @@ def pattern_file_differences(path):
     return differences
 
 
+# The first line of the block's trust step, which runs to the end of its step 5.
+TRUST_STEP_START = "# Claude Code asks whether a folder can be trusted"
+
+
+class TrustStepMixin:
+    """Run the trust step of a written block on the fixture accounts, and read marks."""
+
+    def run_trust_step(self):
+        """Run the block's trust step; ssh runs the command in the account's fixture home.
+
+        An account whose fixture home is missing cannot be reached, as ssh to an
+        account that does not answer.
+        """
+        text = (self.srv / "blocks/demo/new.sh").read_text(encoding="utf-8")
+        step = text[text.index(TRUST_STEP_START):text.index('echo "step 5 ok"')]
+        fake_ssh = ('ssh() {\n  [ "$1" = -o ] && shift 2\n  local home="$FAKE/accounts/${1%@*}"\n'
+                    '  shift\n  [ -d "$home" ] || return 255\n'
+                    '  (cd "$home" && HOME="$home" bash -c "$*")\n}\n')
+        prelude = (f"set -eu -o pipefail\nSPEC=specwriter\nIMPL=implementer\n"
+                    f"d=ws/src/{PROJECT}-dev\n")
+        return run(["bash", "-c", prelude + fake_ssh + step], env=self.env(FAKE=str(self.fake)))
+
+    def trust_entry(self, home):
+        """Return the entry of the home's -dev clone in its Claude Code state."""
+        state = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        return state["projects"][str(home / "ws" / "src" / f"{PROJECT}-dev")]
+
+    def trust_lines(self, output):
+        return [line for line in output.splitlines() if line.startswith("trust ")]
+
+
 class JigNewCase(TempTestCase):
     """The fixture layout of jig new: a srv root, an ssh double and fixture accounts."""
 
@@ -925,6 +956,71 @@ class JigNewTest(JigNewCase):
     def test_usage_error(self):
         self.assertEqual(self.new().returncode, 2)
         self.assertEqual(self.new("a", "b").returncode, 2)
+
+
+class JigNewTrustTest(TrustStepMixin, JigNewCase):
+    """The trust mark of the -dev clone: jig new marks its own account, the block the rest."""
+
+    def test_new_marks_the_orchestrators_dev_clone_and_says_so_in_every_run(self):
+        # The first run makes the mark; a second run, which writes no block, finds it
+        # there, writes nothing and still prints its line.
+        first = self.made()
+        self.assertEqual(self.trust_lines(first.stdout), [f"trust {ORCH}: trusted"])
+        self.assertEqual(self.trust_entry(self.home), {"hasTrustDialogAccepted": True})
+        state = self.home / ".claude.json"
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        before = state.stat()
+        second = self.new(PROJECT)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("kept ", second.stdout)
+        self.assertEqual(self.trust_lines(second.stdout), [f"trust {ORCH}: kept"])
+        self.assertEqual((state.stat().st_ino, state.stat().st_mtime_ns),
+                         (before.st_ino, before.st_mtime_ns))
+
+    def test_new_sets_a_mark_that_a_stopped_first_run_did_not_set(self):
+        # A first run that stopped after it made the clone left no mark.
+        self.made()
+        (self.home / ".claude.json").unlink()
+        second = self.new(PROJECT)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.trust_lines(second.stdout), [f"trust {ORCH}: trusted"])
+        self.assertEqual(self.trust_entry(self.home), {"hasTrustDialogAccepted": True})
+
+    def test_new_names_a_file_it_cannot_use_and_still_exits_0(self):
+        state = self.home / ".claude.json"
+        state.write_text("{not json", encoding="utf-8")
+        result = self.made()
+        lines = result.stdout.splitlines()
+        at = lines.index(f"trust {ORCH}: not marked")
+        self.assertIn(f"{state} of {ORCH}: it is not JSON", lines[at - 1])
+        self.assertEqual(state.read_text(encoding="utf-8"), "{not json")
+
+    def test_block_marks_the_dev_clone_of_the_spec_writer_and_the_implementer(self):
+        self.made()
+        for value in ("trusted", "kept"):
+            result = self.run_trust_step()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             [f"trust specwriter: {value}", f"trust implementer: {value}"])
+        for account in ("specwriter", "implementer"):
+            home = self.account(account)
+            self.assertEqual(self.trust_entry(home), {"hasTrustDialogAccepted": True})
+            self.assertEqual((home / ".claude.json").stat().st_mode & 0o777, 0o600)
+
+    def test_block_goes_on_past_an_account_it_cannot_mark(self):
+        # The implementer cannot be reached and the spec writer's file is not JSON:
+        # each gets its line and "not marked", and the step ends with exit 0.
+        self.made()
+        shutil.rmtree(self.account("implementer"))
+        state = self.account("specwriter") / ".claude.json"
+        state.write_text("[]", encoding="utf-8")
+        result = self.run_trust_step()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertIn(f"{state} of specwriter: its top level is not an object", lines[0])
+        self.assertEqual(lines[1:], ["trust specwriter: not marked", "new: no ssh to implementer",
+                                     "trust implementer: not marked"])
+        self.assertEqual(state.read_text(encoding="utf-8"), "[]")
 
 
 if __name__ == "__main__":

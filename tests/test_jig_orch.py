@@ -30,11 +30,12 @@ import unittest
 import uuid
 from unittest import mock
 
-from tests.support import CLAUDE_DOUBLE, ROOT, TempTestCase, run
+from tests.support import CLAUDE_DOUBLE, ROOT, TempTestCase, git_ok, push_kickoff, run
 from tests.units_support import DIALOG_SCREEN
 
 sys.path.insert(0, str(ROOT / "lib"))
 
+import jig_dirs  # noqa: E402
 import jig_tmux  # noqa: E402
 
 ORCH = ROOT / "libexec" / "jig-orch"
@@ -650,6 +651,120 @@ class TestRestart(OrchTestCase):
         self.assertTrue(pane["dead"])
         self.assertEqual(self.recorded_ids(), f"{pane['id']} {self.session_ids()[2]}\n")
         self.assertEqual(self.new_sessions(), 1)
+
+
+class TestSessionFolders(OrchTestCase):
+    """The section Directories of the kickoff record, the approved list and the trust marks."""
+
+    def setUp(self):
+        super().setUp()
+        # The project's clone gets an origin, where the kickoff tags go.
+        env = self.env()
+        self.origin, self.work = self.tmp / "origin.git", self.tmp / "work"
+        git_ok(env, "init", "-q", "--bare", "-b", BRANCH, self.origin)
+        git_ok(env, "init", "-q", "-b", BRANCH, self.work)
+        git_ok(env, "-C", self.work, "remote", "add", "origin", self.origin)
+        git_ok(env, "-C", self.work, "commit", "-q", "--no-verify", "--allow-empty", "-m", "a")
+        git_ok(env, "-C", self.work, "push", "-q", "origin", BRANCH)
+        git_ok(env, "init", "-q", "-b", BRANCH, self.clone)
+        git_ok(env, "-C", self.clone, "remote", "add", "origin", self.origin)
+        self.role_dirs = [str(self.home / "ws" / "prompts" / PROJECT), str(self.reviews),
+                          *(str(self.srv / part / PROJECT) for part in ("in", "out", "blocks"))]
+        self.state = self.home / ".claude.json"
+
+    def push_directories(self, number, *lines):
+        text = "\n".join(["# Kickoff record", "", "## Directories", "", *lines, ""])
+        push_kickoff(self.env(), self.work, number, text)
+
+    def added(self, call):
+        argv = self.calls()[call]["argv"]
+        return [argv[index + 1] for index, word in enumerate(argv) if word == "--add-dir"]
+
+    def marked(self):
+        projects = json.loads(self.state.read_text(encoding="utf-8"))["projects"]
+        return sorted(folder for folder, entry in projects.items()
+                      if entry == {"hasTrustDialogAccepted": True})
+
+    def in_process(self):
+        """Return the supervisor of the project, run in this process on the fixture."""
+        return load_orch().Orch(PROJECT)
+
+    def test_start_reads_the_section_and_marks_every_folder_it_passes(self):
+        notes = self.tmp / "notes"
+        notes.mkdir()
+        self.push_directories(1, f"orchestrator: {notes}", f"orchestrator: ~/ws/src/{PROJECT}",
+                              f"orchestrator: {self.tmp}/missing", f"implementer: {self.tmp}")
+        result = self.start()
+        self.assertEqual(result.stderr.splitlines(), [
+            "jig: cannot read line 6 of the section Directories of the kickoff record; "
+            "line ignored"])
+        self.assertEqual(self.added(0), [*self.role_dirs, str(notes)])
+        folders = [str(self.clone), *self.role_dirs, str(notes)]
+        trust = [line for line in result.stdout.splitlines() if line.startswith("trust ")]
+        self.assertEqual(trust, [f"trust orchestrator {folder}: trusted" for folder in folders])
+        self.assertEqual(self.marked(), sorted(folders))
+
+    def test_loop_reads_the_section_again_before_each_session_after_an_exit(self):
+        self.start()
+        self.assertEqual(self.added(0), self.role_dirs)
+        before = self.state.stat()
+        # A restart with every mark there writes nothing and logs no trust line.
+        self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+        self.until(lambda: len(self.calls()) == 2, what="the first restart")
+        self.assertEqual((self.state.stat().st_ino, self.state.stat().st_mtime_ns),
+                         (before.st_ino, before.st_mtime_ns))
+        self.assertNotIn(" trust ", self.log())
+        # A new kickoff tag adds a folder and a line jig cannot read; the next session
+        # gets the folder, marked first, and the log gets both lines.
+        data = self.tmp / "data"
+        data.mkdir()
+        self.push_directories(1, f"orchestrator: {data}", "orchestrator: data")
+        self.until(self.ready, what="the restarted session's input bar")
+        self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+        self.until(lambda: len(self.calls()) == 3, what="the second restart")
+        self.assertEqual(self.added(2), [*self.role_dirs, str(data)])
+        self.assertIn(str(data), self.marked())
+        log = self.log()
+        self.assertIn(f" trust orchestrator {data}: trusted\n", log)
+        self.assertIn(" jig: cannot read line 6 of the section Directories of the kickoff "
+                      "record; line ignored\n", log)
+        self.assertLess(log.index(f"trust orchestrator {data}"),
+                        log.rindex("started session"))
+
+    def refuse_reviews(self):
+        """Patch the approved list so that it lacks the reviews folder that is passed."""
+        real = jig_dirs.approved_list
+
+        def without_reviews(*args, **kwargs):
+            return [folder for folder in real(*args, **kwargs)
+                    if folder != f"~/ws/reviews/{PROJECT}"]
+
+        return mock.patch.object(jig_dirs, "approved_list", without_reviews)
+
+    def test_start_refuses_a_folder_outside_the_approved_list_and_starts_no_loop(self):
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), self.refuse_reviews():
+            orch = self.in_process()
+            with self.assertRaises(Exception) as raised:
+                orch.start()
+        self.assertEqual(str(raised.exception),
+                         f"refused: folders: ~/ws/reviews/{PROJECT} is not in the approved "
+                         f"list of the folders of orchestrator; no session was started")
+        self.assertFalse(self.loop_runs())
+        self.assertEqual(self.calls(), [])
+        self.assertIsNone(self.pane())
+        self.assertFalse(self.state.exists())
+
+    def test_loop_starts_no_session_at_a_refused_folder_and_logs_it(self):
+        # The test before each session the loop starts after an exit: no session, the
+        # line in the log, and a result that ends the loop.
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), self.refuse_reviews():
+            orch = self.in_process()
+            orch.state.mkdir(parents=True, exist_ok=True)
+            self.assertFalse(orch.launch())
+        self.assertIn(f"stopped: ~/ws/reviews/{PROJECT} is not in the approved list of the "
+                      f"folders of orchestrator; no session was started", self.log())
+        self.assertEqual(self.calls(), [])
+        self.assertIsNone(self.pane())
 
 
 class TestSessionPane(OrchTestCase):

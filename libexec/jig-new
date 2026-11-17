@@ -19,11 +19,19 @@ seed product clone, at the paths git names for them, with each path in
 keeps that hook and gets no jig commit-msg hook.
 
 What needs the owner's login (the GitHub repos, deploy keys, the first push,
-the clones in the other accounts, the model policy rules, jig's status line in
-each account's Claude Code settings, ~/.tmux.conf) goes into the block
-<srv>/blocks/<project>/new.sh, and the line that runs it is printed last. The
+the clones in the other accounts and their trust marks, the model policy rules,
+jig's status line in each account's Claude Code settings, ~/.tmux.conf) goes into the
+block <srv>/blocks/<project>/new.sh, and the line that runs it is printed last. The
 settings get no hook of another tool. The status line is jig's own install,
 which jig upgrade makes, so jig new does not look for it.
+
+Claude Code asks whether a folder can be trusted at the first session in it, and
+the session waits at that dialog. So jig new marks the orchestrator's -dev clone as
+trusted in ~/.claude.json of this account, and the block marks the -dev clone of
+each account where it makes one, as that account, with the text of lib/jig_trust.py.
+Each prints "trust <account>: <value>", the value trusted, kept or not marked, in
+every run, and a line that names the file when the mark is not set; that line does
+not change the exit code.
 
 The owner's login, the host name, the GitHub owner and the model policy file
 come from <srv>/host.conf, so they never appear in this tree. A file that exists is never
@@ -61,6 +69,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 
+import jig_trust  # noqa: E402
 import jig_units  # noqa: E402
 
 TEMPLATES = ROOT / "templates" / "new"
@@ -71,6 +80,9 @@ PREFS = ROOT / "prefs.md"
 ACCOUNT_SCRIPT = ROOT / "libexec" / "jig-new-account"
 # jig's pre-commit hook, which runs the term check before each commit to the product.
 PRE_COMMIT = ROOT / "hooks" / "pre-commit"
+# The step that marks a folder as trusted in Claude Code. The block carries its text,
+# because the block runs it in the other accounts, where jig's tree is not read.
+TRUST_STEP = ROOT / "lib" / "jig_trust.py"
 SRV_ROOT = "/srv/jig"
 BLOCK_ID = "new"
 FIRST_BRANCH = "0.1"
@@ -386,6 +398,19 @@ def seed_repos(project, host, values, home, existing=False):
         say(f"made {product_target}")
 
 
+def mark_dev_clone(account, home, project):
+    """Mark the -dev clone of this account as trusted in Claude Code; print the result.
+
+    Claude Code would ask about the folder at the first session in it, and that
+    session would wait at the dialog. A run that finds the mark there writes nothing.
+    """
+    value, problem = jig_trust.mark(home / "ws" / "src" / f"{project}-dev", account,
+                                    home=home)
+    if problem:
+        say(problem)
+    say(f"trust {account}: {value}")
+
+
 def write_block(srv, project, values, template):
     """Write the block from its template; return its path and whether it was made now.
 
@@ -451,10 +476,14 @@ def new(project, existing=False):
         "STATUS_LINE": STATUS_LINE,
         "ORCH_HOME": homes["orch"], "SPEC_HOME": homes["spec"],
         "IMPL_HOME": homes["impl"],
+        "TRUST_STEP": TRUST_STEP.read_text(encoding="utf-8").rstrip("\n"),
         # Last, so that no other name is filled inside the preferences' text.
         "PREFS": prefs_text(),
     }
     seed_repos(project, host, values, home, existing)
+    # The orchestrator's -dev clone is made here; the block marks those of the other
+    # accounts, where it makes them.
+    mark_dev_clone(host["ORCH_ACCOUNT"], home, project)
     template = "block-existing.sh.in" if existing else "block.sh.in"
     block, made = write_block(srv, project, values, template)
     digest = hashlib.sha256(block.read_bytes()).hexdigest()[:8]

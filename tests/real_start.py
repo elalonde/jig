@@ -11,6 +11,12 @@ prompt with jig start's own readers, and starts the fixture project with it. The
 kickoff tag test does the same with the tag of the kickoff record, annotated, on an
 origin with no spec tag, and is refused once a spec tag reaches origin. The tests
 use their own test IDs, which no real unit uses.
+
+The worker marks the -dev clone of a start, and each folder it passes, as trusted in
+~/.claude.json of this account before the session starts. So the fixture project's
+sessions start with no folder-trust dialog, and the run leaves the marks of the
+fixture folders in that file. The close test starts claude itself, not through the
+worker, so its new folder has no mark and its session still waits at the dialog.
 """
 
 import getpass
@@ -250,8 +256,11 @@ class FixtureProjectCase(unittest.TestCase):
     The project's -dev clone, its product clone and both bare origins live in a new
     directory under /tmp. The worker reads the project's conf file from this account's
     ~/.config/jig, and puts the prompt and the tee under ~/ws; the test removes all of
-    them. The session waits at the folder-trust dialog in the new folder, so the worker
-    stops there after the install, and the test ends that session and frees its lock.
+    them. The worker marks the new -dev clone and each folder it passes as trusted
+    before the session starts, so the session starts with no folder-trust dialog. A
+    folder of --add-dir can still show the dialog of an added folder, since Claude Code
+    keeps no known mark for such a folder; the worker then stops at that dialog. Either
+    way, the test ends that session and frees its lock.
 
     The fixture product tracks a hooks directory, and the clone has no core.hooksPath,
     as a product has before its first make check: the start sets core.hooksPath to
@@ -286,7 +295,8 @@ class FixtureProjectCase(unittest.TestCase):
         self.addCleanup(self.stop_session)
         self.lock_dir = self.base / "lock"
         self.lock_dir.mkdir()
-        # The settle time only matters when no dialog shows; the dialog stops it sooner.
+        # The session starts with no dialog, so the worker watches it for the whole
+        # settle time, unless the dialog of an added folder stops it sooner.
         self.env = {**os.environ, "JIG_LOCK_DIR": str(self.lock_dir),
                     "JIG_START_SETTLE": "15"}
 
@@ -352,7 +362,10 @@ class FixtureProjectCase(unittest.TestCase):
         lock.with_name(lock.name + ".expected").unlink(missing_ok=True)
 
     def run_worker(self, *tag_args, add_dirs=()):
-        """Run the worker part alone; accept its stop at the folder-trust dialog.
+        """Run the worker part alone; accept a start, or a stop at an added folder's dialog.
+
+        The folder-trust dialog of the start folder no longer comes, because the worker
+        marks that folder first, so a stop there fails the test.
 
         tag_args are the --tag and --approved-tag options; without them, the phase tag
         that the fixture holds is both. add_dirs are the --add-dir words. Returns the
@@ -362,9 +375,12 @@ class FixtureProjectCase(unittest.TestCase):
         result = capture(str(WORKER), HOOK_PROJECT, "impl", HOOK_UNIT, str(self.prompt),
                          "--expected", EXPECTED, "--model", MODEL, *tag_args, *add_dirs,
                          env=self.env)
-        stopped = result.returncode == 1 and "refused: dialog:" in result.stderr
+        self.assertNotIn("folder-trust dialog", result.stderr)
+        stopped = result.returncode == 1 and "the dialog of the added folder" in result.stderr
         self.assertTrue(result.returncode == 0 or stopped, result.stderr)
-        print(f"worker: {'stopped at the folder-trust dialog' if stopped else 'started'}")
+        print(f"worker: {'stopped at the dialog of an added folder' if stopped else 'started'}")
+        print("\n".join(line for line in result.stdout.splitlines()
+                        if line.startswith("trust ")))
         command = capture("tmux", "display-message", "-p", "-t", f"={HOOK_SESSION}:",
                           "#{pane_start_command}").stdout
         self.stop_session()

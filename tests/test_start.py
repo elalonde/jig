@@ -1,5 +1,7 @@
+import contextlib
 import grp
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 from tests.support import CO_AUTHOR_ADDRESS, ROOT, TempTestCase, run
 
@@ -34,10 +37,15 @@ SESSION = "jig-impl-demo"
 UPDATES = "impl/orch/updates.log"
 DIALOG = ("Quick safety check: Is this a project you created or one you trust?\n"
           " 1. No, exit\n 2. Yes, I trust this folder\n Enter to confirm · Esc to cancel\n")
+# The dialog for a folder of --add-dir that Claude Code does not trust, with its folder.
+ADDED_DIALOG = (" Adding a new directory:\n {folder}\n This session hasn't worked here "
+                "before. Is this a directory you created or one\n you trust?\n"
+                " ❯ No, exit\n   Yes, add it\n Enter to confirm · Esc to cancel\n")
 
 # Stands in for claude: says what it was given, then waits as a live session does.
 CLAUDE_DOUBLE = """#!/bin/bash
 printf '%s\\0' "$@" > "$HOME/claude-args"
+cp "$HOME/.claude.json" "$HOME/claude-json-at-start" 2>/dev/null
 pwd > "$HOME/claude-cwd"
 echo "double claude output"
 [ -f "$HOME/claude-exits" ] && exit 3
@@ -865,6 +873,124 @@ git push -q origin master
         self.assertIn("refused: lock:", result.stderr)
         self.assertEqual(self.lock().read_text(encoding="utf-8"), "other\n")
         self.assertFalse(self.worker_file("claude-args").exists())
+
+
+class StartFolderTrustTest(StartCase):
+    """The folders of the section Directories, the approved list, and the trust marks."""
+
+    def setUp(self):
+        super().setUp()
+        self.clone_folder = self.in_worker("ws/src/jig-dev")
+        self.role_dirs = [self.in_worker("ws/prompts/jig"), self.in_worker("ws/reviews/jig"),
+                          self.in_worker("ws/src/jig-dev-approved")]
+
+    def push_directories(self, *lines):
+        """Approve a kickoff record with these lines in its section Directories."""
+        text = "\n".join(["# Kickoff record", "", "## Directories", "", *lines, "",
+                          "## Next", ""])
+        (self.seed / "specs" / "00-kickoff.md").write_text(text, encoding="utf-8")
+        self.git_commit_all(self.seed)
+        self.ok(["git", "-C", self.seed, "push", "-q", "origin", "master"])
+        self.push_annotated_tag("kickoff-r1")
+
+    def state(self, name=".claude.json"):
+        return json.loads(self.worker_file(name).read_text(encoding="utf-8"))
+
+    def trust_lines(self, output):
+        return [line for line in output.splitlines() if line.startswith("trust ")]
+
+    def test_start_marks_the_clone_and_each_folder_before_claude_starts(self):
+        # No mark is there: each is set before the session starts, with one line each;
+        # the product clone, which does not exist, is not passed and gets no mark.
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.given_dirs(), self.role_dirs)
+        folders = [self.clone_folder, *self.role_dirs]
+        self.assertEqual(self.trust_lines(result.stdout),
+                         [f"trust implementer {folder}: trusted" for folder in folders])
+        projects = self.state("claude-json-at-start")["projects"]
+        self.assertEqual(projects, {folder: {"hasTrustDialogAccepted": True}
+                                    for folder in folders})
+
+    def test_start_writes_nothing_when_every_mark_is_there(self):
+        marked = {folder: {"hasTrustDialogAccepted": True}
+                  for folder in [self.clone_folder, *self.role_dirs]}
+        state = self.worker_file(".claude.json")
+        state.write_text(json.dumps({"projects": marked}), encoding="utf-8")
+        before = state.stat()
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trust_lines(result.stdout), [])
+        self.assertNotIn(".claude.json", result.stdout)
+        self.assertEqual((state.stat().st_ino, state.stat().st_mtime_ns),
+                         (before.st_ino, before.st_mtime_ns))
+
+    def test_start_names_a_file_it_cannot_use_and_starts_all_the_same(self):
+        state = self.worker_file(".claude.json")
+        state.write_text("{oops", encoding="utf-8")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        at = lines.index(f"trust implementer {self.clone_folder}: not marked")
+        self.assertIn(f"{state} of implementer: it is not JSON", lines[at - 1])
+        self.assertEqual(len(self.trust_lines(result.stdout)), 4)
+        self.assertEqual(state.read_text(encoding="utf-8"), "{oops")
+
+    def test_start_passes_the_folders_of_its_account_in_the_section(self):
+        # The record names an existing folder of the implementer twice, one that does
+        # not exist, one of another account and a line jig cannot read (line 7).
+        data = self.worker_home / "data"
+        data.mkdir()
+        self.push_directories(f"implementer: {data}", "implementer: data",
+                              f"implementer: {data}/", f"implementer: {self.tmp}/missing",
+                              f"specwriter: {self.worker_home}")
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.given_dirs(), [*self.role_dirs, str(data)])
+        self.assertIn("jig: cannot read line 6 of the section Directories of the kickoff "
+                      "record; line ignored", result.stderr)
+        self.assertEqual(result.stderr.count("cannot read line"), 1)
+        self.assertIn(f"trust implementer {data}: trusted", result.stdout)
+        self.assertNotIn("missing", result.stdout)
+
+    def test_start_refuses_a_folder_outside_the_approved_list_and_starts_nothing(self):
+        # The lists give no such folder, so the approved list here lacks the role's
+        # reviews folder, which the start would pass.
+        real = jig_dirs.approved_list
+
+        def without_reviews(*args, **kwargs):
+            return [folder for folder in real(*args, **kwargs) if folder != "~/ws/reviews/jig"]
+
+        start = load_start()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(jig_dirs, "approved_list", without_reviews), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = start.main(["jig", "impl", "demo", str(self.prompt), "--expected", "45"])
+        self.assertEqual(code, 1, err.getvalue())
+        refusal = [line for line in err.getvalue().splitlines() if "refused:" in line]
+        self.assertEqual(refusal, ["jig start: refused: folders: ~/ws/reviews/jig is not in "
+                                   "the approved list of the folders of implementer; no "
+                                   "session was started"])
+        self.assertEqual(self.origin_subjects(), ["fixture"])
+        self.assertNotEqual(self.tmux("has-session", "-t", f"={SESSION}").returncode, 0)
+        self.assertFalse(self.lock().exists())
+        self.assertFalse(self.worker_file("claude-args").exists())
+        self.assertFalse(self.worker_file(".claude.json").exists())
+
+    def test_start_refuses_at_the_dialog_of_an_added_folder_and_names_it(self):
+        folder = self.in_worker("ws/reviews/jig")
+        (self.worker_home / "claude-dialog").write_text(ADDED_DIALOG.format(folder=folder),
+                                                        encoding="utf-8")
+        result = self.start()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        refusal = [line for line in result.stderr.splitlines() if "refused: dialog:" in line]
+        self.assertEqual(len(refusal), 1)
+        self.assertIn(f"the dialog of the added folder {folder},", refusal[0])
+        self.assertIn(f"tmux attach -t {SESSION}", refusal[0])
+        self.assertEqual(self.tmux("has-session", "-t", f"={SESSION}").returncode, 0)
+        self.assertTrue(self.lock().exists())
+        self.assertFalse(self.worker_file("claude-answered").exists())
 
 
 class StartDirectoriesTest(StartCase):

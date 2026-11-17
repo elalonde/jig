@@ -14,7 +14,8 @@ import shutil
 import unittest
 
 from tests.support import ROOT, run
-from tests.test_jig_new import GITHUB, HOST, ORCH, OWNER, PLACEHOLDER, PROJECT, JigNewCase
+from tests.test_jig_new import GITHUB, HOST, ORCH, OWNER, PLACEHOLDER, PROJECT, JigNewCase, \
+    TrustStepMixin
 
 # The URL that every product clone of the block ends with.
 PRODUCT_URL = f"github-{PROJECT}:{GITHUB}/{PROJECT}"
@@ -454,6 +455,32 @@ class JigNewExistingTest(JigNewCase):
         self.assertIn("jig new cannot test the repository itself", doc)
         readme = (ROOT / "templates" / "new" / "README.md").read_text(encoding="utf-8")
         self.assertIn("block-existing.sh.in", readme)
+
+
+class JigNewExistingTrustTest(TrustStepMixin, JigNewCase):
+    """The trust mark of the -dev clone in the form for a product that exists."""
+
+    def test_existing_new_marks_the_orchestrators_clone_in_every_run_of_either_form(self):
+        first = self.new(PROJECT, "--existing")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.trust_lines(first.stdout), [f"trust {ORCH}: trusted"])
+        self.assertEqual(self.trust_entry(self.home), {"hasTrustDialogAccepted": True})
+        # A run of either form after it keeps the block and the mark, and says so.
+        for form in (["--existing"], []):
+            again = self.new(PROJECT, *form)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertEqual(self.trust_lines(again.stdout), [f"trust {ORCH}: kept"])
+
+    def test_existing_block_marks_the_dev_clone_of_the_spec_writer_and_the_implementer(self):
+        self.assertEqual(self.new(PROJECT, "--existing").returncode, 0)
+        for value in ("trusted", "kept"):
+            result = self.run_trust_step()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             [f"trust specwriter: {value}", f"trust implementer: {value}"])
+        for account in ("specwriter", "implementer"):
+            self.assertEqual(self.trust_entry(self.account(account)),
+                             {"hasTrustDialogAccepted": True})
 
 
 if __name__ == "__main__":

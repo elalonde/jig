@@ -5,7 +5,8 @@
 # exists, and the product clone place of the orchestrator and of the
 # implementer is empty or holds a clone that step 5 keeps or
 # repoints; 2 the GitHub repo of -dev; 3 deploy keys; 4 first push of
-# the -dev seed; 5 clones in the role accounts; 6 model policy rules;
+# the -dev seed; 5 clones in the role accounts, with the trust marks
+# of the -dev clones; 6 model policy rules;
 # 7 jig's status line in each account's Claude Code settings, and
 # ~/.tmux.conf. The settings get no hook of another tool. Nothing is
 # pushed to the product repo, and no product clone gets a hook or a
@@ -218,6 +219,18 @@ on "$SPEC" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
 on "$IMPL" "[ -d ~/$d ] || $c github-$P-dev:$GH/$P-dev ~/$d"
 product "$ORCH"
 product "$IMPL"
+# Claude Code asks whether a folder can be trusted at the first session
+# in it, and the session waits there. Each account that got its -dev
+# clone here marks that clone as trusted in its own ~/.claude.json, as
+# that account; a later run marks it again when the mark is gone. The
+# step prints "trust", the account and the value: trusted, kept or
+# not marked, after a line that names the file when it is not marked.
+for a in "$SPEC" "$IMPL"; do
+  ssh -o BatchMode=yes "$a@localhost" python3 -I - "$a" "\$HOME/$d" \
+    <<'PY' || { echo "new: no ssh to $a"; echo "trust $a: not marked"; }
+@TRUST_STEP@
+PY
+done
 echo "step 5 ok"
 
 echo "step 6: model policy rules"

@@ -51,6 +51,18 @@ ORCHESTRATOR.md as its first message, --remote-control <project>-orch and the
 orchestrator's directories as --add-dir. When the session exits, the loop copies its
 transcript and starts it again; the third exit in 10 minutes stops the loop instead.
 
+The session's folders. Before each session, the first one at start and each one after
+an exit, the folders are read again: the orchestrator's list of lib/jig_dirs.py and
+the orchestrator's folders in the section Directories of the kickoff record at the
+newest kickoff tag on origin; each that exists is passed. A line of that section that
+jig cannot read is ignored, with one line on stderr at start and in the log in the
+loop. A folder outside the approved list of the orchestrator account is refused with
+one line: start then starts no loop and no session, and the loop starts no session,
+writes the line to the log and stops. Then the -dev clone and each folder passed get
+the trust mark of Claude Code in ~/.claude.json, by lib/jig_trust.py, with one line
+"trust <account> <folder>: trusted" or "not marked" for each mark set or not set, on
+stdout at start and in the log in the loop; a mark that is there gives no line.
+
 The session's pane. A person's tmux client attached to the session stays attached across
 each restart and each stop, because the session itself never ends: the loop sets the
 window option remain-on-exit, so that the pane stays, dead, when Claude Code exits. The
@@ -219,7 +231,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
 import jig_dirs  # noqa: E402
 import jig_ids  # noqa: E402
+import jig_profile  # noqa: E402
 import jig_tmux  # noqa: E402
+import jig_trust  # noqa: E402
 import jig_units  # noqa: E402
 
 worker = jig_units.worker
@@ -964,8 +978,9 @@ class Orch:
         self.srv = pathlib.Path(root)
         self.watched = (("inbox", pathlib.Path(root) / "in" / project),
                         ("readback", pathlib.Path(root) / "out" / project))
-        self.directories = [root + path[len(SRV_ROOT):] if path.startswith(SRV_ROOT + "/")
-                            else path for path in jig_dirs.of_role("orch", project)]
+        self.srv_root = root
+        self.directories = jig_dirs.with_srv(jig_dirs.of_role("orch", project), root)
+        self.account = conf.get("ORCH_ACCOUNT") or "orchestrator"
 
     # The log and the tee.
 
@@ -1033,17 +1048,56 @@ class Orch:
         return (f"tmux session {self.session} is not the loop's own: its tmux or Claude "
                 f"Code session ID differs from {self.ids_file}")
 
-    def launch(self):
+    def prepare(self, say, warn, quiet=False):
+        """Find the folders of the next session and mark them as trusted.
+
+        The folders are the orchestrator's list and the orchestrator's folders in the
+        section Directories of the kickoff record, read anew each time, since a new
+        kickoff tag can change them. Each line of that section that jig cannot read
+        goes to warn, unless quiet. A folder outside the approved list of the account
+        is refused: the result is then None and the line of the refusal. Otherwise the
+        -dev clone and each folder that exists get the trust mark of Claude Code, so
+        that the session does not wait at a dialog, with a line to say for each mark
+        set or not set, and the result is the folders to pass and None.
+        """
+        homes = jig_dirs.homes_of(self.conf)
+        found, problems = jig_dirs.read_directories(jig_profile.read_record(self.clone),
+                                                    homes, self.project)
+        for line in [] if quiet else problems:
+            warn(line)
+        extra = found["orchestrator"]
+        candidates = [*self.directories, *extra]
+        approved = jig_dirs.approved_list(self.conf, self.account, self.project, extra,
+                                          self.srv_root)
+        outside = jig_dirs.first_outside(candidates, approved, homes["orchestrator"])
+        if outside is not None:
+            return None, (f"{outside} is not in the approved list of the folders of "
+                          f"{self.account}; no session was started")
+        passed = worker.existing_dirs(candidates)
+        marks = [(str(self.clone), jig_trust.TRUST_KEY)]
+        marks += [(folder, jig_trust.ADDED_FOLDER_KEY) for folder in passed]
+        for folder, key in marks:
+            value, problem = jig_trust.mark(folder, self.account, key=key)
+            if value == jig_trust.KEPT:
+                continue
+            if problem:
+                say(problem)
+            say(f"trust {self.account} {folder}: {value}")
+        return passed, None
+
+    def launch(self, first=False):
         """Start the next Claude Code session; return False when the loop must stop.
 
         A session that does not exist is made anew. The loop's own session with a dead
         pane gets the new Claude Code in that pane, so that a person's attached client
-        stays. Any other session is left as it is.
+        stays. Any other session is left as it is. Before it, the folders are read and
+        marked again; their lines go to the log. The first session of a loop is the one
+        that jig orch start has prepared and reported on already, so its lines of the
+        section that cannot be read are not written twice.
         """
         pane = self.pane()
         if pane is None:
-            self.open_session(None)
-            return True
+            return self.open_prepared(None, first)
         if not self.ours(pane):
             self.log(f"stopped: {self.foreign()}; the loop starts nothing in it and "
                      f"leaves it as it is", tee=True)
@@ -1052,10 +1106,18 @@ class Orch:
             self.log(f"stopped: tmux session {self.session} has a live pane that this "
                      f"loop did not start", tee=True)
             return False
-        self.open_session(pane)
+        return self.open_prepared(pane, first)
+
+    def open_prepared(self, pane, first):
+        """Prepare the folders and open the session; return False after a refusal."""
+        folders, refusal = self.prepare(self.log, self.log, quiet=first)
+        if refusal:
+            self.log(f"stopped: {refusal}", tee=True)
+            return False
+        self.open_session(pane, folders)
         return True
 
-    def open_session(self, pane):
+    def open_session(self, pane, folders):
         """Start Claude Code in a new session, or, given the dead pane, in that pane."""
         self.run = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.claude_session = str(uuid.uuid4())
@@ -1072,8 +1134,7 @@ class Orch:
                      f"to {self.events_file}: {failure}", tee=True)
             return
         channel = f"jig-orch-{self.session}"
-        add_dirs = "".join(f"--add-dir {shlex.quote(directory)} "
-                           for directory in worker.existing_dirs(self.directories))
+        add_dirs = "".join(f"--add-dir {shlex.quote(directory)} " for directory in folders)
         # The pane waits for the channel before Claude Code runs, so that the options
         # and the tee below are in place before it can write or exit.
         inner = (
@@ -1675,7 +1736,7 @@ class Orch:
 
     def supervise(self, poll):
         exits = []
-        if not self.launch():
+        if not self.launch(first=True):
             return REFUSED
         no_bar, reported = 0, False
         while not self.stopping:
@@ -1809,6 +1870,10 @@ class Orch:
             if pane is not None and not pane.dead:
                 worker.refuse("session", f"tmux session {self.session} exists with a live "
                                          f"pane, and no loop runs")
+            refusal = self.prepare(lambda line: print(line, flush=True),
+                                   lambda line: print(line, file=sys.stderr, flush=True))[1]
+            if refusal:
+                worker.refuse("folders", refusal)
             with open(self.log_path, "a", encoding="utf-8") as log:
                 child = subprocess.Popen(
                     [sys.executable, str(pathlib.Path(__file__).resolve()), self.project,

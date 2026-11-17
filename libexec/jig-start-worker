@@ -4,7 +4,8 @@
 usage: jig-start-worker <project> <role> <ID> <prompt> --expected <minutes> --model <model>
            [--effort <level>] [--account <account>] [--branch <branch>] [--tag <tag>]...
            [--approved-tag <tag>] [--head <commit>] [--stage all|check|launch]
-           [--add-dir <directory>]... [--hook <base64 text>]
+           [--add-dir <directory>]... [--hook <base64 text>] [--clones <base64 text>]
+           [--trust <base64 text>]
 
 The check stage refuses, in order: a lock, a live session of that name, a role
 account that differs, no fetch or the wrong branch, a dirty tree, a failed
@@ -18,7 +19,8 @@ impl/orch/updates.log alone does not make the tree dirty, because jig orch appen
 idle lines there between the orchestrator's commits. The launch
 stage takes the lock, brings the clone to origin, installs or removes jig's
 pre-commit and commit-msg hooks in the product clone, sets the effort, places the
-prompt, refreshes the approved worktree and starts the session. The default runs
+prompt, refreshes the approved worktree, marks the -dev clone and each folder it
+passes as trusted in Claude Code, and starts the session. The default runs
 both, so the script can run alone in the account. A refusal in the launch stage
 keeps the lock when jig start has pushed the unit's start line (it passes
 --head), or when the session is still there, so that jig close --dead finds
@@ -36,6 +38,17 @@ The product clone is the one lib/jig_clones.py finds for the -dev clone REPO: th
 clone beside it, ~/ws/src/<project>. For the same
 reason as the hook, jig start passes the text of that module as --clones, and the
 script runs it; run alone from a jig tree, the script reads the module beside it.
+
+Claude Code asks whether a folder can be trusted the first time a session works in
+it, and for each folder of --add-dir that it does not know, and the session then
+waits with no output until someone answers. So, before the session starts, the
+launch sets the trust mark of the -dev clone and of each folder it passes in
+~/.claude.json of this account, by lib/jig_trust.py, which comes as --trust for the
+same reason as the other module. It prints "trust <account> <folder>: trusted" or
+"not marked" for each folder whose mark it sets or cannot set, after the line that
+names the file it could not use, and nothing for a mark that is there; none of this
+changes the exit code. A dialog that still comes stops the start: the folder-trust
+dialog of the start folder, and the dialog of an added folder, named by its line.
 jig's pre-commit hook is the file that git rev-parse --git-path
 hooks/pre-commit names there, so a clone with core.hooksPath gets it at the right
 place too. Its second line is a marker, and only a file with that marker is jig's:
@@ -97,6 +110,10 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 # An answer the folder-trust dialog offers. The session waits there with no output.
 TRUST_DIALOG = "Yes, I trust this folder"
+# The dialog for a folder of --add-dir that Claude Code does not trust yet: the first
+# line, with the folder after it, and the answer that adds the folder.
+ADDED_DIALOG = "Adding a new directory:"
+ADDED_ANSWER = "Yes, add it"
 SETTLE_SECONDS = 30.0
 POLL_SECONDS = 0.2
 
@@ -392,6 +409,51 @@ def clones_beside_script():
     return None
 
 
+# The module of lib/jig_trust.py, once it is loaded.
+_trust = {}
+
+
+def use_trust(text):
+    """Run the text of lib/jig_trust.py and keep it as a module."""
+    namespace = {"__name__": "jig_trust"}
+    exec(compile(text, "jig_trust.py", "exec"), namespace)
+    _trust.update(namespace)
+
+
+def trust_module():
+    """Return the loaded lib/jig_trust.py, read from beside the script when not given."""
+    if not _trust:
+        text = None
+        for start in (globals().get("__file__"), sys.argv[0]):
+            if not start or start in ("-", "<stdin>"):
+                continue
+            path = pathlib.Path(start).resolve().parent.parent / "lib" / "jig_trust.py"
+            try:
+                text = path.read_text(encoding="utf-8")
+                break
+            except OSError:
+                continue
+        if text is None:
+            refuse("trust", "no way to mark a folder as trusted: jig start passes "
+                   "lib/jig_trust.py as --trust")
+        use_trust(text)
+    return _trust
+
+
+def set_trust_marks(account, clone, directories):
+    """Mark the -dev clone and each folder of --add-dir as trusted; print each change."""
+    trust = trust_module()
+    folders = [(clone, trust["TRUST_KEY"])]
+    folders += [(folder, trust["ADDED_FOLDER_KEY"]) for folder in directories]
+    for folder, key in folders:
+        value, problem = trust["mark"](folder, account, key=key)
+        if value == trust["KEPT"]:
+            continue
+        if problem:
+            print(problem, flush=True)
+        print(f"trust {account} {folder}: {value}", flush=True)
+
+
 def product_clone(conf):
     """Return the product clone of the -dev clone REPO, or None when it has none."""
     if "other_clone" not in _clones:
@@ -616,6 +678,22 @@ def decode_hook(value):
         raise argparse.ArgumentTypeError("not the base64 text of a hook") from None
 
 
+def added_folder(pane):
+    """Return the folder that the dialog of an added folder on the screen names, or None.
+
+    The folder stands after the dialog's first line, on that line or on the next one.
+    """
+    if ADDED_ANSWER not in " ".join(pane.split()):
+        return None
+    lines = pane.splitlines()
+    for index, line in enumerate(lines):
+        if ADDED_DIALOG in line:
+            rest = line.split(ADDED_DIALOG, 1)[1].strip()
+            following = [text.strip() for text in lines[index + 1:] if text.strip()]
+            return rest or (following[0] if following else "")
+    return None
+
+
 def decode_clones(value):
     try:
         return base64.b64decode(value, validate=True).decode("utf-8")
@@ -724,6 +802,11 @@ def watch_pane(session):
             refuse("dialog", f"session {session} waits on the folder-trust dialog, with no "
                              f"output until someone answers it; jig start does not. Answer it "
                              f"with tmux attach -t {session}")
+        folder = added_folder(pane)
+        if folder is not None:
+            refuse("dialog", f"session {session} waits on the dialog of the added folder "
+                             f"{folder}, with no output until someone answers it; jig start "
+                             f"does not. Answer it with tmux attach -t {session}")
         if time.monotonic() >= deadline:
             return
         time.sleep(POLL_SECONDS)
@@ -762,6 +845,7 @@ def launch(args, conf, session):
         tee.touch()
         # After the steps above, which create the prompt tree, the reviews and the worktree.
         directories = existing_dirs(args.add_dir)
+        set_trust_marks(args.account, clone, directories)
         open_session(session, clone, args.model, directories, prompt, tee)
         watch_pane(session)
     except Refused as error:
@@ -791,6 +875,7 @@ def parse_args(argv):
     parser.add_argument("--add-dir", action="append", default=[])
     parser.add_argument("--hook", type=decode_hook, default=None)
     parser.add_argument("--clones", type=decode_clones, default=None)
+    parser.add_argument("--trust", type=decode_clones, default=None)
     args = parser.parse_args(argv)
     if not PROJECT.fullmatch(args.project):
         parser.error(f"bad project: {args.project}")
@@ -802,6 +887,8 @@ def parse_args(argv):
         args.hook = hook_beside_script()
     if args.clones is not None:
         use_clones(args.clones)
+    if args.trust is not None:
+        use_trust(args.trust)
     return args
 
 
