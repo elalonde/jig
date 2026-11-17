@@ -7,6 +7,11 @@ given in the environment, and the account that runs jig tag has an invented git
 identity, so that the tests can tell its tags from the fixture's own.
 """
 
+import importlib.machinery
+import importlib.util
+import sys
+import unittest
+
 from tests.support import ROOT, TempTestCase, run
 
 TAG = ROOT / "libexec" / "jig-tag"
@@ -18,15 +23,19 @@ DOC = "specs/design.md"
 OTHER_DOC = "specs/parts/other.md"
 
 
-def status_text(*rows):
+def status_text(*rows, fix_column=False):
     """Return a status file whose table of closed review loops holds these rows.
 
-    Another table follows in the next section, so a reader that does not stop at the
-    end of its own section would take that table's rows as records.
+    Each row is a tuple of its cells, three or four. With fix_column the header has the
+    fourth column for the ID of a fix unit. Another table follows in the next section,
+    so a reader that does not stop at the end of its own section would take that
+    table's rows as records.
     """
+    header = ["| Path | Commit | ID | Fix |", "| --- | --- | --- | --- |"] if fix_column \
+        else ["| Path | Commit | ID |", "| --- | --- | --- |"]
     lines = ["# Status", "", "## Spec phase", "", "Prose about the phase.", "",
-             "### Closed review loops", "", "| Path | Commit | ID |", "| --- | --- | --- |"]
-    lines += [f"| {path} | {commit} | {unit} |" for path, commit, unit in rows]
+             "### Closed review loops", ""] + header
+    lines += ["| " + " | ".join(row) + " |" for row in rows]
     lines += ["", "### Open concessions", "", "| Item | Gap | Risk | State |",
               "| --- | --- | --- | --- |", f"| {DOC} | none | low | open |", ""]
     return "\n".join(lines)
@@ -39,6 +48,46 @@ def findings_text(*severities):
         lines += [f"### F-{number} {severity}", "file: specs/design.md  line: 3  commit: abc",
                   "rule: the rule", "problem: the problem", "options: the options", ""]
     return "\n".join(lines)
+
+
+def report_text(first_line):
+    """Return a unit report whose first line, the outcome, is the given one."""
+    return "\n".join([first_line, "jig-report: 1", "class: patch", "---", "Notes.", ""])
+
+
+def needs_spec_line():
+    # Built from parts, so that a scanner of this repo does not take it for a question
+    # of the project's own.
+    return "NEEDS SPEC: " + "IQ" + "-1"
+
+
+def load_tag_module():
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("jig_tag_under_test", str(TAG))
+    module = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+class LoopRowsTest(unittest.TestCase):
+    """The reader of the table keeps rows of three or four cells, and nothing else."""
+
+    def test_rows_of_three_and_four_cells_are_records_and_an_empty_fourth_cell_is_dropped(self):
+        # One table holds a row of three cells, a row with a fix ID, an old row with an
+        # empty fourth cell, and two rows with too few and too many cells. The row with
+        # the empty cell must come back as three cells, so that it is checked as an old
+        # row and not as a row with a fix ID that is no ID.
+        text = status_text(("specs/a.md", "abc1234", "rv1"),
+                           ("specs/b.md", "abc1234", "rv2", "fx2"),
+                           ("specs/c.md", "abc1234", "rv3", ""),
+                           ("specs/d.md", "abc1234"),
+                           ("specs/e.md", "abc1234", "rv5", "fx5", "more"),
+                           fix_column=True)
+        self.assertEqual(load_tag_module().loop_rows(text),
+                         [("specs/a.md", "abc1234", "rv1"),
+                          ("specs/b.md", "abc1234", "rv2", "fx2"),
+                          ("specs/c.md", "abc1234", "rv3")])
 
 
 class TagCase(TempTestCase):
@@ -247,7 +296,8 @@ class TagRevisionTest(TagCase):
         changed = self.commit({DOC: "two\n"})
         # The one line also gives the form of the row it looked for.
         self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC, "no row",
-                            f"the row it looks for is | {DOC} | <commit> | <ID> |")
+                            f"the row it looks for is | {DOC} | <commit> | <ID> |",
+                            f"| {DOC} | <commit> | <ID> | <fix ID> |")
         self.assertIsNone(self.on_origin("spec-p4r1"))
 
     def test_a_row_at_another_commit_whose_document_differs_is_refused(self):
@@ -304,6 +354,79 @@ class TagRevisionTest(TagCase):
     def test_a_document_outside_specs_needs_no_row(self):
         changed = self.commit({"impl/notes.md": "notes\n", "README": "b\n"})
         self.assert_tagged(self.tag("spec-p4r1", changed), "spec-p4r1", changed)
+
+
+class TagFixUnitTest(TagCase):
+    """A row with a fourth cell records a review whose must-fix findings a fix unit applied."""
+
+    def setUp(self):
+        super().setUp()
+        self.approve("spec-p4", self.first)
+        # The review read the second text and found a must-fix; the fix unit then made
+        # the third text, which is the one to tag.
+        self.read = self.commit({DOC: "two\n"})
+        self.fixed = self.commit({DOC: "three\n"})
+
+    def close(self, row, report=None, findings=True):
+        """Commit the row with the review's must-fix findings and the fix unit's report."""
+        files = {STATUS: status_text(row, fix_column=True)}
+        if findings:
+            files["impl/log/rv1-findings.md"] = findings_text("should-fix", "must-fix")
+        if report is not None:
+            files["impl/log/fx1-report.md"] = report_text(report)
+        return self.commit(files)
+
+    def test_a_must_fix_review_with_an_ok_fix_report_is_tagged(self):
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), "OK: two findings applied")
+        self.assert_tagged(self.tag("spec-p4r1", changed), "spec-p4r1", changed)
+
+    def test_a_fix_report_whose_first_line_is_not_ok_is_refused(self):
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), needs_spec_line())
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "impl/log/fx1-report.md", "does not start with OK",
+                            needs_spec_line())
+
+    def test_a_row_whose_fix_report_is_missing_is_refused(self):
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"))
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "fix unit has no impl/log/fx1-report.md")
+
+    def test_a_row_whose_findings_file_is_missing_is_refused_even_with_a_fix_report(self):
+        changed = self.close((DOC, self.fixed, "rv1", "fx1"), "OK", findings=False)
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "review has no impl/log/rv1-findings.md")
+
+    def test_a_row_whose_document_differs_from_the_commit_to_tag_is_refused(self):
+        # The row names the commit that the review read, not the fix unit's commit, so
+        # the fixed text was never recorded as the end of the loop.
+        changed = self.close((DOC, self.read, "rv1", "fx1"), "OK")
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC, "differs")
+
+    def test_a_fix_id_equal_to_the_review_id_is_refused(self):
+        changed = self.close((DOC, self.fixed, "rv1", "rv1"), "OK")
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "fix ID rv1 is the ID of its review")
+
+    def test_a_fix_id_that_is_no_id_is_refused(self):
+        changed = self.close((DOC, self.fixed, "rv1", "fix-unit-1"), "OK")
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "fix ID 'fix-unit-1' is not an ID")
+
+    def test_a_row_of_three_cells_with_a_must_fix_is_refused_in_a_table_of_four_columns(self):
+        # The fourth cell is empty, so the row is an old one and its must-fix counts.
+        changed = self.close((DOC, self.fixed, "rv1", ""), "OK")
+        self.assert_refused(self.tag("spec-p4r1", changed), "review", DOC,
+                            "impl/log/rv1-findings.md holds a must-fix finding")
+
+    def test_old_rows_with_an_empty_fourth_cell_in_a_table_of_four_columns_are_tagged(self):
+        # The header gained the fourth column after these rows were written; each row's
+        # review left no must-fix, so the tag is made as it was before.
+        changed = self.commit({OTHER_DOC: "new\n"})
+        rows = ((DOC, changed, "rv1", ""), (OTHER_DOC, changed, "rv2", ""))
+        tagged = self.commit({STATUS: status_text(*rows, fix_column=True),
+                              "impl/log/rv1-findings.md": findings_text("should-fix"),
+                              "impl/log/rv2-findings.md": findings_text()})
+        self.assert_tagged(self.tag("spec-p4r1", tagged), "spec-p4r1", tagged)
 
 
 class TagVersionLineTest(TagCase):

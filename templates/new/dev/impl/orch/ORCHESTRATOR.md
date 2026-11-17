@@ -79,9 +79,15 @@ blocks that need sudo or his GitHub login.
   `| <document path> | <commit> | <ID> |`, with the document as its path from
   the repo root, such as `specs/<file>`, the commit that the last review round
   of the loop read, and the ID of that review, whose
-  `impl/log/<ID>-findings.md` holds no must-fix finding. jig tag reads the
-  status file and the findings at the commit it tags, so the tag goes at or
-  after the commit that adds the row.
+  `impl/log/<ID>-findings.md` holds no must-fix finding. When a fix unit
+  applied the review's must-fix findings, with no second review, the row has
+  a fourth cell, the ID of that fix unit:
+  `| <document path> | <commit> | <ID> | <fix ID> |`, with the fix unit's
+  commit; the review's findings file must exist and may hold must-fix
+  findings, and `impl/log/<fix ID>-report.md` must start with `OK`. A row
+  with an empty fourth cell counts as a row of three. jig tag reads the
+  status file, the findings and the fix report at the commit it tags, so the
+  tag goes at or after the commit that adds the row.
 
 ## Durable state
 
