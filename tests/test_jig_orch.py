@@ -1169,6 +1169,11 @@ class TestForksWhenTheLoopEnds(ForkTestCase):
     the fork, and lets the process go on. When the freeze itself came later than a
     window after the first look, the second look may have passed already: the test
     lets the process finish and runs its case again, a few times at most.
+
+    When no try sets the race up, the test skips itself with that reason instead of
+    failing: a host too busy to freeze a process in time says nothing about the code,
+    and a failure there would turn a whole run red on a slow shared runner. Once the
+    race is set up, the test asserts as usual.
     """
 
     fork_window = "4"
@@ -1229,8 +1234,8 @@ class TestForksWhenTheLoopEnds(ForkTestCase):
             pass
 
     def too_slow(self):
-        self.fail(f"the host never let the test freeze the process within the window of "
-                  f"{self.fork_window} s in {self.attempts} tries; log:\n{self.log()}")
+        self.skipTest(f"the host never let the test freeze the process within the window "
+                      f"of {self.fork_window} s in {self.attempts} tries")
 
     def stop_in_background(self):
         stop = subprocess.Popen([ORCH, PROJECT, "stop"], env=self.base_env(),
