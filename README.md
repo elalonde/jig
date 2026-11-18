@@ -83,6 +83,14 @@ the newest installed version, whatever the project is pinned to. When the
 newest installed version has no `jig upgrade` yet, run it from a clone of jig
 instead: `libexec/jig-upgrade <X.Y.Z>`.
 
+`jig branch <project> <X.Y>`, run as the orchestrator at a batch boundary,
+moves a project to another version line: it sets `BRANCH` in the conf file of
+each of the project's accounts, fetches the `-dev` clone and the product clone
+of each account, and switches each clean clone to the line by fast-forward
+only. A clone with work in it stays as it is and is named. It refuses while a
+unit or a batch of the project runs, or when origin has no such line, prints
+one line for each clone and conf file, and is safe to run again.
+
 ## License
 
 MIT, in `LICENSE`. `THIRD-PARTY-NOTICES` lists the software of others that jig

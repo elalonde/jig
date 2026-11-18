@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Move a project to another version line in every role account.
+
+usage: jig branch <project> <line>
+
+Run as the orchestrator account, at a batch boundary. <line> is X.Y, two whole
+numbers. The role accounts are the accounts that ORCH_ACCOUNT, SPEC_ACCOUNT,
+IMPL_ACCOUNT and REV_ACCOUNT of the orchestrator's ~/.config/jig/<project>.conf name,
+each once; with no ORCH_ACCOUNT the orchestrator account is "orchestrator". The
+orchestrator's own account is worked here; every other account through ssh, with the
+command in JIG_SSH, as jig upgrade reaches them.
+
+First the refusals, which change nothing: a lock <lock dir>/<project>-<account> of a
+role account, the file <batch dir>/<project> of a running jig batch, or an origin with
+no branch <line> in the product or in -dev, read with git ls-remote in a clone of each
+repository in a role account.
+
+Then, in each role account:
+  - BRANCH=<line> in ~/.config/jig/<project>.conf, written by a temporary file and a
+    rename, with every other line kept; a file that holds it already is not written.
+  - git fetch origin in ~/ws/src/<project>-dev and ~/ws/src/<project>, and a switch of
+    each clone to <line> by fast-forward only. The approved worktree is not touched.
+    A clone ends in one of these states:
+      missing   the account has no such clone; not a failure
+      same      on <line> at origin/<line>, also with changes in its files, because
+                nothing is done to it
+      moved     switched to <line> and brought to origin/<line>
+      kept: <reason>
+                left as it was: a fetch that failed (with git's first line), tracked
+                changes, a detached HEAD, local commits that no branch of origin
+                holds, a local <line> that is not an ancestor of origin/<line>
+                ("not a fast-forward"), an account ssh cannot reach, or a switch that
+                git refused (with git's first line)
+    Untracked files and the stash stay; nothing is reset, cleaned, stashed, merged or
+    rebased.
+
+The readback is one line per clone, "clone <account> <path> <branch> <head> <state>",
+then one line per conf file, "conf <account> <path> BRANCH=<value> <state>" with the
+state same, set or "failed: <reason>"; "-" stands for a value that does not exist.
+
+Environment: JIG_SSH (default ssh -o BatchMode=yes), JIG_LOCK_DIR (default
+/run/jig/lock), JIG_BATCH_DIR (default /run/jig/batch).
+
+Exits 0 when every conf file holds BRANCH=<line> and every clone is same, moved or
+missing; 1 after the readback otherwise, and on a refusal; 2 on a usage error.
+"""
+
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+
+import jig_units  # noqa: E402
+
+LINE = re.compile(r"[0-9]+\.[0-9]+")
+ACCOUNT = re.compile(r"[a-z_][a-z0-9_-]*")
+ROLE_KEYS = ("ORCH_ACCOUNT", "SPEC_ACCOUNT", "IMPL_ACCOUNT", "REV_ACCOUNT")
+# The orchestrator role's account when the conf file names none, as jig orch reads it.
+DEFAULT_ORCHESTRATOR = "orchestrator"
+# ssh exits 255 when it cannot reach the account; the account script never does.
+SSH_FAILED = 255
+# Reading the branches of origin is quick; a fetch of two clones may take minutes.
+ORIGIN_TIMEOUT_SECONDS = 60
+MOVE_TIMEOUT_SECONDS = 600
+
+# Runs in each role account, the orchestrator's included, with python3 -I and this
+# text on stdin, so that no account needs a file of jig's for it. "origin" says, for
+# each of the two clones, whether it exists and whether origin has the branch of the
+# line; "move" sets the conf file and moves the clones. Each prints one JSON line.
+ACCOUNT_SCRIPT = r'''
+import json, os, pathlib, re, subprocess, sys, tempfile
+
+mode, project, line = sys.argv[1:4]
+home = pathlib.Path.home()
+clones = [home / "ws" / "src" / f"{project}-dev", home / "ws" / "src" / project]
+# git must never wait for a password that no one will type.
+env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+
+def git(clone, *words):
+    return subprocess.run(["git", "-C", str(clone), *words], capture_output=True,
+                          text=True, errors="replace", stdin=subprocess.DEVNULL,
+                          env=env, check=False)
+
+
+def first_line(result):
+    for text in (result.stderr, result.stdout):
+        for row in text.splitlines():
+            if row.strip():
+                return row.strip()
+    return f"git exit {result.returncode}"
+
+
+def value(result):
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def commit(clone, ref):
+    return value(git(clone, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"))
+
+
+def origin():
+    answer = []
+    for clone in clones:
+        if not clone.exists():
+            answer.append({"exists": False})
+            continue
+        found = git(clone, "ls-remote", "--heads", "origin", f"refs/heads/{line}")
+        if found.returncode != 0:
+            answer.append({"exists": True, "error": first_line(found)})
+        else:
+            answer.append({"exists": True, "has": bool(found.stdout.strip())})
+    return answer
+
+
+def branch_value(text):
+    """The value of BRANCH as the tools read it: the last such line wins."""
+    found = None
+    for row in text.splitlines():
+        row = row.strip()
+        if row and not row.startswith("#") and "=" in row:
+            key, rest = row.split("=", 1)
+            if key.strip() == "BRANCH":
+                found = rest.strip().strip("\"'")
+    return found or "-"
+
+
+def set_conf():
+    path = home / ".config" / "jig" / f"{project}.conf"
+    done = {"path": str(path), "value": "-"}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        return dict(done, state=f"failed: cannot read: {error.strerror}")
+    done["value"] = branch_value(text)
+    keyed = [row for row in text.splitlines() if re.match(r"\s*BRANCH\s*=", row)]
+    if len(keyed) == 1 and done["value"] == line:
+        return dict(done, state="same")
+    if not os.access(path, os.W_OK) or not os.access(path.parent, os.W_OK | os.X_OK):
+        return dict(done, state="failed: cannot write")
+    # The first BRANCH line takes the new value and any other goes, so that one value
+    # remains; a file with none gets the line at its end.
+    rows, placed = [], False
+    for row in text.splitlines(keepends=True):
+        if re.match(r"\s*BRANCH\s*=", row):
+            if not placed:
+                rows.append(f"BRANCH={line}\n")
+                placed = True
+            continue
+        rows.append(row)
+    if not placed:
+        if rows and not rows[-1].endswith("\n"):
+            rows[-1] += "\n"
+        rows.append(f"BRANCH={line}\n")
+    # A rename replaces the file whole, so that a tool that reads it at the same moment
+    # never sees half of it.
+    try:
+        descriptor, scratch = tempfile.mkstemp(prefix=f".{project}.conf.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write("".join(rows))
+            os.chmod(scratch, path.stat().st_mode & 0o7777)
+            os.replace(scratch, path)
+        except BaseException:
+            os.unlink(scratch)
+            raise
+    except OSError as error:
+        return dict(done, state=f"failed: {error.strerror}")
+    return dict(done, value=line, state="set")
+
+
+def clone_state(clone):
+    """Return the state of a clone after the move, and change it only when it is clean."""
+    if not clone.exists():
+        return "missing"
+    fetched = git(clone, "fetch", "--quiet", "origin")
+    if fetched.returncode != 0:
+        # With the origin/<line> of an older fetch, the clone could look current
+        # while it is behind origin, so nothing below can be trusted.
+        return f"kept: {first_line(fetched)}"
+    target = commit(clone, f"refs/remotes/origin/{line}")
+    branch = value(git(clone, "symbolic-ref", "-q", "--short", "HEAD"))
+    head = commit(clone, "HEAD")
+    # The states are tested in this order, so a clone on the line at origin is the
+    # same even with changes in its files: nothing is done to it.
+    if branch == line and head and head == target:
+        return "same"
+    status = git(clone, "status", "--porcelain", "--untracked-files=no")
+    if status.returncode != 0:
+        return f"kept: {first_line(status)}"
+    if status.stdout.strip():
+        return "kept: tracked changes"
+    if not branch:
+        return "kept: detached HEAD"
+    local = commit(clone, f"refs/heads/{line}")
+    tips = [f"refs/heads/{branch}"] + ([f"refs/heads/{line}"] if local else [])
+    ahead = git(clone, "rev-list", "-n", "1", *tips, "--not", "--remotes=origin")
+    if ahead.returncode != 0:
+        return f"kept: {first_line(ahead)}"
+    if ahead.stdout.strip():
+        return "kept: local commits"
+    if local and target:
+        ancestor = git(clone, "merge-base", "--is-ancestor", local, target)
+        if ancestor.returncode == 1:
+            return "kept: not a fast-forward"
+        if ancestor.returncode != 0:
+            return f"kept: {first_line(ancestor)}"
+    # The checks above make this a fast-forward: the local branch of the line, when
+    # there is one, is an ancestor of origin/<line>. -C moves the branch and the files
+    # in one step, so a switch that git refuses, as for an untracked file it would
+    # overwrite, leaves the clone as it was.
+    switched = git(clone, "switch", "--quiet", "-C", line, "--track", f"origin/{line}")
+    if switched.returncode != 0:
+        return f"kept: {first_line(switched)}"
+    return "moved"
+
+
+def move():
+    conf = set_conf()
+    moved = []
+    for clone in clones:
+        state = clone_state(clone)
+        branch = value(git(clone, "symbolic-ref", "-q", "--short", "HEAD")) \
+            if clone.exists() else ""
+        head = commit(clone, "HEAD") if clone.exists() else ""
+        moved.append({"path": str(clone), "branch": branch or "-",
+                      "head": head[:12] or "-", "state": state})
+    return {"conf": conf, "clones": moved}
+
+
+print(json.dumps(origin() if mode == "origin" else move()))
+'''
+
+
+class Refusal(Exception):
+    pass
+
+
+def read_conf(path):
+    """Read a conf file as data: running it would run whatever it holds."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise Refusal(f"cannot read {path}: {error.strerror}") from None
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def role_accounts(project):
+    """Return the orchestrator account and every role account, each once, the
+    orchestrator's first."""
+    path = pathlib.Path.home() / ".config" / "jig" / f"{project}.conf"
+    conf = read_conf(path)
+    orchestrator = conf.get("ORCH_ACCOUNT", "").split() or [DEFAULT_ORCHESTRATOR]
+    named = list(orchestrator)
+    for key in ROLE_KEYS[1:]:
+        named.extend(conf.get(key, "").split())
+    accounts = list(dict.fromkeys(named))
+    for account in accounts:
+        if not ACCOUNT.fullmatch(account):
+            raise Refusal(f"{path}: {account!r} is not an account name")
+    return orchestrator[0], accounts
+
+
+def in_account(account, local, words, timeout):
+    """Run the account script; return its answer, or a reason why there is none.
+
+    The reason "cannot reach <account>" comes only from ssh, so that a script that
+    fails in an account that ssh reached is not taken for an account that is down.
+    """
+    if local:
+        command = [sys.executable, "-I", "-", *words]
+    else:
+        ssh = shlex.split(os.environ.get("JIG_SSH", "ssh -o BatchMode=yes"))
+        command = [*ssh, f"{account}@localhost", shlex.join(["python3", "-I", "-", *words])]
+    try:
+        result = subprocess.run(command, input=ACCOUNT_SCRIPT, capture_output=True,
+                                text=True, errors="replace", timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"no answer from {account} in {timeout} s"
+    except OSError as error:
+        return None, f"cannot run the account script for {account}: {error.strerror}"
+    if result.returncode == SSH_FAILED and not local:
+        return None, f"cannot reach {account}"
+    lines = result.stdout.strip().splitlines()
+    if result.returncode == 0 and lines:
+        try:
+            return json.loads(lines[-1]), None
+        except ValueError:
+            pass
+    detail = result.stderr.strip().splitlines()
+    return None, (f"the account script failed in {account}: "
+                  f"{detail[-1] if detail else f'exit {result.returncode}'}")
+
+
+def check_refusals(project, line, orchestrator, accounts):
+    for account in accounts:
+        lock = jig_units.worker.lock_path(project, account)
+        if lock.exists():
+            raise Refusal(f"{lock} exists: a unit of {project} runs in {account}")
+    batch = pathlib.Path(os.environ.get("JIG_BATCH_DIR", "/run/jig/batch")) / project
+    if batch.exists():
+        raise Refusal(f"{batch} exists: a jig batch of {project} runs")
+    repos = [f"{project}-dev", project]
+    answers = [None, None]
+    problems = ["", ""]
+    for account in accounts:
+        if None not in answers:
+            break
+        answer, _ = in_account(account, account == orchestrator,
+                               ["origin", project, line], ORIGIN_TIMEOUT_SECONDS)
+        # An account that cannot answer is named in the readback; another account's
+        # clone can still tell what origin has.
+        if not isinstance(answer, list) or len(answer) != 2:
+            continue
+        for index, clone in enumerate(answer):
+            if answers[index] is not None or not clone.get("exists"):
+                continue
+            if "error" in clone:
+                problems[index] = f"{account}: {clone['error']}"
+            else:
+                answers[index] = bool(clone.get("has"))
+    for index, repo in enumerate(repos):
+        if answers[index] is None:
+            raise Refusal(f"cannot read the branches of origin of {repo}: "
+                          f"{problems[index]}" if problems[index] else
+                          f"no role account has a clone ~/ws/src/{repo}")
+        if not answers[index]:
+            raise Refusal(f"origin of {repo} has no branch {line}")
+
+
+def move(project, line, orchestrator, accounts):
+    """Move each account and print the readback; return True when all is on the line."""
+    clone_lines, conf_lines, ok = [], [], True
+    for account in accounts:
+        answer, reason = in_account(account, account == orchestrator,
+                                    ["move", project, line], MOVE_TIMEOUT_SECONDS)
+        try:
+            conf, clones = answer["conf"], answer["clones"]
+            clone_lines.extend(f"clone {account} {clone['path']} {clone['branch']} "
+                               f"{clone['head']} {clone['state']}" for clone in clones)
+            conf_lines.append(f"conf {account} {conf['path']} BRANCH={conf['value']} "
+                              f"{conf['state']}")
+            ok = ok and conf["value"] == line and conf["state"] in ("same", "set") and all(
+                clone["state"] in ("same", "moved", "missing") for clone in clones)
+        except (TypeError, KeyError):
+            reason = reason or f"the account script in {account} gave no readback"
+            for path in (f"~/ws/src/{project}-dev", f"~/ws/src/{project}"):
+                clone_lines.append(f"clone {account} {path} - - kept: {reason}")
+            conf_lines.append(f"conf {account} ~/.config/jig/{project}.conf BRANCH=- "
+                              f"failed: {reason}")
+            ok = False
+    for text in clone_lines + conf_lines:
+        print(text, flush=True)
+    return ok
+
+
+def main(argv):
+    if argv in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if len(argv) != 2 or not jig_units.PROJECT.fullmatch(argv[0]) \
+            or not LINE.fullmatch(argv[1]):
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    project, line = argv
+    try:
+        orchestrator, accounts = role_accounts(project)
+        check_refusals(project, line, orchestrator, accounts)
+    except Refusal as error:
+        print(f"jig branch: {error}; nothing changed", file=sys.stderr)
+        return 1
+    return 0 if move(project, line, orchestrator, accounts) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

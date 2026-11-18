@@ -247,6 +247,19 @@ not keep the upgrade in `handoff.md` for the next session. `jig upgrade`
 refuses while a lock of the project exists, so run it after `jig batch` has
 closed every worker. No unit is cancelled for an upgrade.
 
+After the release of a minor or major, move the project to the line of the
+next minor or major before your next batch. No block makes a new line. The
+release unit of the minor or major, or the first unit that needs the next
+line, pushes the branch of that line in the product at the release commit;
+you push it in `-dev` at the head of the line. When origin has the line in
+both repos, commit and push your own changes, the idle lines of `updates.log`
+among them, so that your `-dev` clone is clean, and run
+`jig branch @PROJECT@ <line>`. It sets `BRANCH` in the conf file of each role
+account and moves the clones of each account to the line; read its readback.
+When it exits 1, start no batch on the line, and tell Eric which clone or conf
+file failed and why. With a jig older than 0.10.0, which has no `jig branch`,
+each move of `BRANCH` stays an owner block that Eric runs.
+
 ## Session rules
 
 - The first thing after each start of this session: start one background

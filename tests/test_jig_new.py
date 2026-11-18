@@ -470,6 +470,27 @@ class JigNewTest(JigNewCase):
                       "and the reminders)", text)
         self.assertNotIn("`hourly update`", text)
 
+    def test_standing_prompt_moves_the_line_with_jig_branch_after_a_minor_or_major(self):
+        # After a minor or major release the orchestrator runs jig branch before its next
+        # batch, with its own changes pushed first, who pushes the new line in each
+        # repository, no batch after an exit 1 and a word to Eric, and the owner block
+        # for an older jig.
+        text = " ".join(self.made_text("impl/orch/ORCHESTRATOR.md").split())
+        for rule in ("After the release of a minor or major, move the project to the line "
+                     "of the next minor or major before your next batch.",
+                     "No block makes a new line. The release unit of the minor or major, or "
+                     "the first unit that needs the next line, pushes the branch of that "
+                     "line in the product at the release commit; you push it in `-dev` at "
+                     "the head of the line.",
+                     "commit and push your own changes, the idle lines of `updates.log` "
+                     "among them, so that your `-dev` clone is clean, and run "
+                     "`jig branch demo <line>`.",
+                     "When it exits 1, start no batch on the line, and tell Eric which clone "
+                     "or conf file failed and why.",
+                     "With a jig older than 0.10.0, which has no `jig branch`, each move of "
+                     "`BRANCH` stays an owner block that Eric runs."):
+            self.assertIn(rule, text)
+
     def test_orchestrator_templates_hold_no_hourly_update(self):
         # Nothing starts an update each hour any more, so neither the standing prompt
         # nor the handoff template may give the orchestrator a rule for one; the
