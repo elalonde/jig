@@ -5,6 +5,64 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.1
+
+What changed: `jig trace check` no longer asks for the ledger entry of any
+release commit of the unbroken run at the head of the product: each commit
+`Release <X.Y.Z>`, with the same version as the head, met by following the
+first parent down from the head. A rerun of `jig release <project> prepare`
+that adds a second release commit on top of the first therefore no longer needs
+the ledger entry of the lower one before the rows run. A release commit below
+an ordinary commit, or of another version, still needs its entry.
+
+`jig branch`: when git refuses to switch a clone, the `kept:` reason gives all
+of git's message on one line, and so names the files in the way. A failed fetch
+still gives git's first line.
+
+The prompt template: SESSION ECONOMY tells a unit to edit files with the edit
+tool, never with a shell heredoc or a script that writes files. ROLE holds, for
+a project with `reference` yes, the rule on a known security defect of the
+reference.
+
+The templates of `jig new`: `CLAUDE.md` has the new section "A known security
+defect of the reference", and clean-room rule 1 lists `jig upgrade` and
+`jig branch` beside `jig start`, `jig wait`, `jig send`, `jig close` and
+`jig cat`. `ORCHESTRATOR.md` gives the watcher as
+`jig orch <project> events --next [<unit ID>[:<minutes>] ...]`, started again
+when its arguments change, with the minutes of a unit given in one start only,
+and has the same list for rule 1.
+
+Files and formats: changed files: `libexec/jig-trace`, `libexec/jig-branch`,
+`templates/prompt.md`, and the templates `CLAUDE.md` and `ORCHESTRATOR.md`
+under `templates/new/`. The ledger, the trace, the conf file and the event
+formats are unchanged.
+
+Migration: a host and its projects move from 0.10.0 to 0.10.1 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.10.1`. It installs 0.10.1
+   under `/opt/jig/0.10.1/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.1` as the orchestrator
+   account. It sets `JIG_VERSION=0.10.1` in the conf file of the project in
+   each role account, and refuses while a unit holds a lock. Check in each
+   account that the conf file of the project reads `JIG_VERSION=0.10.1`.
+3. The orchestrator of each project copies by hand into the project's own
+   `CLAUDE.md`, from the template `CLAUDE.md` of 0.10.1 under
+   `templates/new/`: the section "A known security defect of the reference",
+   only in a project with `reference` yes; and the new list of clean-room
+   rule 1, `jig start`, `jig wait`, `jig send`, `jig close`, `jig cat`,
+   `jig upgrade`, `jig branch`. `jig upgrade` changes no file of a project's
+   repo.
+4. In the project's own `impl/orch/ORCHESTRATOR.md`, the orchestrator updates
+   the watcher text to the form of the 0.10.1 template (several unit IDs, each
+   with its minutes; a new start when the arguments change; the minutes in one
+   start only) and the rule 1 list, where the file still holds the older form.
+5. Nothing more for the specwriter and implementer accounts.
+
+Requested by: another project, for the ledger check on a rerun of prepare; the
+rest: found in the use of 0.10.0 and in the code review of the line.
+
+Units: 0 minor, 1 patch, 7 none
+
 ## 0.10.0
 
 What changed: a new command, `jig branch <project> <line>`, moves a project to
