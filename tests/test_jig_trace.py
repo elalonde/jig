@@ -423,14 +423,47 @@ class LedgerTest(TraceCase):
             self.write(self.dev / f"trace/ledger/{commit}.md", ledger_note(commit, name, "none"))
         self.assert_passes()
 
-    def test_release_subject_below_head_is_checked_like_any_commit(self):
-        # Two commits carry release subjects; only HEAD is exempt, so the earlier
-        # one without a note fails.
+    def test_two_release_commits_of_one_version_at_head_need_no_entries(self):
+        # A rerun of the release put a second commit of the same version on top of
+        # the first; neither has a note yet, and the check passes.
         self.map_to_head()
-        first = self.commit_with_subject("one.py", "Release 1.4.0")
+        self.commit_with_subject("one.py", "Release 1.4.0")
+        self.commit_with_subject("two.py", "Release 1.4.0")
+        self.assert_passes()
+
+    def test_lower_of_two_release_commits_needs_its_entry_once_a_commit_follows(self):
+        # The same two release commits now have an ordinary commit on top, and only
+        # the lower release commit has no note: that one is the one failure.
+        self.map_to_head()
+        lower = self.commit_with_subject("one.py", "Release 1.4.0")
+        upper = self.commit_with_subject("two.py", "Release 1.4.0")
+        later = self.commit("later.py")
+        for commit, name in ((upper, "two.py"), (later, "later.py")):
+            self.write(self.dev / f"trace/ledger/{commit}.md", ledger_note(commit, name, "none"))
+        self.assert_fails_with(f"trace/ledger/{lower}.md: no ledger entry for the product "
+                               f"commit {lower}")
+
+    def test_release_commit_of_another_version_below_the_run_needs_its_entry(self):
+        # Two release commits of 1.4.1 end at HEAD, directly on a release commit of
+        # 1.4.0 with no note: the older version ends the run and fails.
+        self.map_to_head()
+        older = self.commit_with_subject("one.py", "Release 1.4.0")
         self.commit_with_subject("two.py", "Release 1.4.1")
-        self.assert_fails_with(f"trace/ledger/{first}.md: no ledger entry for the product "
-                               f"commit {first}")
+        self.commit_with_subject("three.py", "Release 1.4.1")
+        self.assert_fails_with(f"trace/ledger/{older}.md: no ledger entry for the product "
+                               f"commit {older}")
+
+    def test_release_commit_below_an_ordinary_commit_needs_its_entry(self):
+        # A release commit of the same version as HEAD lies below an ordinary commit,
+        # which has its note; the ordinary commit ends the run, so the lower release
+        # commit without a note fails.
+        self.map_to_head()
+        lower = self.commit_with_subject("one.py", "Release 1.4.0")
+        middle = self.commit("middle.py")
+        self.write(self.dev / f"trace/ledger/{middle}.md", ledger_note(middle, "middle.py", "none"))
+        self.commit_with_subject("two.py", "Release 1.4.0")
+        self.assert_fails_with(f"trace/ledger/{lower}.md: no ledger entry for the product "
+                               f"commit {lower}")
 
     def test_head_whose_subject_only_starts_like_a_release_needs_its_entry(self):
         # A subject with words after the version is not the release commit's subject.

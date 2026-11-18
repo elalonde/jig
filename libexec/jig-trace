@@ -25,10 +25,13 @@ check makes sure that tie still holds:
   trace/commit-map.tsv lists, for each commit that a history rewrite replaced,
   the commit that took its place, and the import is the newest of those; a
   commit that the rewrite dropped has no new hash and takes no part in finding
-  the import. HEAD itself needs no note when its subject is "Release <X.Y.Z>":
-  jig release prepare makes that commit and runs this check on it in the same
-  run, so nobody could have written its note yet. Once a later commit exists, the
-  release commit needs its note like every other commit;
+  the import. The release commits at HEAD need no note: HEAD when its subject is
+  "Release <X.Y.Z>", and each commit below it, by the first parent, with the same
+  subject, up to the first commit that does not have it. jig release prepare
+  makes such a commit, a rerun of it can add another, and the run that makes
+  them is the run that checks them, so nobody could have written their notes
+  yet. Once a later commit exists, each release commit needs its note like every
+  other commit;
 - the ID map specs/id-map.tsv, when present, has its form, and while
   trace/pre-import names the commit from before the product's IDs moved into the
   trace, every ID of that commit's tree is carried. Only the files that are still
@@ -240,12 +243,12 @@ def check_ledger(dev, product):
     if listed.returncode != 0:
         return [f"trace/commit-map.tsv: git cannot list the commits after {start}: "
                 f"{listed.stderr.strip()}"]
-    # The release commit at HEAD cannot have its note yet: the release run that
-    # made the commit is the run that checks it.
-    release = release_head(product)
+    # The release commits at HEAD cannot have their notes yet: the release run that
+    # made them is the run that checks them.
+    releases = release_run(product, start)
     failures = []
     for commit in listed.stdout.split():
-        if commit == release:
+        if commit in releases:
             continue
         note = dev / "trace" / "ledger" / f"{commit}.md"
         if not note.is_file():
@@ -256,13 +259,32 @@ def check_ledger(dev, product):
     return failures
 
 
-def release_head(product):
-    """The full hash of HEAD when it is the commit jig release prepare makes, else None."""
-    shown = jig_trace.git(product, "log", "-1", "--format=%H %s", "HEAD")
+def release_run(product, start):
+    """The full hashes of the release commits of one version that end at HEAD.
+
+    jig release prepare makes a commit with the subject "Release <X.Y.Z>" and runs
+    this check in the same run, and a rerun of prepare can add a second commit with
+    the same subject on top of the first. None of them can have its note before
+    that run. The run is walked back from HEAD by the first parent, within the
+    commits after start, and ends at the first commit whose subject is not exactly
+    the subject of HEAD: a release commit of another version, or one below an
+    ordinary commit, needs its note like every other commit.
+    """
+    shown = jig_trace.git(product, "log", "--first-parent", "--format=%H %s",
+                          f"{start}..HEAD")
     if shown.returncode != 0:
-        return None
-    commit, _, subject = shown.stdout.strip().partition(" ")
-    return commit if RELEASE_SUBJECT.fullmatch(subject) else None
+        return set()
+    releases, head_subject = set(), None
+    for row in shown.stdout.splitlines():
+        commit, _, subject = row.partition(" ")
+        if not RELEASE_SUBJECT.fullmatch(subject):
+            break
+        if head_subject is None:
+            head_subject = subject
+        elif subject != head_subject:
+            break
+        releases.add(commit)
+    return releases
 
 
 def read_id_map(dev):
