@@ -5,6 +5,7 @@ account is a directory under fake/accounts, which an ssh double enters as that a
 The two origins are bare repositories, built once for the class.
 """
 
+import os
 import pathlib
 import shutil
 import tempfile
@@ -144,9 +145,10 @@ class TestStates(BranchTest):
         (blocked / "new.txt").write_text("in the way\n")
         # auditor: a clone on the line at origin is the same, also with a tracked
         # change; a clone on the line at an old origin/0.10 whose fetch fails is kept
-        # with git's message, not taken as the same; a conf file with no BRANCH line
-        # in a folder that cannot be written is a failure, and its value is shown as -.
-        auditor_conf = self.conf("auditor", "REPO=x\n")
+        # with git's message, not taken as the same; a conf path that is a folder
+        # cannot be read, which is a failure, and its value is shown as -.
+        auditor_conf = self.home_of("auditor") / ".config" / "jig" / f"{PROJECT}.conf"
+        auditor_conf.mkdir(parents=True)
         current = self.clone("auditor", dev)
         self.git(current, "switch", "-q", LINE)
         (current / "file.txt").write_text("edited\n")
@@ -154,8 +156,6 @@ class TestStates(BranchTest):
         self.git(stale, "update-ref", f"refs/remotes/origin/{LINE}", second)
         self.git(stale, "switch", "-q", "-c", LINE, second)
         self.git(stale, "remote", "set-url", "origin", str(self.tmp / "no-such-origin"))
-        auditor_conf.parent.chmod(0o500)
-        self.addCleanup(auditor_conf.parent.chmod, 0o700)
         # gone has no account directory, so ssh fails; broken is reached, but the
         # command fails there.
         (self.fake / "accounts" / "broken").mkdir()
@@ -197,7 +197,7 @@ class TestStates(BranchTest):
             "BRANCH=- failed: cannot read: No such file or directory",
             f"conf implementer {implementer_conf} BRANCH={LINE} set",
             f"conf checker {checker_conf} BRANCH={LINE} same",
-            f"conf auditor {auditor_conf} BRANCH=- failed: cannot write",
+            f"conf auditor {auditor_conf} BRANCH=- failed: cannot read: Is a directory",
             f"conf gone ~/.config/jig/{PROJECT}.conf BRANCH=- failed: cannot reach gone",
             f"conf broken ~/.config/jig/{PROJECT}.conf BRANCH=- failed: the account "
             "script failed in broken: python3: broken",
@@ -222,7 +222,24 @@ class TestStates(BranchTest):
         after = checker_conf.stat()
         self.assertEqual((after.st_ino, after.st_mtime_ns),
                          (unchanged.st_ino, unchanged.st_mtime_ns))
-        self.assertEqual(auditor_conf.read_text(), "REPO=x\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes in a directory of any mode")
+    def test_a_conf_file_with_no_value_that_cannot_be_written_is_a_failure(self):
+        # The conf file has no BRANCH line and is in a folder that cannot be written:
+        # its line shows BRANCH=- and the failure, the clones still move, the file is as
+        # it was, and the exit is 1.
+        conf = self.conf("orchestrator", "REPO=x\n")
+        for repo in (f"{PROJECT}-dev", PROJECT):
+            self.clone("orchestrator", repo)
+        conf.parent.chmod(0o500)
+        self.addCleanup(conf.parent.chmod, 0o700)
+        result = self.branch(PROJECT, LINE)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        states = [text.rsplit(" ", 1)[1] for text in result.stdout.splitlines()[:2]]
+        self.assertEqual(states, ["moved", "moved"])
+        self.assertEqual(result.stdout.splitlines()[2],
+                         f"conf orchestrator {conf} BRANCH=- failed: cannot write")
+        self.assertEqual(conf.read_text(), "REPO=x\n")
 
     def test_a_second_run_after_a_clean_move_changes_nothing_and_exits_0(self):
         # Three accounts with clean clones and conf files on the old line, and no
