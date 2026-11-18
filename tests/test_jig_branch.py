@@ -104,7 +104,7 @@ class BranchTest(TempTestCase):
 
 class TestStates(BranchTest):
     def test_each_clone_and_conf_file_gets_its_state_and_a_kept_clone_gives_exit_1(self):
-        # One run over six accounts, with no ORCH_ACCOUNT in the orchestrator's conf
+        # One run over seven accounts, with no ORCH_ACCOUNT in the orchestrator's conf
         # file, so the orchestrator role is the account "orchestrator". Each clone and
         # each conf file sets up one case. The kept clones of the earlier accounts do
         # not stop the run: the later accounts' clones are still moved or named, and
@@ -114,7 +114,7 @@ class TestStates(BranchTest):
         second, third = self.commits["second"], self.commits["third"]
         orchestrator_conf = self.conf("orchestrator", (
             "REPO=x\nBRANCH=0.9\nSPEC_ACCOUNT=specwriter\nIMPL_ACCOUNT=implementer\n"
-            "REV_ACCOUNT=checker auditor gone broken\n"))
+            "REV_ACCOUNT=checker auditor gone broken ignorer\n"))
         # The orchestrator: a clean -dev clone with no local branch of the line is moved
         # and gets the branch with origin/0.10 as upstream; a product clone with a
         # tracked change is kept, with its untracked file and its stash.
@@ -160,6 +160,16 @@ class TestStates(BranchTest):
         # command fails there.
         (self.fake / "accounts" / "broken").mkdir()
         (self.fake / "accounts" / "broken" / "script-fails").write_text("")
+        # ignorer, the last account, after the failures above: an untracked new.txt
+        # that the clone's own exclude file ignores, where the line tracks new.txt.
+        # git would overwrite an ignored file without a word, so the switch must be
+        # refused as for any untracked file, and the file kept. The clean product
+        # clone after it is still moved.
+        ignorer_conf = self.conf("ignorer", "REPO=x\n")
+        ignored = self.clone("ignorer", dev)
+        (ignored / ".git" / "info" / "exclude").write_text("new.txt\n")
+        (ignored / "new.txt").write_text("ignored but mine\n")
+        self.clone("ignorer", product)
 
         result = self.branch(PROJECT, LINE)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -192,6 +202,12 @@ class TestStates(BranchTest):
             for repo in (dev, product):
                 shown.append(f"clone {account} ~/ws/src/{repo} - - kept: {reason}")
         shown += [
+            f"clone ignorer {fake / 'ignorer/ws/src' / dev} 0.9 {first[:12]} "
+            "kept: error: The following untracked working tree files would be "
+            "overwritten by checkout:",
+            f"clone ignorer {fake / 'ignorer/ws/src' / product} {LINE} {third[:12]} moved",
+        ]
+        shown += [
             f"conf orchestrator {orchestrator_conf} BRANCH={LINE} set",
             f"conf specwriter {fake / 'specwriter/.config/jig' / (PROJECT + '.conf')} "
             "BRANCH=- failed: cannot read: No such file or directory",
@@ -201,6 +217,7 @@ class TestStates(BranchTest):
             f"conf gone ~/.config/jig/{PROJECT}.conf BRANCH=- failed: cannot reach gone",
             f"conf broken ~/.config/jig/{PROJECT}.conf BRANCH=- failed: the account "
             "script failed in broken: python3: broken",
+            f"conf ignorer {ignorer_conf} BRANCH={LINE} set",
         ]
         self.assertEqual(result.stdout.splitlines(), shown)
 
@@ -212,11 +229,12 @@ class TestStates(BranchTest):
         self.assertEqual((kept / "notes.txt").read_text(), "mine\n")
         self.assertEqual(len(self.git(kept, "stash", "list").splitlines()), 1)
         self.assertEqual((blocked / "new.txt").read_text(), "in the way\n")
+        self.assertEqual((ignored / "new.txt").read_text(), "ignored but mine\n")
         self.assertEqual((current / "file.txt").read_text(), "edited\n")
         # Conf files: the other lines stay, a file that held the line was not written.
         self.assertEqual(orchestrator_conf.read_text(), (
             f"REPO=x\nBRANCH={LINE}\nSPEC_ACCOUNT=specwriter\nIMPL_ACCOUNT=implementer\n"
-            "REV_ACCOUNT=checker auditor gone broken\n"))
+            "REV_ACCOUNT=checker auditor gone broken ignorer\n"))
         self.assertEqual(implementer_conf.read_text(),
                          f"REPO=x\nJIG_VERSION=0.9.2\nBRANCH={LINE}\n")
         after = checker_conf.stat()

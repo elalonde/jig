@@ -214,8 +214,11 @@ def clone_state(clone):
     # The checks above make this a fast-forward: the local branch of the line, when
     # there is one, is an ancestor of origin/<line>. -C moves the branch and the files
     # in one step, so a switch that git refuses, as for an untracked file it would
-    # overwrite, leaves the clone as it was.
-    switched = git(clone, "switch", "--quiet", "-C", line, "--track", f"origin/{line}")
+    # overwrite, leaves the clone as it was. By default git overwrites an untracked
+    # file without a word when an ignore rule covers it; --no-overwrite-ignore makes
+    # git refuse for that file too, since it is in no commit and would be lost.
+    switched = git(clone, "switch", "--quiet", "--no-overwrite-ignore", "-C", line,
+                   "--track", f"origin/{line}")
     if switched.returncode != 0:
         return f"kept: {first_line(switched)}"
     return "moved"
