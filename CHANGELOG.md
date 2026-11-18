@@ -5,6 +5,90 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.9.2
+
+What changed: `jig tag` checks a four-cell row of "Closed review loops" more
+closely. The fix unit's report must have the first line `OK` or start with
+`OK:`, and its `commits:` line must not be `none`. Of the documents in the
+rows with the same review ID and fix ID, at least one must differ between the
+oldest commit that adds the review's findings file and the commit to tag, so a
+fix that changed no document of its review is refused.
+
+`jig orch <project> events --next [<unit ID>]` is a watcher that prints the
+next event and exits. It keeps a mark, `~/ws/reviews/<project>/orch/events.mark`,
+so a line that comes while no watcher runs is printed by the next run, and no
+line comes twice. With a unit ID it also runs `jig wait` on that unit, and
+ends with one line `jig wait <unit ID> exit <code>: <last line>` when the wait
+ends other than at the unit's report.
+
+The stall check, `jig orch <project> status`, `wait-on` and the state of a
+running unit all find the orchestrator account the same way: `ORCH_ACCOUNT` of
+the conf file, `orchestrator` when it names none. `wait-on` reads the activity
+file of the other project in that account's home, and for a mistyped project
+names the missing directory first.
+
+`make real-start`, when it is stopped, also ends its worker processes and
+removes the conf file, the lock and the transcripts that it made; the approved
+worktree is read-only again also when it is found at the right commit.
+
+The templates of `jig new`: `ORCHESTRATOR.md` gives a spec document or a plan
+at most one review, with one fix unit for its must-fix findings and no second
+review; every other finding goes to a new file, `impl/orch/backlog.md`. The
+watcher is the command `jig orch <project> events --next [<unit ID>]`, run in
+the background and started again after each wake, in place of a watcher that
+prints each line. At a rollover, the fresh session passes the running unit's
+ID to its watcher. The prompt template asks a unit to wait on CI with a command
+that ends when CI ends, to run tmux in tests on a server of its own
+(`tmux -L <name>`), and, in a review prompt, to use `git --no-optional-locks
+status` in a reference checkout, because a plain `git status` rewrites its
+index.
+
+Tests: the tests of the looks for forks at the end of a loop hold the looking
+process while they start a late fork, and skip with the reason when a busy
+host cannot hold it in time in any of 3 tries. The tests of the next-event
+watcher wait for its files with a bound instead of reading them a fixed time
+after its start. A watcher test ends its watcher in its cleanup. A slow CI
+runner no longer turns these tests red.
+
+Files and formats: changed files: `lib/jig_trust.py`, `libexec/jig-orch`,
+`libexec/jig-tag`, the template `ORCHESTRATOR.md` under `templates/new/`,
+`templates/prompt.md`, `tests/real_start.py` and `tests/real_start_end.py`.
+New file of a project: `~/ws/reviews/<project>/orch/events.mark`, written by
+the watcher. The table "Closed review loops" keeps its form; only the checks
+of a four-cell row are stricter. The other formats are unchanged.
+
+Migration: a host and its projects move from 0.9.1 to 0.9.2 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.9.2`. It installs 0.9.2
+   under `/opt/jig/0.9.2/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.9.2` as the orchestrator
+   account. It sets `JIG_VERSION=0.9.2` in the conf file of the project in each
+   role account, and refuses while a unit holds a lock. Check in each account
+   that the conf file of the project reads `JIG_VERSION=0.9.2`.
+3. Restart each project's orchestrator loop, so that it loads the new
+   `jig orch`: let the session finish its step, then, from a shell of the
+   orchestrator account outside the session, run `jig orch <project> stop` and
+   then `jig orch <project> start`. The start prints a trust line for each mark
+   it sets or cannot set; a line that ends in `not marked` names a folder whose
+   session will wait at the dialog. A loop that is not restarted keeps the
+   0.9.1 code.
+4. In the orchestrator session, stop the Monitor watcher. From then on the
+   watcher is the background command
+   `jig orch <project> events --next [<unit ID>]`, with the running unit's ID
+   while a unit runs; start it again after each wake, and never run two at
+   once.
+5. Copy the changed rules of the templates by hand into the project's own
+   `ORCHESTRATOR.md`: one review of a spec or plan, with one fix unit and the
+   backlog `impl/orch/backlog.md`; the watcher; the rollover rule for a running
+   unit. `jig upgrade` changes no file of a project's repo.
+6. Nothing more for the specwriter and implementer accounts.
+
+Requested by: another project, for the line of the prompt template on
+`git status` in a reference checkout; the rest: found in the use of 0.9.1 and
+in the code review of the line.
+
+Units: 0 minor, 4 patch, 5 none
+
 ## 0.9.1
 
 What changed: `jig report`, for a product that has no branch of the conf's
