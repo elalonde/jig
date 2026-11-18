@@ -586,6 +586,17 @@ class VersionTest(ReleaseCase):
         self.assertEqual(release.next_version(self.product, LINE), ("0.7.2", "v0.7.1"))
         self.assertEqual(release.count_classes(self.dev, LINE, "v0.7.1"), {"patch": 1})
 
+    def test_the_newest_tag_of_a_line_is_found_by_its_numbers(self):
+        # Tags of the lines 0.9 and 0.10 are both in the history. The line 0.10 takes
+        # only its own tags, and 0.9.10 is newer than 0.9.2 on the line 0.9.
+        for tag in ("v0.9.2", "v0.10.0"):
+            self.git("-C", self.product, "tag", tag)
+        self.assertEqual(release.next_version(self.product, "0.10"), ("0.10.1", "v0.10.0"))
+        self.assertEqual(release.next_version(self.product, "0.9"), ("0.9.3", "v0.9.2"))
+        self.git("-C", self.product, "tag", "v0.9.10")
+        self.assertEqual(release.next_version(self.product, "0.9"), ("0.9.11", "v0.9.10"))
+        self.assertEqual(release.next_version(self.product, "0.1"), ("0.1.0", None))
+
     def test_reports_of_a_line_with_no_release_are_those_master_does_not_hold(self):
         self.git("-C", self.dev, "fetch", "-q", "origin")
         self.assertEqual(release.count_classes(self.dev, LINE, None),

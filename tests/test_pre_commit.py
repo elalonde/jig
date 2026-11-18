@@ -487,7 +487,7 @@ class AddedOnlyCase(TempTestCase):
         conf.parent.mkdir(parents=True)
         conf.write_text(f"REPO={self.dev}\nBRANCH=0.8\n", encoding="utf-8")
         self.opt = self.tmp / "opt"
-        for name in ("0.8.1", "0.8.2", "0.10.0", "jig"):
+        for name in ("0.8.1", "0.8.2", "0.9.2", "0.10.0", "jig"):
             (self.opt / name).mkdir(parents=True)
         (self.opt / "current").symlink_to("0.8.2")
         (self.tmp / "bin").mkdir()
@@ -655,14 +655,18 @@ class AddedOnlyTest(AddedOnlyCase):
         self.assertEqual(self.commits(), 1)
 
     def test_a_jig_newer_by_its_numbers_checks_only_what_the_commit_adds(self):
-        # 0.10.0 is newer than 0.8.2 when the parts are compared as numbers, though not
-        # as text: the commit with the old match in HEAD is made.
-        self.use_which(f"echo '{self.opt / '0.10.0'}'\nexit 0")
-        self.write({"notes.txt": "first\nsecond\nthird\n"})
-        result = self.commit()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"terms check demo --staged {os.path.realpath(self.product)}",
-                      self.calls())
+        # 0.9.2 and 0.10.0 are both newer than 0.8.2 when the parts are compared as
+        # numbers, though 0.10.0 is not as text: with each, the commit with the old
+        # match in HEAD is made.
+        for version in ("0.9.2", "0.10.0"):
+            with self.subTest(version=version):
+                self.use_which(f"echo '{self.opt / version}'\nexit 0")
+                self.write({"notes.txt": f"first\nsecond\n{version}\n"})
+                result = self.commit()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"terms check demo --staged {os.path.realpath(self.product)}",
+                              self.calls())
+                self.log.unlink()
 
     def test_an_older_jig_or_one_the_hooks_cannot_read_gets_the_whole_check(self):
         # The jig's tree reads as 0.8.1, jig which fails, or the tree's name is not a

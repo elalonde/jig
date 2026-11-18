@@ -1,4 +1,5 @@
 import filecmp
+import os
 import shutil
 import stat
 import unittest
@@ -79,6 +80,16 @@ class InstallTest(TempTestCase):
         # Numbers, not letters, decide which is newest.
         self.assertEqual(self.install("0.10.0").returncode, 0)
         self.assertEqual((self.root / "current").resolve(), (self.root / "0.10.0").resolve())
+
+    def test_0_10_0_is_newer_than_0_9_2_in_either_order_of_install(self):
+        # As text, 0.9.2 would sort after 0.10.0. Installed after 0.9.2, 0.10.0 becomes
+        # current; a later 0.9.2 in a second root leaves current at 0.10.0.
+        for order in (("0.9.2", "0.10.0"), ("0.10.0", "0.9.2")):
+            with self.subTest(order=order):
+                self.root = self.tmp / ("root-" + "-".join(order))
+                for version in order:
+                    self.assertEqual(self.install(version).returncode, 0)
+                self.assertEqual(os.readlink(self.root / "current"), "0.10.0")
 
     def test_install_twice_ignores_byte_code_in_the_installed_tree(self):
         self.assertEqual(self.install().returncode, 0)

@@ -87,6 +87,17 @@ class ChangelogTest(TempTestCase):
         result = self.changelog("--since", "0.9.5")
         self.assertEqual(self.headings(result), ["## 0.10.0"])
 
+    def test_changelog_since_0_9_2_prints_0_10_0_and_its_patches_only(self):
+        # A patch of the line 0.9 came out after 0.10.0, so it is above it in the
+        # file. From 0.9.2, which has an entry, the entries above it print; from 0.9.4,
+        # which has none, the numbers decide, and 0.10.0 is above 0.9.4.
+        self.file.write_text("## 0.9.3\n\nThree.\n\n## 0.10.0\n\nTen.\n\n"
+                             "## 0.9.2\n\nTwo.\n")
+        self.assertEqual(self.headings(self.changelog("--since", "0.9.2")),
+                         ["## 0.9.3", "## 0.10.0"])
+        self.assertEqual(self.headings(self.changelog("--since", "0.9.4")), ["## 0.10.0"])
+        self.assertEqual(self.headings(self.changelog("--since", "0.10.0")), ["## 0.9.3"])
+
     def test_changelog_reads_the_current_version_under_jig_root(self):
         # Another installed version with its own change log is not read.
         (self.root / "0.4.0").mkdir()

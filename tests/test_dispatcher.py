@@ -237,6 +237,19 @@ class DispatcherTest(TempTestCase):
         self.assert_runs(result, "0.2.0")
         self.assertEqual(result.stdout.strip(), "0.2.0 upgrade demo 0.2.0")
 
+    def test_dispatcher_with_0_9_2_and_0_10_0_picks_by_pin_and_current_not_by_name(self):
+        # Both versions are installed and current is 0.10.0. A project pinned to 0.9.2
+        # runs its own tree, also for jig branch, which names the project; upgrade
+        # runs from current; a project with no pin runs current.
+        for version in ("0.9.2", "0.10.0"):
+            self.install(version, "probe", "branch", "upgrade")
+        self.set_current("0.10.0")
+        self.pin("demo", "JIG_VERSION=0.9.2\n")
+        self.assert_runs(self.jig("probe", "demo"), "0.9.2")
+        self.assert_runs(self.jig("branch", "demo", "0.10"), "0.9.2")
+        self.assert_runs(self.jig("upgrade", "demo", "0.10.0"), "0.10.0")
+        self.assert_runs(self.jig("probe", "other"), "0.10.0")
+
 
 if __name__ == "__main__":
     unittest.main()
