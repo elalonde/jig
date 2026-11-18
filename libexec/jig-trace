@@ -35,7 +35,9 @@ check makes sure that tie still holds:
 - the ID map specs/id-map.tsv, when present, has its form, and while
   trace/pre-import names the commit from before the product's IDs moved into the
   trace, every ID of that commit's tree is carried. Only the files that are still
-  product files are searched: first for the old IDs of the map, the longest first,
+  product files and that git reads as text, as git grep -I does, are searched;
+  a binary file gives no line. The search looks first for the old IDs of the map,
+  the longest first,
   then for the IDs of each class, where a match inside an earlier one does not
   count. Each ID found reads through the map, to its new IDs, to nothing for a
   dropped ID, or to itself, and each result must be in an entry of the trace of
@@ -325,6 +327,27 @@ def tree_files(product, commit):
     return [name for name in listed.stdout.split("\0") if name]
 
 
+def text_files(product, commit):
+    """The paths of the files in the tree of commit that git reads as text, or None.
+
+    Archives and other binary files hold byte runs that look like IDs, and no trace
+    entry can carry those. git grep -I leaves out what git itself calls binary: a
+    NUL near the start, or the binary attribute. Asking git keeps that one rule
+    instead of a second, different one here. The empty pattern matches each line,
+    so every text file with content is listed; an empty file holds no ID anyway.
+    When git grep fails, None asks the caller to read every file, so that a failure
+    never hides an ID.
+    """
+    prefix = f"{commit}:"
+    listed = jig_trace.git(product, "grep", "-I", "-l", "-z", "--no-recurse-submodules",
+                           "-e", "", commit)
+    # Exit 1 means no line matched: the tree has no text file with content.
+    if listed.returncode not in (0, 1):
+        return None
+    return {name[len(prefix):] for name in listed.stdout.split("\0")
+            if name.startswith(prefix)}
+
+
 def tree_texts(product, commit, paths):
     """Map each path to its text in the tree of commit, read in one git call."""
     paths = [path for path in paths if "\n" not in path]
@@ -396,7 +419,9 @@ def check_completeness(dev, product, classes, id_map):
     if commit is None:
         return failures
     now = set(tree_files(product, "HEAD"))
-    paths = sorted(path for path in tree_files(product, commit) if path in now)
+    texts_only = text_files(product, commit)
+    paths = sorted(path for path in tree_files(product, commit)
+                   if path in now and (texts_only is None or path in texts_only))
     texts = tree_texts(product, commit, paths)
     searches = id_searches(list(id_map.rows) if id_map else [],
                            [item.search for item in classes or []])

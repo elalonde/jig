@@ -645,6 +645,43 @@ class CompletenessTest(TraceCase):
         self.assert_fails_with("trace/pre-import: is a directory, not a file that holds one "
                                "line")
 
+    def binary_beside_text(self, binary_name, binary_bytes, attributes=None):
+        """Commit a binary file and a text file that cite the same old ID and
+        control, and name that commit, which is also HEAD, in trace/pre-import."""
+        self.write(self.dev / "specs/id-map.tsv", ID_MAP_HEADER + "F-7\tR-7\n")
+        self.write(self.product / "src/tool.py", TOOL_TEXT + "# F-7 and C-core-2 guard this.\n")
+        path = self.product / binary_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(binary_bytes)
+        if attributes is not None:
+            self.write(self.product / ".gitattributes", attributes)
+        self.git_commit_all(self.product)
+        self.write(self.dev / "trace/pre-import", self.head() + "\n")
+
+    def assert_text_file_lines_only(self):
+        """The text file gives a line for each uncarried ID; the binary file none."""
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [
+            PREFIX + f"src/tool.py:7: {record} of the tree of trace/pre-import is in no "
+            "entry of trace/src/tool.py.json" for record in ("R-7", "C-core-2")])
+
+    def test_binary_file_with_a_nul_gives_no_line(self):
+        # An archive-like file holds a NUL byte and then the bytes of an old ID and
+        # of a control. git reads it as binary, so only the text file that cites
+        # the same IDs gives its lines.
+        self.binary_beside_text("assets/bundle.bin",
+                                b"\x1f\x8b\x00\x00 F-7 C-core-2 \x00\xff\n")
+        self.assert_text_file_lines_only()
+
+    def test_file_the_binary_attribute_marks_gives_no_line(self):
+        # A file with no NUL byte that .gitattributes marks as binary. git grep -I
+        # leaves it out, and so does the search, because git's rule decides and
+        # not a byte test of the tool's own.
+        self.binary_beside_text("assets/table.dat", b"F-7 C-core-2\n",
+                                attributes="*.dat binary\n")
+        self.assert_text_file_lines_only()
+
     def test_only_files_still_in_the_product_are_searched(self):
         # The old tree had a file that cited a control, and the product has since
         # removed it, so its IDs need no trace.
