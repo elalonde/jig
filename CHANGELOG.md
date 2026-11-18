@@ -5,6 +5,80 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.0
+
+What changed: a new command, `jig branch <project> <line>`, moves a project to
+another version line. Run as the orchestrator account at a batch boundary, it
+sets `BRANCH=<line>` in the conf file of the project in each role account,
+fetches the `-dev` clone and the product clone of each account, and switches
+each clean clone to the line by fast-forward only. A clone with tracked changes,
+local commits, a detached HEAD, a local line that is not a fast-forward, or an
+ignored file that the line would overwrite stays as it was and is named with
+the reason; nothing is reset, cleaned, stashed, merged or rebased. It refuses,
+and changes nothing, while a unit or a batch of the project runs, or when
+origin has no such line in the product or in `-dev`. It prints one line for
+each clone and each conf file, exits 1 when any of them is not on the line, and
+is safe to run again. The move to a new line after a minor or major release is
+now the orchestrator's, with no owner block.
+
+`jig orch <project> events --next` takes several unit IDs, each with its
+expected minutes as `<ID>:<minutes>`, and runs one `jig wait` for each. When a
+wait ends other than at the unit's report, the watcher prints that wait's whole
+output before its line `jig wait <ID> exit <code>: <last line>`. A mark file
+that does not hold one whole number counts as no mark.
+
+`jig trace check`: an ID in a trace entry also passes when a file of its
+class's `defined` column defines it in a form that the class's coverage reads,
+such as a question's heading in `QUESTIONS.md`, also when the spec documents do
+not name it. The refusal of an ID that passes neither way now names both parts.
+
+The templates of `jig new`: `ORCHESTRATOR.md` has the rule for the move after a
+minor or major release. The release unit pushes the new line of the product,
+the orchestrator pushes the new line of `-dev`, commits its own changes so that
+its clone is clean, and runs `jig branch <project> <line>`; when it exits 1, no
+batch starts on the line.
+
+Tests: versions are compared as numbers, so 0.10.0 sorts after 0.9.2 in the
+dispatcher, the install, the change log, the pre-commit hook and the release
+tool; each has a test of that pair.
+
+Files and formats: new file: `libexec/jig-branch`. Changed files:
+`lib/jig_trace.py`, `libexec/jig-orch`, `libexec/jig-trace`, `README.md` and
+the template `ORCHESTRATOR.md` under `templates/new/`. The arguments of
+`events --next` grow from one unit ID to several, each with optional minutes;
+one plain unit ID works as before. The conf file, the event file, the mark and
+the trace formats are unchanged.
+
+Migration: a host and its projects move from 0.9.2 to 0.10.0 in this order.
+
+1. As the orchestrator account, run `jig upgrade 0.10.0`. It installs 0.10.0
+   under `/opt/jig/0.10.0/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.0` as the orchestrator
+   account. It sets `JIG_VERSION=0.10.0` in the conf file of the project in
+   each role account, and refuses while a unit holds a lock. Check in each
+   account that the conf file of the project reads `JIG_VERSION=0.10.0`.
+3. Restart each project's orchestrator loop, so that it loads the new
+   `jig orch`: let the session finish its step, then, from a shell of the
+   orchestrator account outside the session, run `jig orch <project> stop` and
+   then `jig orch <project> start`. The start prints a trust line for each mark
+   it sets or cannot set; a line that ends in `not marked` names a folder whose
+   session will wait at the dialog. A loop that is not restarted keeps the
+   0.9.2 code.
+4. The watcher, `jig orch <project> events --next`, may now name several unit
+   IDs, each with its minutes, `<ID>:<minutes>`, when several units run.
+5. After a minor or major release, the release unit pushes the new line of the
+   product and the orchestrator the new line of `-dev`; then the orchestrator
+   runs `jig branch <project> <line>`, with no block. Copy this rule by hand
+   into the project's own `ORCHESTRATOR.md`; `jig upgrade` changes no file of a
+   project's repo.
+6. Nothing more for the specwriter and implementer accounts.
+
+Requested by: other projects, for `jig branch` and for the change of
+`jig trace check`; the rest: found in the use of 0.9.2 and in the code review
+of the line.
+
+Units: 1 minor, 2 patch, 2 none
+
 ## 0.9.2
 
 What changed: `jig tag` checks a four-cell row of "Closed review loops" more
