@@ -215,10 +215,10 @@ def ids_in(text):
 
 
 def class_of(classes, record):
-    """The name of the first class whose regex matches the whole ID, or None."""
+    """The first class whose regex matches the whole ID, or None."""
     for item in classes:
         if item.regex.fullmatch(record):
-            return item.name
+            return item
     return None
 
 

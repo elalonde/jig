@@ -140,11 +140,20 @@ def check_ids_file(dev):
 
 
 def check_trace_files(dev, product, classes, documents):
-    """Check the anchors and IDs of every trace file, and that its product file exists."""
+    """Check the anchors and IDs of every trace file, and that its product file exists.
+
+    An ID of an entry must occur in the spec documents, or be defined in a file
+    that the defined column of its class names. The second way lets a trace hold
+    a decision or a question that only a record outside the specs defines, such
+    as a question that has only its heading in QUESTIONS.md.
+    """
     failures = []
     known = set()
     for text in documents.values():
         known |= jig_trace.ids_in(text)
+    # The IDs each class defines, read once for each class the first time an ID
+    # of that class is not in the spec documents.
+    defined = {}
     for product_path, path in jig_trace.trace_files(dev).items():
         name = f"trace/{product_path}.json"
         target = product / product_path
@@ -167,15 +176,29 @@ def check_trace_files(dev, product, classes, documents):
             if classes is False:
                 continue
             for record in entry["ids"]:
+                item = None
                 if classes is None:
                     failures.append(f"{where}: ID {record!r} matches no class: there is no "
                                     "specs/ids.tsv")
-                elif jig_trace.class_of(classes, record) is None:
-                    failures.append(f"{where}: ID {record!r} matches no class of "
-                                    "specs/ids.tsv")
-                if record not in known:
+                else:
+                    item = jig_trace.class_of(classes, record)
+                    if item is None:
+                        failures.append(f"{where}: ID {record!r} matches no class of "
+                                        "specs/ids.tsv")
+                if record in known:
+                    continue
+                # An ID of no class has no file that could define it.
+                if item is None:
                     failures.append(f"{where}: ID {record!r} does not occur in the spec "
                                     "documents")
+                    continue
+                if item.name not in defined:
+                    defined[item.name] = {
+                        definition.record for definition in
+                        jig_trace.definitions(dev, item, defining_kinds(item))}
+                if record not in defined[item.name]:
+                    failures.append(f"{where}: ID {record!r} does not occur in the spec "
+                                    "documents and is not defined in a file of its class")
     return failures
 
 
@@ -400,9 +423,15 @@ def check(start):
     return failures
 
 
-# The forms of definition each coverage check reads: requirements are headings,
-# controls and fixtures are table rows, and the rest may use any of the three.
+# The forms of definition each coverage check reads, and the ID check of the trace
+# with them: requirements are headings, controls and fixtures are table rows, and
+# the rest may use any of the three.
 DEFINING_KINDS = {"requirement": ("heading",), "control": ("row",), "fixture": ("row",)}
+
+
+def defining_kinds(item):
+    """The forms of line that define an ID of class item, by the coverage of the class."""
+    return DEFINING_KINDS.get(item.coverage, ("heading", "item", "row"))
 
 
 def problem(path, line, record, words):
@@ -518,8 +547,7 @@ def coverage(start):
     traced = {record for _name, entry in entries for record in entry["ids"]}
     cells = None
     for item in classes:
-        found = jig_trace.definitions(dev, item, DEFINING_KINDS.get(item.coverage,
-                                                                    ("heading", "item", "row")))
+        found = jig_trace.definitions(dev, item, defining_kinds(item))
         first, again = first_definitions(found)
         failures += [problem(definition.path, definition.line,
                              definition.record, "defined twice") for definition in again]

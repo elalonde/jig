@@ -167,13 +167,15 @@ class IdTest(TraceCase):
         # must not find the shorter one inside it.
         self.write(self.dev / "specs/jig-spec.md", "Only R-10 is written here.\n")
         self.assert_fails_with("trace/src/tool.py.json: entry 1 (line 1): ID 'R-1' does not "
-                               "occur in the spec documents")
+                               "occur in the spec documents and is not defined in a file "
+                               "of its class")
 
     def test_id_written_only_in_the_kickoff_record_fails(self):
         # The kickoff record is not a spec document, so its mention does not count.
         self.trace("src/tool.py", [entry(1, "def main():", ["R-77"])])
         self.assert_fails_with("trace/src/tool.py.json: entry 1 (line 1): ID 'R-77' does not "
-                               "occur in the spec documents")
+                               "occur in the spec documents and is not defined in a file "
+                               "of its class")
 
     def test_id_in_a_spec_document_below_specs_passes(self):
         # A spec document in a subdirectory of specs counts like any other.
@@ -253,7 +255,67 @@ class IdTest(TraceCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stderr.splitlines(), [
             PREFIX + f"trace/src/tool.py.json: entry 1 (line 1): ID '{record}' does not occur "
-            "in the spec documents" for record in ("R-78", "R-79")])
+            "in the spec documents and is not defined in a file of its class"
+            for record in ("R-78", "R-79")])
+
+
+class DefinedIdTest(TraceCase):
+    """IDs that a record outside the spec documents defines, by the forms of its class."""
+
+    # The questions and needs of these fixtures live in records outside specs, so
+    # only a definition in one of those records can make their IDs known.
+    CLASSES = (ID_CLASSES
+               + "IQ\tIQ-[0-9]+\tQUESTIONS.md\treference\n"
+               + "N\tN-[0-9]+\trecords/needs.md\trequirement\n"
+               + "D\tD-[0-9]+\trecords/decisions.md\treference\n")
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.dev / "specs/ids.tsv", self.CLASSES)
+
+    def assert_unknown(self, ids, failing):
+        """The entry holds ids; the check prints one line for each ID of failing, and
+        passes when failing is empty."""
+        self.trace("src/tool.py", [entry(1, "def main():", ids)])
+        result = self.check()
+        self.assertEqual(result.returncode, 1 if failing else 0, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [
+            PREFIX + f"trace/src/tool.py.json: entry 1 (line 1): ID '{record}' does not occur "
+            "in the spec documents and is not defined in a file of its class"
+            for record in failing])
+
+    def test_question_defined_only_by_its_heading_in_the_questions_file_passes(self):
+        # The question has its heading in QUESTIONS.md and is named nowhere under
+        # specs; the heading defines it, so the entry that holds it passes.
+        self.write(self.dev / "QUESTIONS.md", "# Questions\n\n### IQ-4 Which file wins\n\n"
+                   "The answer comes later.\n")
+        self.assert_unknown(["R-1", "IQ-4"], [])
+
+    def test_question_with_no_heading_fails_with_one_line_that_names_both_parts(self):
+        # QUESTIONS.md mentions the question in a sentence, which is not a definition,
+        # and the spec documents do not name it, so neither way makes it known.
+        self.write(self.dev / "QUESTIONS.md", "# Questions\n\nSee IQ-4 for the file.\n")
+        self.assert_unknown(["R-1", "IQ-4"], ["IQ-4"])
+
+    def test_requirement_defined_by_a_list_item_fails_and_by_a_heading_passes(self):
+        # A requirement is defined by a heading only. The needs file holds one need
+        # as a heading and another as a list item; only the list item fails.
+        self.write(self.dev / "records/needs.md", "# Needs\n\n### N-4 Start offline\n\n"
+                   "- N-3 Start without a network\n")
+        self.assert_unknown(["N-3", "N-4"], ["N-3"])
+
+    def test_table_row_in_a_file_of_a_reference_class_passes(self):
+        # A decision is defined by a table row whose first cell is its ID; a class
+        # with coverage reference accepts that form.
+        self.write(self.dev / "records/decisions.md", "| ID | decision |\n| --- | --- |\n"
+                   "| D-6 | Keep the one file |\n")
+        self.assert_unknown(["D-6"], [])
+
+    def test_question_the_spec_documents_name_passes_with_no_heading(self):
+        # The spec names the question and QUESTIONS.md does not exist; an ID that
+        # occurs in the spec documents still passes without a definition.
+        self.write(self.dev / "specs/jig-spec.md", SPEC_TEXT + "The ruling of IQ-5 holds.\n")
+        self.assert_unknown(["R-1", "IQ-5"], [])
 
 
 class MirrorTest(TraceCase):
