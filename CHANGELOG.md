@@ -87,7 +87,7 @@ Requested by: another project, for the line of the prompt template on
 `git status` in a reference checkout; the rest: found in the use of 0.9.1 and
 in the code review of the line.
 
-Units: 0 minor, 4 patch, 7 none
+Units: 0 minor, 4 patch, 8 none
 
 ## 0.9.1
 
