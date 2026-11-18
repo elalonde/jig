@@ -9,6 +9,17 @@ ROLE: <role>. Rules: CLAUDE.md, the sections <names>; when the
   Commit message standard. Spec tag: <the approved tag>.
   Prohibited sources: <from the kickoff record>. Never force-push,
   rewrite history, or delete tags or releases.
+  <In a project with reference yes: a known security defect of the
+  reference is named only by its OI-n, in CLAUDE.md and in every
+  record, and no record says more about it. Work on such a defect is
+  defensive only: the project's own rule, written as an approved
+  difference from the reference, with a test. Write no tool that is
+  aimed at systems outside the project. The disclosure of the defect
+  is Eric's decision. When the model refuses a request on it, do not
+  send the same request again in other words: make the scope of the
+  work smaller, and report NEEDS ERIC with the reason, so that the
+  orchestrator writes a brief to Eric. The record of such a defect is
+  never deleted.>
 STATE: <the expected state when this unit starts: the previous unit, the
   path of its report, what should be on origin>; the premise check
   verifies it.
@@ -36,7 +47,9 @@ SESSION ECONOMY: grep first; read by section; cut -c1-200; long output
   commit, with a clean tree. Wait on CI with a command that exits
   when CI ends (for jig, tools/ci-green --wait), not with a watcher
   that you must start again. A test or probe that needs tmux uses its
-  own server, tmux -L <name>, never the default server.
+  own server, tmux -L <name>, never the default server. Edit files
+  with the edit tool, never with a shell heredoc or with a script
+  that writes files.
 STEPS: 1 premise; 2 ...; n-1 commit, push; n report, committed alone
   as "log: <ID>", pushed.
 ESCALATION: report first line "NEEDS ERIC: <reason>" or

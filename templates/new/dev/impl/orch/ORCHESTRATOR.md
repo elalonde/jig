@@ -128,7 +128,7 @@ never alone. In `updates.log` the first line of each entry starts with
   whole, a transcript, or `updates.log`, unless `state.md` names a file.
 - Clean-room rules, in every project: use your ssh keys into the worker
   accounts only through jig (`jig start`, `jig wait`, `jig send`,
-  `jig close`, `jig cat`). With the clean room on: never read `~/ws/ref`; a
+  `jig close`, `jig cat`, `jig upgrade`, `jig branch`). With the clean room on: never read `~/ws/ref`; a
   prompt names no path under `~/ws/ref` and no reference-derived text; never
   copy reference-derived text into a prompt.
 - A worker's files: `jig cat @PROJECT@ <account> <path>`, under its
@@ -149,7 +149,8 @@ ID (Session rules, below). It uses no model and costs no tokens. It ends when
 the report commit reaches origin, the session ends, the screen shows no
 change, a dialog shows, or 3 times the expected duration passes. Its end at
 the report gives no line, because the line `report: <ID> <status>` wakes you;
-each other end gives the line `jig wait <ID> exit <code>: <last line>`.
+each other end gives the whole output of the wait, then the line
+`jig wait <ID> exit <code>: <last line>`.
 
 - A screen with no change: start the watcher with the unit ID again, or
   escalate. It is not by itself an escalation.
@@ -263,16 +264,25 @@ each move of `BRANCH` stays an owner block that Eric runs.
 ## Session rules
 
 - The first thing after each start of this session: start one background
-  watcher, `jig orch @PROJECT@ events --next [<unit ID>]`, as a background
-  command of the harness that gives you one turn when the command ends (in
-  Claude Code, a Bash command run in the background). Set no deadline on it,
-  and do not run it with a tool that gives a turn for each line (in Claude
-  Code, not with the Monitor tool). After each wake, act on what it printed,
-  then start it again. While a unit runs, pass that unit's ID as
-  `<unit ID>`: the watcher then also runs `jig wait` on the unit, and ends
-  with one line `jig wait <unit ID> exit <code>: <last line>` when that wait
-  ends other than at the unit's report. Run no separate `jig wait` in the
-  background. Never run two watchers at once, because they share one mark.
+  watcher, `jig orch @PROJECT@ events --next [<unit ID>[:<minutes>] ...]`,
+  as a background command of the harness that gives you one turn when the
+  command ends (in Claude Code, a Bash command run in the background). Set no
+  deadline on it, and do not run it with a tool that gives a turn for each
+  line (in Claude Code, not with the Monitor tool). After each wake, act on
+  what it printed, then start it again. While units run, pass the ID of each
+  running unit as a `<unit ID>`: the watcher then also runs `jig wait` on
+  each of them. When one of those waits ends other than at the unit's
+  report, the watcher prints the whole output of that wait, then the line
+  `jig wait <unit ID> exit <code>: <last line>`, and ends. With
+  `<unit ID>:<minutes>`, that wait first writes the new expected duration of
+  the unit. Run no separate `jig wait` in the background. To give the
+  watcher a new unit ID or new minutes while it runs, end the running
+  watcher and start it again with the new arguments. Give the minutes of a
+  unit in one start of the watcher only, not in each restart after it:
+  `jig wait` refuses `--expected` for a unit with no lock, also when the
+  report of that unit is on origin, so a watcher that starts again with
+  `<unit ID>:<minutes>` after the end of that unit exits at once with that
+  refusal. Never run two watchers at once, because they share one mark.
   The supervisor types nothing into this
   session: it appends each event as one line to the event file,
   `~/ws/reviews/@PROJECT@/orch/events.log` (the `inbox:` and `readback:`

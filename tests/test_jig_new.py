@@ -325,6 +325,59 @@ class JigNewTest(JigNewCase):
             self.assertIn(line, text)
         self.assertNotIn("when the project has no reference", text)
 
+    def test_made_claude_md_holds_the_security_defect_rule_and_every_command_of_rule_1(self):
+        # A new project gets the rule on a known security defect of the reference as a
+        # section of its own, which says that it holds only with a reference, so jig new
+        # need not know the profile yet; and the first clean-room rule names every jig
+        # command that reaches the worker accounts, jig upgrade and jig branch too.
+        text = self.made_text("CLAUDE.md")
+        section = text.split("## A known security defect of the reference", 1)[1]
+        section = section.split(" ## ", 1)[0]
+        for rule in ("This section holds in a project with `reference` yes in the project "
+                     "profile.",
+                     "is named only by its open-item ID, `OI-n`, in `CLAUDE.md` and in every "
+                     "record. No record says more about the defect than that ID.",
+                     "Work on such a defect is defensive only: the project's own rule, "
+                     "written as an approved difference from the reference, with a test.",
+                     "No unit writes a tool that is aimed at systems outside the project.",
+                     "The disclosure of such a defect is Eric's decision.",
+                     "the session does not send the same request again in other words. It "
+                     "makes the scope of the work smaller, and then the orchestrator writes "
+                     "a brief to Eric.",
+                     "A record of such a defect is never deleted."):
+            self.assertIn(rule, section)
+        self.assertIn("1. The orchestrator never reads `~/ws/ref`, and uses its ssh keys "
+                      "into the worker accounts only through jig (`jig start`, `jig wait`, "
+                      "`jig send`, `jig close`, `jig cat`, `jig upgrade`, `jig branch`).",
+                      text)
+
+    def test_standing_prompt_gives_the_watcher_of_several_units_and_its_restart(self):
+        # The watcher takes several unit IDs, each with optional minutes, and ends with
+        # the whole output of a wait. The standing prompt must say so, say how to give
+        # it new arguments, and say why minutes go into one start only: a restart with
+        # the minutes of a unit that has ended makes the watcher exit at once.
+        text = self.made_text("impl/orch/ORCHESTRATOR.md")
+        for rule in ("`jig orch demo events --next [<unit ID>[:<minutes>] ...]`",
+                     "While units run, pass the ID of each running unit as a `<unit ID>`: "
+                     "the watcher then also runs `jig wait` on each of them.",
+                     "the watcher prints the whole output of that wait, then the line "
+                     "`jig wait <unit ID> exit <code>: <last line>`, and ends.",
+                     "each other end gives the whole output of the wait, then the line "
+                     "`jig wait <ID> exit <code>: <last line>`.",
+                     "To give the watcher a new unit ID or new minutes while it runs, end "
+                     "the running watcher and start it again with the new arguments.",
+                     "Give the minutes of a unit in one start of the watcher only, not in "
+                     "each restart after it: `jig wait` refuses `--expected` for a unit "
+                     "with no lock, also when the report of that unit is on origin, so a "
+                     "watcher that starts again with `<unit ID>:<minutes>` after the end of "
+                     "that unit exits at once with that refusal."):
+            self.assertIn(rule, text)
+        # The form of the older watcher, one unit ID and one line at the end of a wait,
+        # is gone.
+        self.assertNotIn("--next [<unit ID>]`", text)
+        self.assertNotIn("one line `jig wait", text)
+        self.assertNotIn("each other end gives the line", text)
+
     def test_made_claude_md_has_the_vector_rules_the_checks_and_every_tool(self):
         # An implementer must learn the vector rule before jig report refuses its report,
         # and every session must know how a check is run and which tools exist.
@@ -388,13 +441,14 @@ class JigNewTest(JigNewCase):
         rules = text.split("## Session rules", 1)[1]
         first = rules.split(" - ", 2)[1]
         for part in ("The first thing after each start of this session: start one "
-                     "background watcher, `jig orch demo events --next [<unit ID>]`, as a "
-                     "background command of the harness that gives you one turn when the "
-                     "command ends (in Claude Code, a Bash command run in the background).",
+                     "background watcher, `jig orch demo events --next "
+                     "[<unit ID>[:<minutes>] ...]`, as a background command of the harness "
+                     "that gives you one turn when the command ends (in Claude Code, a Bash "
+                     "command run in the background).",
                      "Set no deadline on it,",
                      "(in Claude Code, not with the Monitor tool).",
                      "After each wake, act on what it printed, then start it again.",
-                     "While a unit runs, pass that unit's ID as `<unit ID>`:",
+                     "While units run, pass the ID of each running unit as a `<unit ID>`:",
                      "Run no separate `jig wait` in the background.",
                      "Never run two watchers at once,",
                      "`~/ws/reviews/demo/orch/events.log`",
@@ -409,7 +463,13 @@ class JigNewTest(JigNewCase):
         self.assertNotIn("supervisor sends", text)
         self.assertNotIn("announces", text)
         self.assertNotIn("Start no second one", text)
-        self.assertNotIn("minutes", first)
+        # Minutes occur in the first rule only as the expected duration that the
+        # watcher passes on to a wait, never as a time limit on the watcher itself.
+        rest = first
+        for allowed in ("[:<minutes>]", "<unit ID>:<minutes>", "new minutes",
+                        "the minutes of a unit"):
+            rest = rest.replace(allowed, "")
+        self.assertNotIn("minutes", rest)
         # The tool that gives a turn for each line is named only to rule it out, never
         # as the way to run the watcher.
         self.assertEqual(text.count("Monitor"), 1)
@@ -1258,6 +1318,47 @@ class JigNewTrustTest(TrustStepMixin, JigNewCase):
         self.assertEqual(lines[1:], ["trust specwriter: not marked", "new: no ssh to implementer",
                                      "trust implementer: not marked"])
         self.assertEqual(state.read_text(encoding="utf-8"), "[]")
+
+
+def prompt_section(text, name, following):
+    """The words of one section of a prompt, from its label up to the next label."""
+    start = text.index(f"\n{name}:")
+    return " ".join(text[start:text.index(f"\n{following}:", start)].split())
+
+
+class PromptTemplateTest(unittest.TestCase):
+    """The prompt template that the orchestrator fills for each unit of a new project."""
+
+    def setUp(self):
+        self.text = (ROOT / "templates" / "prompt.md").read_text(encoding="utf-8")
+
+    def test_session_economy_says_to_edit_files_with_the_edit_tool(self):
+        # A long shell command that writes files can bring up a safety dialog, and a
+        # dialog stops an unattended session; every prompt says so in its economy rules.
+        economy = prompt_section(self.text, "SESSION ECONOMY", "STEPS")
+        self.assertIn("Edit files with the edit tool, never with a shell heredoc or with a "
+                      "script that writes files.", economy)
+
+    def test_role_holds_the_security_defect_rule_for_a_project_with_a_reference(self):
+        # The prompt of a project with a reference carries each part of the rule on a
+        # known security defect of that reference, in words that fit any project.
+        role = prompt_section(self.text, "ROLE", "STATE")
+        rule = role.split("<In a project with reference yes: ", 1)[1].split(">", 1)[0]
+        for part in ("a known security defect of the reference is named only by its OI-n, "
+                     "in CLAUDE.md and in every record, and no record says more about it.",
+                     "Work on such a defect is defensive only: the project's own rule, "
+                     "written as an approved difference from the reference, with a test.",
+                     "Write no tool that is aimed at systems outside the project.",
+                     "The disclosure of the defect is Eric's decision.",
+                     "When the model refuses a request on it, do not send the same request "
+                     "again in other words: make the scope of the work smaller, and report "
+                     "NEEDS ERIC with the reason, so that the orchestrator writes a brief "
+                     "to Eric.",
+                     "The record of such a defect is never deleted."):
+            self.assertIn(part, rule)
+        # The rule is generic: it names no path of a reference and no record number.
+        self.assertNotIn("~/ws/ref", rule)
+        self.assertIsNone(re.search(r"OI-[0-9]", rule))
 
 
 if __name__ == "__main__":

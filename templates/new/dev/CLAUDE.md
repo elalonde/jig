@@ -35,7 +35,7 @@ can read no value for `clean room`, `jig wait`, `jig cat` and
 
 1. The orchestrator never reads `~/ws/ref`, and uses its ssh keys into the
    worker accounts only through jig (`jig start`, `jig wait`, `jig send`,
-   `jig close`, `jig cat`).
+   `jig close`, `jig cat`, `jig upgrade`, `jig branch`).
 2. A finding cites the reference by `file:line` and never quotes it.
 3. A prompt names no path under `~/ws/ref` and no reference-derived text; the
    orchestrator never copies reference-derived text into a prompt.
@@ -43,6 +43,24 @@ can read no value for `clean room`, `jig wait`, `jig cat` and
    prompt names, in `~/ws/src/@PROJECT@-dev-approved/`.
 5. Excluded sources named in the kickoff record stay excluded after the
    reference is archived; `terms.txt` and lint A carry them.
+
+## A known security defect of the reference
+
+This section holds in a project with `reference` yes in the project profile.
+
+- A known security defect of the reference is named only by its open-item
+  ID, `OI-n`, in `CLAUDE.md` and in every record. No record says more about
+  the defect than that ID.
+- Work on such a defect is defensive only: the project's own rule, written as
+  an approved difference from the reference, with a test.
+- No unit writes a tool that is aimed at systems outside the project.
+- The disclosure of such a defect is Eric's decision.
+- When the model refuses a request on such a defect, the session does not
+  send the same request again in other words. It makes the scope of the work
+  smaller, and then the orchestrator writes a brief to Eric. A unit reports
+  such a refusal with `NEEDS ERIC: <reason>`, and the orchestrator writes the
+  brief.
+- A record of such a defect is never deleted.
 
 ## Unit rules
 
