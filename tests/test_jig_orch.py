@@ -1829,6 +1829,10 @@ class TestWatcher(TempTestCase):
 # pid in HOME, prints two lines, and then exits with the code in wait-exit in HOME, or,
 # without that file, sleeps until it is ended. exec keeps the pid of the sleep the pid
 # that the watcher started, so a test can see that it is gone.
+# How long a test waits for a process it started before it gives up. A runner that
+# stalls for a few seconds must not fail a test; a passing run never waits this long.
+SLOW_RUNNER_SECONDS = 30
+
 WAIT_DOUBLE = """#!/bin/bash
 echo "$@" > "$HOME/wait-args"
 echo $$ > "$HOME/wait-pid"
@@ -1873,8 +1877,51 @@ class TestNextEvent(TempTestCase):
 
     def finished(self, watcher):
         """Wait for the watcher to exit 0 and return the lines it printed."""
-        self.assertEqual(watcher.wait(timeout=5), 0, watcher.stderr.read())
+        self.assertEqual(watcher.wait(timeout=SLOW_RUNNER_SECONDS), 0,
+                         watcher.stderr.read())
         return watcher.stdout.read().decode().splitlines()
+
+    def until(self, test, what):
+        """Wait for test() to give a true value, and return it.
+
+        The watcher and the fixture wait are new processes, and a busy runner can hold
+        them back for seconds; a check made a fixed time after their start would then
+        read a file that is not there yet. The bound only stops a test that would
+        otherwise hang.
+        """
+        deadline = time.monotonic() + SLOW_RUNNER_SECONDS
+        while not (value := test()):
+            if time.monotonic() >= deadline:
+                self.fail(f"{what} did not come within {SLOW_RUNNER_SECONDS} s")
+            time.sleep(0.02)
+        return value
+
+    def mark_is(self, text):
+        """Wait until the mark file holds text, as the watcher writes it whole."""
+        self.until(lambda: self.mark.exists() and self.mark.read_text(encoding="utf-8")
+                   == text, f"the mark {text.strip()}")
+
+    def child_pid(self):
+        """Wait for the fixture wait to write its pid, and return it.
+
+        The shell writes the file in two steps, so an empty file is not yet a pid.
+        """
+        def pid():
+            try:
+                return int((self.home / "wait-pid").read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                return None
+        return self.until(pid, "the pid of the fixture wait")
+
+    def child_gone(self, pid):
+        """Wait until the watcher has reaped its child: until then the pid answers."""
+        def gone():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+        self.until(gone, "the end of the fixture wait")
 
     def assert_still_waiting(self, watcher):
         time.sleep(0.6)
@@ -1912,6 +1959,7 @@ class TestNextEvent(TempTestCase):
         self.append("start s1")
         watcher = self.start()
         self.append("hourly update", "hourly update")
+        self.mark_is("3\n")
         self.assert_still_waiting(watcher)
         self.assertEqual(self.mark.read_text(encoding="utf-8"), "3\n")
         self.append("hourly update", "report: a1 OK")
@@ -1932,12 +1980,13 @@ class TestNextEvent(TempTestCase):
 
     def test_a_wait_that_ends_at_a_report_gives_no_line_and_no_exit(self):
         # The report wakes the session through its own event line, which the watcher
-        # then prints alone.
+        # then prints alone. The watcher must run on after it has reaped the wait
+        # that exited 0, so the test waits for that reap before it looks.
         self.append("start s1")
         (self.home / "wait-exit").write_text("0\n", encoding="utf-8")
         watcher = self.start("u1")
+        self.child_gone(self.child_pid())
         self.assert_still_waiting(watcher)
-        self.assertTrue((self.home / "wait-pid").exists())
         self.append("report: u1 OK")
         self.assertEqual(self.finished(watcher), ["report: u1 OK"])
 
@@ -1950,11 +1999,7 @@ class TestNextEvent(TempTestCase):
                 pid_file = self.home / "wait-pid"
                 pid_file.unlink(missing_ok=True)
                 watcher = self.start("u1")
-                deadline = time.monotonic() + 5
-                while not pid_file.exists() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                time.sleep(0.1)
-                pid = int(pid_file.read_text(encoding="utf-8"))
+                pid = self.child_pid()
                 if ending == "event":
                     self.append("inbox: one")
                     self.assertEqual(self.finished(watcher), ["inbox: one"])
