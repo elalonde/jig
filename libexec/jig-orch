@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The supervisor of a project's orchestrator session.
 
-usage: jig orch <project> start | stop | status | events [--old | --next [<ID>]] | rollover
+usage: jig orch <project> start | stop | status | events [--old | --next [<ID>[:<minutes>] ...]]
+       | rollover
        jig orch <project> wait-on [<other> <what>... | <other> --clear]
 
   start   refuses when impl/orch/ORCHESTRATOR.md is not in the project's clone, when a
@@ -24,19 +25,25 @@ usage: jig orch <project> start | stop | status | events [--old | --next [<ID>]]
           prints once the events of the session before the newest one, the lines
           between the last two start lines, and exits 0; with one start line, the
           lines before it; with none, or with no file, nothing
-  events --next [<ID>]
+  events --next [<ID>[:<minutes>] ...]
           the session's watcher that ends at the first event: prints the lines of
           the event file after its mark, orch/events.mark, leaving out the lines
           "hourly update", moves the mark past them and exits 0. Lines "hourly update"
-          alone move the mark and do not end it. The mark is the number of lines
-          already printed; with no mark file, or a mark beyond the end of the file, it
-          is the line number of the last "start <session ID>" line, or 0 with none.
-          With <ID>, it also runs jig wait <project> <ID> as its child: when that wait
-          ends other than at the unit's report commit, it prints "jig wait <ID> exit
-          <code>: <the wait's last line of output>" and exits 0; at the report commit
-          it prints nothing and goes on, because the report line of the event file
-          tells the news. The child ends with the command, also at SIGTERM, SIGHUP or
-          SIGINT. It also ends, with no line, when its parent process ends
+          alone move the mark and do not end it; a "start <session ID>" line is an
+          event like any other, so a watcher left over from an ended session stops
+          at the start of the next one. The mark is the number of lines already
+          printed; with no mark file, a mark file that does not hold one whole
+          number, or a mark beyond the end of the file, it is the line number of the
+          last "start <session ID>" line, or 0 with none.
+          For each <ID>, it also runs jig wait <project> <ID> as its child, with
+          --expected <minutes> when the ID has them; minutes that are not a whole
+          number above 0 are a usage error, and no child starts. When a wait ends
+          other than at the unit's report commit, it prints the whole output of that
+          wait, then "jig wait <ID> exit <code>: <the wait's last line of output>",
+          and exits 0; at the report commit it prints nothing for that wait and goes
+          on, because the report line of the event file tells the news. Each child
+          keeps its own output. The children end with the command, also at SIGTERM,
+          SIGHUP or SIGINT. It also ends, with no line, when its parent process ends
   rollover
           run by the session itself to end its own Claude Code session, so that the
           loop starts the next one as on any exit; first stop every background shell
@@ -288,6 +295,8 @@ START_LINE = re.compile(rb"start \S+")
 # The number of lines of the event file that events --next has printed, and the line
 # that it reads past without ending: a clock tick tells the orchestrator nothing new.
 MARK_FILE = "events.mark"
+# The form of the mark, and of the minutes of a unit ID given to events --next.
+WHOLE_NUMBER = re.compile(r"[0-9]+")
 HOURLY_LINE = b"hourly update"
 # The exit of jig wait when the unit's report commit is on origin.
 WAIT_REPORT = 0
@@ -2186,41 +2195,87 @@ def mark_at_start(lines):
 
 def read_mark(path, lines):
     """Return the mark in the mark file, or the mark at the last start line when the
-    file is missing, cannot be read as a number, or points beyond the event file, as
-    after the event file was replaced."""
+    file is missing, does not hold one whole number, or points beyond the event file,
+    as after the event file was replaced."""
     try:
-        value = int(path.read_text(encoding="utf-8").strip())
+        text = path.read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
         return mark_at_start(lines)
-    return value if 0 <= value <= len(lines) else mark_at_start(lines)
+    # int() would also take a sign, underscores and digits of other scripts, which
+    # this command never writes: such a file is damaged, not a mark.
+    if not WHOLE_NUMBER.fullmatch(text):
+        return mark_at_start(lines)
+    value = int(text)
+    return value if value <= len(lines) else mark_at_start(lines)
 
 
-def wait_line(unit, code, output):
-    """Return the line that tells how the child jig wait ended."""
-    if code < 0:
-        # Killed by a signal: give the code that a shell would show.
-        code = 128 - code
-    output.seek(0)
-    lines = [line.strip() for line in output.read().decode("utf-8", "replace").splitlines()]
-    last = next((line for line in reversed(lines) if line), "no output")
-    return f"jig wait {unit} exit {code}: {last}".encode("utf-8")
+def watched_units(words):
+    """Return the units that events --next waits on, as (unit ID, minutes or None),
+    or None when a word is not <ID> or <ID>:<minutes> with minutes above 0."""
+    units = []
+    for word in words:
+        unit, colon, minutes = word.partition(":")
+        if not jig_units.UNIT_ID.fullmatch(unit):
+            return None
+        if not colon:
+            units.append((unit, None))
+        elif WHOLE_NUMBER.fullmatch(minutes) and int(minutes) > 0:
+            units.append((unit, minutes))
+        else:
+            return None
+    return units
 
 
-def end_child(child):
-    """End the child jig wait and reap it; SIGKILL when SIGTERM is not enough."""
-    if child is None or child.poll() is not None:
-        return
-    child.terminate()
-    try:
-        child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        child.kill()
-        child.wait()
+class Child:
+    """One child jig wait of events --next, with its own output file, so that the
+    output of one wait never runs into the output of another."""
+
+    def __init__(self, project, unit, minutes):
+        self.unit = unit
+        command = os.environ.get("JIG_ORCH_WAIT") or str(
+            pathlib.Path(__file__).resolve().parent / "jig-wait")
+        words = [command, project, unit]
+        if minutes is not None:
+            words += ["--expected", minutes]
+        self.output = tempfile.TemporaryFile()
+        try:
+            self.process = subprocess.Popen(words, stdin=subprocess.DEVNULL,
+                                            stdout=self.output, stderr=subprocess.STDOUT)
+        except BaseException:
+            self.output.close()
+            raise
+
+    def lines(self):
+        """Return the whole output of the wait as lines, then the line that tells how
+        it ended."""
+        code = self.process.returncode
+        if code < 0:
+            # Killed by a signal: give the code that a shell would show.
+            code = 128 - code
+        self.output.seek(0)
+        shown = self.output.read().splitlines()
+        text = [line.decode("utf-8", "replace").strip() for line in shown]
+        last = next((line for line in reversed(text) if line), "no output")
+        return shown + [f"jig wait {self.unit} exit {code}: {last}".encode("utf-8")]
+
+    def end(self):
+        """End the child and reap it; SIGKILL when SIGTERM is not enough."""
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        finally:
+            self.output.close()
 
 
-def next_events(project, path, mark_path, out, unit, poll=FOLLOW_SECONDS):
+def next_events(project, path, mark_path, out, units, poll=FOLLOW_SECONDS):
     """Wait for the next event after the mark, print it and what came with it, and
-    return; with a unit ID, also return when its jig wait ends without a report.
+    return; with unit IDs, also return when one of their jig waits ends without a
+    report.
 
     The printed lines and the new mark go out with the end signals held back, so that a
     signal cannot fall between them: a line printed with no mark written would be
@@ -2228,15 +2283,10 @@ def next_events(project, path, mark_path, out, unit, poll=FOLLOW_SECONDS):
     it.
     """
     parent = os.getppid()
-    child, output = None, None
+    children = []
     try:
-        if unit is not None:
-            output = tempfile.TemporaryFile()
-            command = os.environ.get("JIG_ORCH_WAIT") or str(
-                pathlib.Path(__file__).resolve().parent / "jig-wait")
-            child = subprocess.Popen([command, project, unit],
-                                     stdin=subprocess.DEVNULL, stdout=output,
-                                     stderr=subprocess.STDOUT)
+        for unit, minutes in units:
+            children.append(Child(project, unit, minutes))
         mark, seen = None, None
         while os.getppid() == parent:
             try:
@@ -2265,30 +2315,32 @@ def next_events(project, path, mark_path, out, unit, poll=FOLLOW_SECONDS):
                         signal.pthread_sigmask(signal.SIG_SETMASK, held)
                     if shown:
                         return DONE
-            if child is not None and child.poll() is not None:
-                if child.returncode != WAIT_REPORT:
-                    emit(out, [wait_line(unit, child.returncode, output)])
+            for child in list(children):
+                if child.process.poll() is None:
+                    continue
+                if child.process.returncode != WAIT_REPORT:
+                    emit(out, child.lines())
                     return DONE
                 # The report wakes the session by its own line in the event file.
-                child = None
+                children.remove(child)
+                child.end()
             time.sleep(poll)
         return DONE
     finally:
         for signum in END_SIGNALS:
             signal.signal(signum, signal.SIG_IGN)
-        end_child(child)
-        if output is not None:
-            output.close()
+        for child in children:
+            child.end()
 
 
-def watch_next(project, unit):
-    """Run jig orch <project> events --next, with jig wait on the unit when one is given."""
+def watch_next(project, units):
+    """Run jig orch <project> events --next, with a jig wait on each unit given."""
     path = events_path(project)
     out = sys.stdout.buffer
     for signum in END_SIGNALS:
         signal.signal(signum, stop_watching)
     try:
-        return next_events(project, path, path.with_name(MARK_FILE), out, unit)
+        return next_events(project, path, path.with_name(MARK_FILE), out, units)
     except Stopped:
         return DONE
     except BrokenPipeError:
@@ -2304,8 +2356,7 @@ def main(argv):
     commands = ("start", "stop", "status", "rollover")
     hidden = len(argv) == 3 and argv[1] == "loop" and argv[2].isdigit()
     watcher = argv[1:] in (["events"], ["events", "--old"])
-    following = argv[1:3] == ["events", "--next"] and len(argv) in (3, 4) \
-        and (len(argv) == 3 or jig_units.UNIT_ID.fullmatch(argv[3]) is not None)
+    following = argv[1:3] == ["events", "--next"] and watched_units(argv[3:]) is not None
     waits = len(argv) >= 2 and argv[1] == "wait-on"
     if not (len(argv) == 2 and argv[1] in commands or hidden or watcher or following
             or waits) or not jig_units.PROJECT.fullmatch(argv[0]):
@@ -2316,7 +2367,7 @@ def main(argv):
         # lock: it runs in the session beside the loop.
         return watch_events(argv[0], len(argv) == 3)
     if following:
-        return watch_next(argv[0], argv[3] if len(argv) == 4 else None)
+        return watch_next(argv[0], watched_units(argv[3:]))
     try:
         activity = setting("JIG_ORCH_ACTIVITY", ACTIVITY_SECONDS)
         if waits:

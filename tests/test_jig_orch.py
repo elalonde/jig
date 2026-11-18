@@ -1830,21 +1830,25 @@ class TestWatcher(TempTestCase):
         self.assertEqual(watcher.stderr.read(), b"")
 
 
-# Stands in for jig wait as the child of events --next. It notes its arguments and its
-# pid in HOME, prints two lines, and then exits with the code in wait-exit in HOME, or,
-# without that file, sleeps until it is ended. exec keeps the pid of the sleep the pid
-# that the watcher started, so a test can see that it is gone.
 # How long a test waits for a process it started before it gives up. A runner that
 # stalls for a few seconds must not fail a test; a passing run never waits this long.
 SLOW_RUNNER_SECONDS = 30
 
+# Stands in for jig wait as the child of events --next, one file of each kind for each
+# unit ID, its second argument. It notes its arguments, prints two lines, and notes its
+# pid only after them, so that a test that has read the pid knows the lines are out.
+# Then it exits with the code in wait-exit-<ID> in HOME once that file exists, which a
+# test can write at the moment it wants, or after a minute, so that a child that a
+# failed test leaves behind still ends.
 WAIT_DOUBLE = """#!/bin/bash
-echo "$@" > "$HOME/wait-args"
-echo $$ > "$HOME/wait-pid"
+echo "$@" > "$HOME/wait-args-$2"
 echo "jig wait: watching $2"
 echo "$2 runs past three times its expected minutes"
-if [ -e "$HOME/wait-exit" ]; then exit "$(cat "$HOME/wait-exit")"; fi
-exec sleep 60
+echo $$ > "$HOME/wait-pid-$2"
+for _ in $(seq 600); do
+    if [ -e "$HOME/wait-exit-$2" ]; then exit "$(cat "$HOME/wait-exit-$2")"; fi
+    sleep 0.1
+done
 """
 
 
@@ -1906,14 +1910,14 @@ class TestNextEvent(TempTestCase):
         self.until(lambda: self.mark.exists() and self.mark.read_text(encoding="utf-8")
                    == text, f"the mark {text.strip()}")
 
-    def child_pid(self):
-        """Wait for the fixture wait to write its pid, and return it.
+    def child_pid(self, unit="u1"):
+        """Wait for the fixture wait of a unit to write its pid, and return it.
 
         The shell writes the file in two steps, so an empty file is not yet a pid.
         """
         def pid():
             try:
-                return int((self.home / "wait-pid").read_text(encoding="utf-8"))
+                return int((self.home / f"wait-pid-{unit}").read_text(encoding="utf-8"))
             except (FileNotFoundError, ValueError):
                 return None
         return self.until(pid, "the pid of the fixture wait")
@@ -1971,24 +1975,88 @@ class TestNextEvent(TempTestCase):
         self.assertEqual(self.finished(watcher), ["report: a1 OK"])
         self.assertEqual(self.mark.read_text(encoding="utf-8"), "5\n")
 
-    def test_a_wait_that_ends_without_a_report_gives_its_line_and_ends(self):
-        # The fixture wait exits with the code of a unit that runs too long; its last
-        # line of output goes into the one line, and the mark does not move.
+    def test_a_wait_that_ends_without_a_report_gives_its_output_and_its_line(self):
+        # The fixture wait exits with the code of a unit that runs too long. Its whole
+        # output comes first, then the one line with its last line of output, and the
+        # mark does not move.
         self.append("start s1")
-        (self.home / "wait-exit").write_text("4\n", encoding="utf-8")
+        (self.home / "wait-exit-u1").write_text("4\n", encoding="utf-8")
         lines = self.finished(self.start("u1"))
-        self.assertEqual(lines, ["jig wait u1 exit 4: u1 runs past three times its "
+        self.assertEqual(lines, ["jig wait: watching u1",
+                                 "u1 runs past three times its expected minutes",
+                                 "jig wait u1 exit 4: u1 runs past three times its "
                                  "expected minutes"])
-        self.assertEqual((self.home / "wait-args").read_text(encoding="utf-8"),
+        self.assertEqual((self.home / "wait-args-u1").read_text(encoding="utf-8"),
                          f"{PROJECT} u1\n")
         self.assertFalse(self.mark.exists())
+
+    def test_two_units_each_get_a_wait_and_the_one_that_ends_alone_is_printed(self):
+        # The first unit has new minutes, which its wait gets as --expected; the second
+        # has none. Both waits have printed their lines when the second ends with the
+        # timeout code: only its own output and line come out, and the wait of the
+        # first unit, which still runs, is gone when the watcher has exited.
+        self.append("start s1")
+        watcher = self.start("u1:25", "u2")
+        first = self.child_pid("u1")
+        self.child_pid("u2")
+        (self.home / "wait-exit-u2").write_text("4\n", encoding="utf-8")
+        self.assertEqual(self.finished(watcher),
+                         ["jig wait: watching u2",
+                          "u2 runs past three times its expected minutes",
+                          "jig wait u2 exit 4: u2 runs past three times its "
+                          "expected minutes"])
+        self.assert_gone(first)
+        self.assertEqual((self.home / "wait-args-u1").read_text(encoding="utf-8"),
+                         f"{PROJECT} u1 --expected 25\n")
+        self.assertEqual((self.home / "wait-args-u2").read_text(encoding="utf-8"),
+                         f"{PROJECT} u2\n")
+
+    def test_minutes_that_are_not_a_whole_number_above_zero_are_a_usage_error(self):
+        # Each bad value comes after a good unit ID: the watcher exits 2 before it
+        # starts any wait, so no fixture wait notes its arguments.
+        self.append("start s1", "inbox: one")
+        for word in ("u2:0", "u2:x", "u2:", "u2:-3", "u2:2.5", "u2:+4", "u2:5:6"):
+            with self.subTest(word=word):
+                result = subprocess.run(
+                    [str(ORCH), PROJECT, "events", "--next", "u1", word],
+                    env=self.env(JIG_ORCH_WAIT=str(self.wait)), capture_output=True,
+                    timeout=SLOW_RUNNER_SECONDS, check=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+        self.assertEqual(sorted(path.name for path in self.home.glob("wait-*")), [])
+        self.assertFalse(self.mark.exists())
+
+    def test_a_start_line_after_the_mark_is_printed_and_ends_the_run(self):
+        # A new session starts while no watcher runs: the next run prints its start
+        # line and ends. A watcher that still runs when the next session starts ends
+        # at that start line too, so that it takes no event of the new session.
+        self.append("start s1", "inbox: one")
+        self.assertEqual(self.finished(self.start()), ["inbox: one"])
+        self.append("start s2")
+        self.assertEqual(self.finished(self.start()), ["start s2"])
+        watcher = self.start()
+        self.assert_still_waiting(watcher)
+        self.append("start s3")
+        self.assertEqual(self.finished(watcher), ["start s3"])
+        self.assertEqual(self.mark.read_text(encoding="utf-8"), "4\n")
+
+    def test_a_mark_file_that_is_not_one_whole_number_is_as_no_mark_file(self):
+        # A mark of +1 or of two numbers would read as a number to a lax parse and
+        # print the old start line again; each such mark counts as no mark, so only
+        # the line after the last start line comes out.
+        self.append("report: a1 OK", "start s1", "inbox: new")
+        for text in ("+1\n", "1 2\n", "one\n", "", "\u0661\n"):
+            with self.subTest(mark=text):
+                self.mark.write_text(text, encoding="utf-8")
+                self.assertEqual(self.finished(self.start()), ["inbox: new"])
+                self.assertEqual(self.mark.read_text(encoding="utf-8"), "3\n")
 
     def test_a_wait_that_ends_at_a_report_gives_no_line_and_no_exit(self):
         # The report wakes the session through its own event line, which the watcher
         # then prints alone. The watcher must run on after it has reaped the wait
         # that exited 0, so the test waits for that reap before it looks.
         self.append("start s1")
-        (self.home / "wait-exit").write_text("0\n", encoding="utf-8")
+        (self.home / "wait-exit-u1").write_text("0\n", encoding="utf-8")
         watcher = self.start("u1")
         self.child_gone(self.child_pid())
         self.assert_still_waiting(watcher)
@@ -2001,7 +2069,7 @@ class TestNextEvent(TempTestCase):
         self.append("start s1")
         for ending in ("event", "signal"):
             with self.subTest(ending=ending):
-                pid_file = self.home / "wait-pid"
+                pid_file = self.home / "wait-pid-u1"
                 pid_file.unlink(missing_ok=True)
                 watcher = self.start("u1")
                 pid = self.child_pid()
