@@ -17,6 +17,11 @@ from tests.units_support import SSH_DOUBLE
 BRANCH = ROOT / "libexec" / "jig-branch"
 PROJECT = "demo"
 LINE = "0.10"
+# The state of a clone whose switch git refused for the untracked file new.txt: every
+# line of git's message, joined into one, so the reason names the file in the way.
+REFUSED_SWITCH = ("kept: error: The following untracked working tree files would be "
+                  "overwritten by checkout: new.txt Please move or remove them before you "
+                  "switch branches. Aborting")
 
 # The ssh double of the other tests, which also stands for an account where ssh gets in
 # but the command fails: with the file script-fails in the account's home, it reads its
@@ -137,7 +142,8 @@ class TestStates(BranchTest):
         self.git(ahead, "commit", "-q", "-am", "local")
         # checker: a conf file that holds the line already is not written; a local
         # branch of the line on another branch of origin is not a fast-forward; an
-        # untracked file that the switch would overwrite makes git refuse it.
+        # untracked file that the switch would overwrite makes git refuse it, and the
+        # reason in the readback names that file.
         checker_conf = self.conf("checker", f"REPO=x\nBRANCH={LINE}\n")
         unchanged = checker_conf.stat()
         self.git(self.clone("checker", dev), "branch", "-q", LINE, side)
@@ -184,9 +190,7 @@ class TestStates(BranchTest):
             ("implementer", fake / "implementer/ws/src" / product, "0.9",
              self.git(ahead, "rev-parse", "HEAD"), "kept: local commits"),
             ("checker", fake / "checker/ws/src" / dev, "0.9", first, "kept: not a fast-forward"),
-            ("checker", fake / "checker/ws/src" / product, "0.9", first,
-             "kept: error: The following untracked working tree files would be "
-             "overwritten by checkout:"),
+            ("checker", fake / "checker/ws/src" / product, "0.9", first, REFUSED_SWITCH),
             ("auditor", fake / "auditor/ws/src" / dev, LINE, third, "same"),
             ("auditor", fake / "auditor/ws/src" / product, LINE, second,
              f"kept: fatal: '{self.tmp / 'no-such-origin'}' does not appear to be a "
@@ -202,9 +206,7 @@ class TestStates(BranchTest):
             for repo in (dev, product):
                 shown.append(f"clone {account} ~/ws/src/{repo} - - kept: {reason}")
         shown += [
-            f"clone ignorer {fake / 'ignorer/ws/src' / dev} 0.9 {first[:12]} "
-            "kept: error: The following untracked working tree files would be "
-            "overwritten by checkout:",
+            f"clone ignorer {fake / 'ignorer/ws/src' / dev} 0.9 {first[:12]} {REFUSED_SWITCH}",
             f"clone ignorer {fake / 'ignorer/ws/src' / product} {LINE} {third[:12]} moved",
         ]
         shown += [

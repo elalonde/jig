@@ -30,7 +30,8 @@ Then, in each role account:
                 changes, a detached HEAD, local commits that no branch of origin
                 holds, a local <line> that is not an ancestor of origin/<line>
                 ("not a fast-forward"), an account ssh cannot reach, or a switch that
-                git refused (with git's first line)
+                git refused (with git's whole message on one line, so that the
+                files in the way are named)
     Untracked files and the stash stay; nothing is reset, cleaned, stashed, merged or
     rebased.
 
@@ -94,6 +95,19 @@ def first_line(result):
         for row in text.splitlines():
             if row.strip():
                 return row.strip()
+    return f"git exit {result.returncode}"
+
+
+def all_lines(result):
+    """git's whole message on one line: its lines that are not blank, stripped, joined.
+
+    git names the files that block a switch on the lines after its first, so the
+    first line alone would not tell the reader which file to move.
+    """
+    for text in (result.stderr, result.stdout):
+        rows = [row.strip() for row in text.splitlines() if row.strip()]
+        if rows:
+            return " ".join(rows)
     return f"git exit {result.returncode}"
 
 
@@ -220,7 +234,7 @@ def clone_state(clone):
     switched = git(clone, "switch", "--quiet", "--no-overwrite-ignore", "-C", line,
                    "--track", f"origin/{line}")
     if switched.returncode != 0:
-        return f"kept: {first_line(switched)}"
+        return f"kept: {all_lines(switched)}"
     return "moved"
 
 
