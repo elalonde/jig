@@ -5,6 +5,34 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.2
+
+What changed: `jig trace check`, in its search of the tree before the import,
+skips each file that git reads as binary, as `git grep -I` does, a file with
+the `binary` attribute included. A binary file gives no line. 0.10.1 read
+binary files too, and could report IDs that no trace entry can carry.
+
+Files and formats: changed files: `libexec/jig-trace`, with its help text. The
+ledger, the trace, the conf file and the event formats are unchanged.
+
+Migration: a host and its projects move from 0.10.1 to 0.10.2 in this order. A
+host still on 0.10.0 first takes the migration of 0.10.1, or takes both at once
+with `jig upgrade 0.10.2` and the steps of 0.10.1 after it.
+
+1. As the orchestrator account, run `jig upgrade 0.10.2`. It installs 0.10.2
+   under `/opt/jig/0.10.2/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.2` as the orchestrator
+   account. It sets `JIG_VERSION=0.10.2` in the conf file of the project in
+   each role account, and refuses while a unit holds a lock. Check in each
+   account that the conf file of the project reads `JIG_VERSION=0.10.2`.
+3. Nothing more: no file of a project's repo changes, and nothing changes for
+   the specwriter and implementer accounts.
+
+Requested by: another project, because the check read binary files of its
+tree.
+
+Units: 0 minor, 1 patch, 1 none
+
 ## 0.10.1
 
 What changed: `jig trace check` no longer asks for the ledger entry of any
