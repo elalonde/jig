@@ -16,7 +16,8 @@ usage: jig orch <project> start | stop | status | events [--old | --next [<ID>[:
           pane (live, dead or none), whether the session is the loop's own, and the
           last line of its log; then a line with the activity state of the project and
           its since, and a line for each wait: the other project, its state and since,
-          and what is waited for
+          and what is waited for; last the line "waiting: " with the line of
+          orch/waiting, or "waiting: none" when that file is missing
   events  the session's watcher on the event file, orch/events.log: prints each line
           after the last line "start <session ID>", or from the top when there is none,
           then each new line as it is appended, and runs until it is stopped, its
@@ -234,10 +235,23 @@ ORCH_STALL_MINUTES of <root>/host.conf, a whole number of 1 or more, or 15; a ba
 value, or a file that cannot be read, is logged at the loop's start and gives 15. A
 waits file or activity file that does not parse is logged at most once an hour.
 
+Idle. The loop also wakes its own orchestrator when it sits idle while no unit runs.
+An idle period starts at an activity poll with the state idle or down when none is
+open, and ends at a poll with the state unit or at the third busy poll in a row, so
+that the short turn that reads the event does not end it. The last end of a unit is
+the time of the last poll with the state unit, or the start of the loop when there
+was none. When a period has lasted the stall time and orch/waiting was not modified
+after the last end of a unit, the loop appends "idle: no unit since <HH:MM>; start
+the next step, or write why you wait in ~/ws/reviews/<project>/orch/waiting", once
+for the period, through the queue and with no change for the hourly tick. The
+orchestrator writes orch/waiting, one line with its time and the reason, when it
+waits on purpose; the loop reads only its modification time, because a time that a
+model writes into the line can be wrong. A missing file holds no wait.
+
 Files, under ~/ws/reviews/<project>/: orch/events.log (the event file), orch/supervisor.log,
 orch/loop.lock (the pid of the loop), orch/session-ids (the tmux session ID and the
 Claude Code session ID of the session the loop started last, on one line), orch/announced, orch/reported, orch/reminded,
-orch/activity, orch/waits,
+orch/activity, orch/waits, orch/waiting (written by the orchestrator),
 orch/fetch.err (the error output of the last fetch), out/orch.txt (the tee),
 transcripts/orch/<run>/. In the project's clone: the idle lines in impl/orch/updates.log.
 """
@@ -338,6 +352,9 @@ QUIET = QuietMark()
 # fields, and each is written whole into a temporary file that a rename puts in place.
 ACTIVITY_FILE = "activity"
 WAITS_FILE = "waits"
+# The orchestrator writes this file when it waits on purpose; the loop reads only when
+# it was last modified.
+WAITING_FILE = "waiting"
 ACTIVITY_SECONDS = 60.0
 # The activity states, in the order the loop tests them.
 STATES = ("unit", "down", "idle", "busy")
@@ -815,6 +832,79 @@ class Stalls:
         for key in set(self.watches) - current:
             del self.watches[key]
         return lines
+
+
+def holds_wait(path, last_unit):
+    """Say whether the waiting file holds a wait: it was modified after the last end of
+    a unit. A missing file, or one whose time cannot be read, holds none, so that the
+    orchestrator is woken rather than left idle."""
+    try:
+        modified = os.stat(path).st_mtime
+    except OSError:
+        return False
+    return modified > last_unit.timestamp()
+
+
+class Idle:
+    """The idle periods of the loop's own project, and the one idle event of each.
+
+    An orchestrator that ends its turn with no unit running and no declared wait would
+    sit idle until a person looks, so the loop wakes it once the period has lasted the
+    stall time. One event per period at most, so that the turn the event starts cannot
+    lead to another event, and an orchestrator is never woken in a loop. It keeps what
+    it sent in memory only: a loop that starts again can send the event of the same
+    period once more.
+    """
+
+    def __init__(self, project, stall_seconds, started):
+        self.project, self.stall_seconds = project, stall_seconds
+        # The time of the last poll with the state unit, or the start of the loop. A unit
+        # ends after its last unit poll, so this is up to one poll early, and a waiting
+        # file written after the close of the worker is always later than it.
+        self.last_unit = started
+        # The start of the open period, or None; the busy polls in a row within it; and
+        # whether its event went out.
+        self.since, self.busy, self.sent = None, 0, False
+
+    def step(self, state, waiting, now):
+        """Return the idle event of one activity poll, or None.
+
+        waiting is the path of the waiting file. The period ends as a stall does: at a
+        unit, or at RESUME_POLLS busy polls in a row, so that the short turn that
+        reads the event leaves it open.
+        """
+        if state == "unit":
+            self.last_unit, self.since = now, None
+            return None
+        if state == "busy":
+            if self.since is not None:
+                self.busy += 1
+                if self.busy >= RESUME_POLLS:
+                    self.since = None
+        else:
+            self.busy = 0
+            if self.since is None:
+                self.since, self.sent = now, False
+        if self.since is None or self.sent \
+                or (now - self.since).total_seconds() < self.stall_seconds \
+                or holds_wait(waiting, self.last_unit):
+            return None
+        self.sent = True
+        return (f"idle: no unit since {clock(self.last_unit, now)}; start the next step, "
+                f"or write why you wait in ~/ws/reviews/{self.project}/orch/{WAITING_FILE}")
+
+
+def waiting_line(path):
+    """Return the line of the waiting file as status shows it, or none when it is
+    missing."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "none"
+    except (OSError, UnicodeDecodeError) as error:
+        return f"{path} cannot be read: {getattr(error, 'strerror', None) or error}"
+    lines = text.splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else "an empty file"
 
 
 def stall_time(srv):
@@ -1873,6 +1963,8 @@ class Orch:
         if problem:
             self.log(f"stall time: {problem}; the loop uses {STALL_MINUTES} minutes")
         self.stalls = Stalls(stall_override or seconds, activity)
+        self.idle = Idle(self.project, stall_override or seconds,
+                         datetime.datetime.now().astimezone())
         try:
             return self.supervise(poll)
         finally:
@@ -1962,7 +2054,8 @@ class Orch:
             self.problem("activity", f"cannot write {self.activity_file}: {error.strerror}")
 
     def watch_activity(self, screen, no_bar):
-        """Once an activity poll, write the activity file and look for stalls."""
+        """Once an activity poll, write the activity file, look for stalls and for an
+        idle orchestrator."""
         moment = time.monotonic()
         if moment < self.next_activity:
             return
@@ -1972,6 +2065,11 @@ class Orch:
                                no_bar, screen)
         self.write_activity(state, now)
         self.watch_waits(now)
+        line = self.idle.step(state, self.state / WAITING_FILE, now)
+        if line:
+            # Through the queue, as a stall line, and no change for the hourly tick.
+            self.queue.append((line, QUIET))
+            self.log(f"queued: {line}")
 
     def watch_waits(self, now):
         try:
@@ -2121,6 +2219,9 @@ class Orch:
               f"{describe(read_activity(self.activity_file), now, poll)}")
         for line in wait_lines(self.project, orch_home(self.conf), now, poll):
             print(f"jig orch: {self.project}: {line}")
+        # Only the line: whether it still holds a wait depends on the last end of a
+        # unit, which only the running loop knows.
+        print(f"jig orch: {self.project}: waiting: {waiting_line(self.state / WAITING_FILE)}")
         return NO_LOOP if descriptor is not None else DONE
 
     def inside(self, pane):

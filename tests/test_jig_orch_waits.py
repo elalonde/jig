@@ -311,6 +311,99 @@ class TestStalls(unittest.TestCase):
         self.assertEqual(orch.clock(at(0), at(24 * 60)), "2026-03-02 10:00")
 
 
+class TestIdle(TempTestCase):
+    """The idle event of the loop's own project, one activity poll a minute from 10:00,
+    with a stall time of 15 minutes and a loop that started at 10:00."""
+
+    def setUp(self):
+        super().setUp()
+        self.idle = orch.Idle(PROJECT, 15 * 60, at(0))
+        self.waiting = self.tmp / "waiting"
+        self.minute = 0
+
+    def polls(self, state, minutes=1):
+        """Run the given minutes of polls in one state, the first at the current
+        minute; return the events they sent."""
+        lines = []
+        for _ in range(minutes):
+            line = self.idle.step(state, self.waiting, at(self.minute))
+            self.minute += 1
+            if line:
+                lines.append(line)
+        return lines
+
+    def event(self, since):
+        return (f"idle: no unit since {since}; start the next step, or write why you wait "
+                f"in ~/ws/reviews/{PROJECT}/orch/waiting")
+
+    def touch(self, moment):
+        """Write the waiting file and give it this modification time, as touch -d does."""
+        self.waiting.write_text(f"{orch.stamp(moment)} waits on Eric: a yes\n",
+                                encoding="utf-8")
+        result = run(["touch", "-d", orch.stamp(moment), self.waiting])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_idle_session_gives_one_event_after_the_stall_time_and_no_second(self):
+        # An idle session with no lock: the period starts at the poll of 10:00, and the
+        # event comes at 10:15, with the start of the loop as the last end of a unit;
+        # then nothing while it stays idle: a second poll after the event gives no
+        # second event.
+        self.assertEqual(self.polls("idle", 15), [])
+        self.assertEqual(self.polls("idle"), [self.event("10:00")])
+        self.assertEqual(self.polls("idle"), [])
+        self.assertEqual(self.polls("down", 60), [])
+
+    def test_one_or_two_busy_polls_keep_the_period_and_give_no_second_event(self):
+        # A turn of two polls before the stall time does not move the start of the
+        # period; two after the event, as the turn that reads it, give no second one.
+        self.assertEqual(self.polls("idle", 5), [])
+        self.assertEqual(self.polls("busy", 2), [])
+        self.assertEqual(self.polls("idle", 9), [self.event("10:00")])
+        self.assertEqual(self.minute, 16)
+        self.assertEqual(self.polls("busy", 2), [])
+        self.assertEqual(self.polls("idle", 30), [])
+        self.assertEqual(self.polls("busy", 2) + self.polls("idle", 30), [])
+
+    def test_three_busy_polls_in_a_row_and_a_new_period_give_a_second_event(self):
+        self.assertEqual(len(self.polls("idle", 16)), 1)
+        # The third busy poll in a row, at 10:18, ends the period; the next one starts
+        # at 10:19 and reaches the stall time at 10:34.
+        self.assertEqual(self.polls("busy", 3), [])
+        self.assertEqual(self.polls("idle", 15), [])
+        self.assertEqual(self.polls("idle"), [self.event("10:00")])
+
+    def test_unit_poll_ends_the_period_and_the_next_event_names_its_end(self):
+        self.assertEqual(len(self.polls("idle", 16)), 1)
+        # The last unit poll is at 10:20; the next period starts at 10:21.
+        self.assertEqual(self.polls("unit", 5), [])
+        self.assertEqual(self.polls("idle", 15), [])
+        self.assertEqual(self.polls("idle"), [self.event("10:20")])
+
+    def test_waiting_file_newer_than_the_last_end_holds_and_an_older_one_does_not(self):
+        # A file from 09:59, before the start of the loop, holds no wait; one from
+        # 10:00:30 holds the wait of the next period, so it gives no event.
+        self.touch(at(-1))
+        self.assertEqual(self.polls("idle", 16), [self.event("10:00")])
+        self.assertEqual(self.polls("busy", 3), [])
+        self.touch(at(0) + datetime.timedelta(seconds=30))
+        self.assertEqual(self.polls("idle", 40), [])
+
+    def test_waiting_file_written_after_the_last_unit_poll_holds_a_wait(self):
+        # The worker closes and the orchestrator writes the file between the last unit
+        # poll, at 10:02, and the next poll, at 10:03: the wait holds.
+        self.assertEqual(self.polls("unit", 3), [])
+        self.touch(at(2) + datetime.timedelta(seconds=40))
+        self.assertEqual(self.polls("idle", 40), [])
+        # Once the file is gone, the same period sends its one event.
+        self.waiting.unlink()
+        self.assertEqual(self.polls("idle"), [self.event("10:02")])
+        self.assertEqual(self.polls("idle", 5), [])
+
+    def test_last_end_of_a_unit_on_another_day_names_the_date(self):
+        self.minute = 24 * 60
+        self.assertEqual(self.polls("idle", 16), [self.event("2026-03-02 10:00")])
+
+
 class TestStallTime(TempTestCase):
     def conf(self, text):
         (self.tmp / "host.conf").write_text(text, encoding="utf-8")
@@ -630,6 +723,19 @@ class TestStatusLines(OrchTestCase):
         self.assertEqual(lines[2], f"jig orch: {PROJECT}: waits on other: no activity file; "
                                    f"waited on since {orch.stamp(now)}: a block")
 
+    def test_status_prints_the_line_of_the_waiting_file_or_none(self):
+        # With no waiting file the last line says none; with one, it is the file's line
+        # as the orchestrator wrote it, whatever its time.
+        orch_files = self.reviews / "orch"
+        orch_files.mkdir()
+        result = self.orch("status")
+        self.assertEqual(result.stdout.splitlines()[-1], f"jig orch: {PROJECT}: waiting: none")
+        line = "2026-11-19T20:41:07-08:00 waits on Eric: the yes for the release"
+        (orch_files / "waiting").write_text(line + "\n", encoding="utf-8")
+        result = self.orch("status")
+        self.assertEqual(result.stdout.splitlines()[-1],
+                         f"jig orch: {PROJECT}: waiting: {line}")
+
 
 class LoopWaitsCase(OrchTestCase):
     """A running loop with activity polls of a fraction of a second."""
@@ -671,7 +777,7 @@ class TestLoopActivity(LoopWaitsCase):
 
 
 class TestLoopStall(LoopWaitsCase):
-    def test_stall_and_resumed_lines_reach_the_event_file_in_time(self):
+    def test_stall_resumed_and_idle_lines_reach_the_event_file_in_time(self):
         # The project waits on another whose loop writes no activity file, so it is
         # down from the first poll; host.conf holds a bad stall key, which the loop
         # logs once. The stall line comes after the stall time; then the other loop
@@ -720,6 +826,19 @@ class TestLoopStall(LoopWaitsCase):
         print(f"\nstall line {stalled:.1f} s after the start, stall time {self.stall} s; "
               f"resumed line {resumed:.1f} s after the other turned busy, "
               f"3 polls of {self.activity} s", file=sys.stderr)
+        # The project's own session waited at its input box the whole time, with no
+        # unit: the loop appended one idle event after the stall time and no second
+        # one, and the watcher prints it, after the start line where it has no mark.
+        self.until(lambda: any(line.startswith("idle: ") for line in self.events()),
+                   what="the idle event")
+        idle = [line for line in self.events() if line.startswith("idle: ")]
+        self.assertEqual(len(idle), 1, self.events())
+        self.assertRegex(idle[0], rf"^idle: no unit since \d\d:\d\d; start the next step, or "
+                                  rf"write why you wait in ~/ws/reviews/{PROJECT}/orch/"
+                                  rf"waiting$")
+        result = run([ORCH, PROJECT, "events", "--next"], env=self.base_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(idle[0], result.stdout.splitlines())
 
 
 FIXTURE = [sys.executable, "-c",
