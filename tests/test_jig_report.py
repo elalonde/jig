@@ -692,3 +692,76 @@ class ReportProductLineVectorTest(UnitVectorCase):
         result = self.report()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.origin_subjects()[0], "report: demo")
+
+
+# A spec writer unit that copies the vectors while the unit under report runs.
+COPIER = "copy"
+COPIER_PROMPT_LINE = f"# {COPIER}  paste into: jig-spec-{COPIER} (specwriter, ~/ws/src/jig-dev)"
+
+
+class ReportSpecWriterCopyTest(UnitVectorCase):
+    """A vector copy of another unit, pushed during the unit and left out of its report.
+
+    The unit under report begins first; the spec writer unit starts later and pushes a
+    product commit with its copy of the vectors before the report is made.
+    """
+
+    def copy_made(self, files):
+        """Push the copy, 1000 s before now, and begin the unit under report before it."""
+        commit = self.product_commit_at(self.now - 1000, files)
+        self.unit_ran(self.now - 2000)
+        return commit
+
+    def records(self, files):
+        """Push records of the copier to -dev, as its own unit would; return the head."""
+        return self.push_files(files, f"records of {COPIER}")
+
+    def refused_with(self, before, *texts):
+        """Run the report, which must be refused for the vectors with each text in its line."""
+        result = self.report()
+        self.assert_refused_unchanged(result, "vectors", before)
+        self.assertIn("changes tests/vectors/a.bin", result.stderr)
+        for text in texts:
+            self.assertIn(text, result.stderr)
+
+    def test_a_copy_is_skipped_only_once_each_record_of_its_unit_is_on_origin(self):
+        # The records come one at a time; each report before the last is refused for the
+        # record that is still missing or wrong, and the last one passes.
+        commit = self.copy_made({"tests/vectors/a.bin": "vector\n"})
+        line = f"{COPIER} start started abc\n"
+        before = self.records({"impl/log/status.log": f"{local_time(self.now - 900)} {line}"})
+        self.refused_with(before, "no ledger entry")
+        ledger = f"trace/ledger/{commit}.md"
+        before = self.records({ledger: f"commit: {commit}\nunit: demo\n"})
+        self.refused_with(before, "names demo, the unit under report")
+        # The only start line of the copier is after the copy, so it cannot have made it.
+        before = self.records({ledger: f"commit: {commit}\nunit: {COPIER}\n"})
+        self.refused_with(before, f"no start line of {COPIER} before the commit")
+        before = self.records({"impl/log/status.log": f"{local_time(self.now - 1500)} {line}"})
+        self.refused_with(before, f"names {COPIER}, whose prompt copy",
+                          f"run jig report again after 'log: {COPIER}'")
+        prompt = f"impl/log/{COPIER}-prompt.md"
+        implementer = COPIER_PROMPT_LINE.replace("specwriter", "implementer")
+        before = self.records({prompt: f"{implementer}\nThe copy.\n"})
+        self.refused_with(before, "names no spec writer account")
+        # With the right prompt copy, a conf that gives the role to another account still
+        # refuses; a conf with no such key counts the default account, and the copy passes.
+        before = self.records({prompt: f"{COPIER_PROMPT_LINE}\nThe copy.\n"})
+        self.write_conf(self.home, SPEC_ACCOUNT="writer")
+        self.refused_with(before, "names no spec writer account")
+        conf = self.home / ".config" / "jig" / "jig.conf"
+        conf.write_text("".join(entry for entry in conf.read_text(encoding="utf-8")
+                                .splitlines(keepends=True)
+                                if not entry.startswith("SPEC_ACCOUNT=")), encoding="utf-8")
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.origin_subjects()[0], "report: demo")
+
+    def test_a_copy_that_also_changes_a_file_outside_the_directory_is_refused(self):
+        # Every record of the copier is there; the extra file alone refuses the commit.
+        commit = self.copy_made({"tests/vectors/a.bin": "vector\n", "tool.py": "print(2)\n"})
+        before = self.records({
+            "impl/log/status.log": f"{local_time(self.now - 1500)} {COPIER} start started abc\n",
+            f"trace/ledger/{commit}.md": f"commit: {commit}\nunit: {COPIER}\n",
+            f"impl/log/{COPIER}-prompt.md": f"{COPIER_PROMPT_LINE}\nThe copy.\n"})
+        self.refused_with(before, "also changes files outside tests/vectors")

@@ -19,7 +19,15 @@ commit may add, change or remove a file in the product's vector directory: the l
 recompute in checks.tsv on origin. A project without that row has no such directory.
 Nor may any other product commit on origin touch that directory when the report does
 not name it and it was made during the unit: committed after the unit's first start
-line in impl/log/status.log on origin and not after its "log: <ID>" commit. An exit file counts when its name is <ID>-<row>.exit for a row of checks.tsv and it
+line in impl/log/status.log on origin and not after its "log: <ID>" commit. That second
+check skips the vector copy of a spec writer unit that ran beside the unit: a commit
+that changes files in the vector directory and no other file, whose ledger entry
+trace/ledger/<full hash>.md on origin names one other unit <X> on its line "unit: <X>",
+where status.log on origin has a start line of <X> not later than the commit, and the
+first line of impl/log/<X>-prompt.md on origin names the spec writer account
+(SPEC_ACCOUNT of the conf file, or specwriter when it has no such key). When only that
+prompt copy is missing, the refusal names <X>, so the report can be run again after
+"log: <X>". An exit file counts when its name is <ID>-<row>.exit for a row of checks.tsv and it
 was written during the current run. A checks: or context: value other than none is
 the unit's and stays as written.
 
@@ -76,6 +84,8 @@ EXIT_TEXT = re.compile(r"([0-9]{1,3})\n?")
 RECOMPUTE_ROW = "recompute"
 # jig start appends a line "<time> <ID> start ..." here for each run of a unit.
 STATUS_LOG = "impl/log/status.log"
+# The account of the spec writer role when the conf file has no SPEC_ACCOUNT.
+SPEC_ACCOUNT = "specwriter"
 
 
 def refuse(name, detail):
@@ -275,7 +285,8 @@ def check_unnamed_vectors(lines, conf, account, clone, product, branch, unit, lo
     A unit could push a product commit that changes the vectors and leave it out of its
     commits: line, which the check of the listed commits would then never see. A product
     commit counts as the unit's when its committer time is after the unit's first start
-    line and not after the unit's log commit in -dev.
+    line and not after the unit's log commit in -dev, unless it is a spec writer's copy
+    of the vectors (not_a_spec_writer_copy).
     """
     if account not in helpers.role_accounts(conf, "impl"):
         return
@@ -304,10 +315,101 @@ def check_unnamed_vectors(lines, conf, account, clone, product, branch, unit, lo
         if not begun < int(committed) <= ended or commit in named:
             continue
         paths = vector_paths(product, commit, directory)
-        if paths:
+        if not paths:
+            continue
+        why = not_a_spec_writer_copy(conf, clone, product, branch, unit, commit,
+                                     int(committed), directory)
+        if why is not None:
             refuse("vectors", f"the product commit {commit[:12]} changes {paths[0]} in "
                               f"{directory}, the product's vector directory, during the unit "
-                              f"and is not named in commits:")
+                              f"and is not named in commits: ({why})")
+
+
+def not_a_spec_writer_copy(conf, clone, product, branch, unit, commit, committed, directory):
+    """Return why an unnamed vector commit is not a spec writer's copy, or None if it is.
+
+    A spec writer unit can copy the vectors into the product while an implementer unit
+    runs, and the implementer's report cannot name a commit that it did not make. Such a
+    copy is known by the records that its own unit left on origin of -dev, which the unit
+    under report does not write: the commit's ledger entry, the other unit's start line,
+    and that unit's prompt copy, whose first line names the spec writer account. The
+    commit must also change nothing outside the vector directory, so that no product
+    code can come in under the copy.
+    """
+    if not only_under(product, commit, directory):
+        return f"it also changes files outside {directory}"
+    origin = f"refs/remotes/origin/{branch}"
+    entry = f"trace/ledger/{commit}.md"
+    shown = helpers.git(clone, "show", f"{origin}:{entry}")
+    if shown.returncode != 0:
+        return f"origin/{branch} has no ledger entry {entry}"
+    other = ledger_unit(shown.stdout)
+    if other is None:
+        return f"the ledger entry {entry} on origin/{branch} has no one line 'unit: <ID>'"
+    if other == unit:
+        return f"its ledger entry names {unit}, the unit under report"
+    if not started_by(clone, origin, other, committed):
+        return (f"{STATUS_LOG} on origin/{branch} has no start line of {other} "
+                f"before the commit")
+    copy = f"impl/log/{other}-prompt.md"
+    shown = helpers.git(clone, "show", f"{origin}:{copy}")
+    if shown.returncode != 0:
+        # The copy comes with the other unit's report commit, which can still be to come.
+        return (f"its ledger entry names {other}, whose prompt copy {copy} is not on "
+                f"origin/{branch} yet; run jig report again after 'log: {other}'")
+    first = shown.stdout.split("\n", 1)[0]
+    match = start.FIRST_LINE.fullmatch(first)
+    accounts = conf["SPEC_ACCOUNT"].split() if "SPEC_ACCOUNT" in conf else [SPEC_ACCOUNT]
+    if not match or match[3] not in accounts:
+        return f"the first line of {copy} on origin/{branch} names no spec writer account"
+    return None
+
+
+def only_under(product, commit, directory):
+    """Say whether every path that the commit changes against its first parent is in the
+    directory, both paths of a rename or a copy among them."""
+    parents = helpers.git_out(product, "rev-list", "--parents", "-n", "1", commit).split()
+    base = [parents[1]] if len(parents) > 1 else ["--root"]
+    listed = helpers.git(product, "diff-tree", "-r", "-M", "-C", "--no-commit-id",
+                         "--name-status", "-z", *base, commit)
+    if listed.returncode != 0:
+        refuse("vectors", f"cannot list the files of {commit} in {product}: "
+                          f"{helpers.last_line(listed)}")
+    # With -z each status word stands alone, then one path, or two for a rename or a copy.
+    fields = [field for field in listed.stdout.split("\0") if field]
+    paths, index = [], 0
+    while index < len(fields):
+        count = 2 if fields[index][:1] in ("R", "C") else 1
+        paths += fields[index + 1:index + 1 + count]
+        index += 1 + count
+    inside = directory.rstrip("/") + "/"
+    return bool(paths) and all(path.startswith(inside) for path in paths)
+
+
+def ledger_unit(text):
+    """Return the one ID of a ledger entry's line "unit: <ID>", or None."""
+    values = [line[len("unit:"):].split() for line in text.splitlines()
+              if line.startswith("unit:")]
+    if len(values) != 1 or len(values[0]) != 1 or \
+            not helpers.UNIT_ID.fullmatch(values[0][0]):
+        return None
+    return values[0][0]
+
+
+def started_by(clone, origin, unit, committed):
+    """Say whether status.log at the ref has a start line of the unit not after a time."""
+    shown = helpers.git(clone, "show", f"{origin}:{STATUS_LOG}")
+    for line in shown.stdout.splitlines() if shown.returncode == 0 else []:
+        fields = line.split()
+        if len(fields) < 3 or fields[1] != unit or fields[2] != "start":
+            continue
+        try:
+            if datetime.datetime.fromisoformat(fields[0]).timestamp() <= committed:
+                return True
+        except ValueError:
+            # A line with no time proves no start; another line of the unit still can.
+            continue
+    return False
 
 
 def vector_paths(product, commit, directory):
