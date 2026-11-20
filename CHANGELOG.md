@@ -5,6 +5,87 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.3
+
+What changed: `jig orch` announces an idle orchestrator. When the project has
+no running unit, the loop sends one event for each idle period,
+`idle: no unit since <HH:MM>; start the next step, or write why you wait in ...`,
+unless the orchestrator has written why it waits, after the last unit, in the
+waiting file `~/ws/reviews/<project>/orch/waiting` (one line: `date -Iseconds`,
+a space, the reason). `jig orch <project> status` prints that line as
+`waiting: <line>`, or `waiting: none`. A unit that starts again ends the
+period, and so do three busy polls in a row.
+
+`jig batch` appends one line to the event file when it refuses a batch file,
+`batch: <file> refused: <reason>`, and when a batch ends,
+`batch: <file> ended: <exit code>`; a batch stopped by a signal ends with 128
+plus the signal number.
+
+`jig wait` exits 8 when a unit waits at its input prompt, with no running turn,
+and holds a commit in one of its clones that is not pushed. `jig batch` shows
+what `jig wait` printed at that end and waits for the unit again.
+
+`jig report` no longer refuses an implementer report because of a spec
+writer's vector commit pushed while the unit ran, when that commit changes only
+the vector directory and its ledger entry, the start line of the spec writer's
+unit and the copy of that unit's prompt are on origin. When only the prompt copy
+is missing, the refusal names that unit and says to run `jig report` again after
+its log commit. Each refusal ends with its reason in parentheses.
+
+The status line: after a reset of the use that keeps its reset time, the 5 h
+and weekly use now fall to the new value. `usage.json` gains the keys
+`shown_at` and `sessions` beside the old ones.
+
+The templates of `jig new`: `ORCHESTRATOR.md` gives the rule of the end of a
+turn (an orchestrator that waits writes the waiting file first), the form of
+the waiting file, the idle and batch event lines, and the rule of a refused
+push. `CLAUDE.md` and the prompt template give the rule of a refused push: fetch,
+rebase the unpushed commits and push again, up to 3 rounds while git reports no
+conflict; a conflict, or a refused push in the third round, is an escalation; a
+unit that cannot push its report also writes it to
+`~/ws/reviews/<project>/<ID>-report.md`.
+
+Files and formats: changed files: `libexec/jig-orch`, `libexec/jig-batch`,
+`libexec/jig-wait`, `libexec/jig-report` and `libexec/jig-statusline`, with
+their help texts; `templates/prompt.md`, and the templates `CLAUDE.md` and
+`impl/orch/ORCHESTRATOR.md` under `templates/new/dev/`. New formats: the
+waiting file, the event lines `idle:` and `batch:`, the exit code 8 of
+`jig wait`, and the keys `shown_at` and `sessions` of `usage.json`. The ledger,
+the trace and the conf file are unchanged.
+
+Migration: a host and its projects move from 0.10.2 to 0.10.3 in this order. A
+host still on 0.10.1 first takes the migration of 0.10.2, or takes both at once
+with `jig upgrade 0.10.3` and the steps of 0.10.2 after it.
+
+1. As the orchestrator account, run `jig upgrade 0.10.3`. It installs 0.10.3
+   under `/opt/jig/0.10.3/` and points `/opt/jig/current` to it. The status
+   line changes for every account at the install, with no step.
+2. For each project, run `jig upgrade <project> 0.10.3` as the orchestrator
+   account. It sets `JIG_VERSION=0.10.3` in the conf file of the project in
+   each role account, and refuses while a unit holds a lock. Check in each
+   account that the conf file of the project reads `JIG_VERSION=0.10.3`.
+3. For each running project, restart its loop as the orchestrator account,
+   with `jig orch <project> stop` and then `jig orch <project> start`, so that
+   the loop runs the new code and the idle event is live.
+4. The orchestrator of each project copies by hand into the project's own
+   `impl/orch/ORCHESTRATOR.md`, from the template of 0.10.3 under
+   `/opt/jig/0.10.3/templates/new/dev/impl/orch/`: the section "The end of a
+   turn" with the form of the waiting file, and the handling of the idle and
+   batch event lines. `jig upgrade` changes no file of a project's repo.
+5. The orchestrator copies the rule of a refused push (3 rounds; a conflict or
+   a third refusal escalates; the report also in
+   `~/ws/reviews/<project>/<ID>-report.md`) into the project's own `CLAUDE.md`
+   and `impl/orch/ORCHESTRATOR.md`, from the templates of 0.10.3 under
+   `/opt/jig/0.10.3/templates/new/dev/`, in place of the older rule of one
+   rebase.
+6. Nothing more for the specwriter and implementer accounts.
+
+Requested by: two other projects: one, whose orchestrator sat idle for hours
+with no event; the other, whose vector commit was refused while two batches
+ran. The rest: found in the code review of the line.
+
+Units: 0 minor, 3 patch, 8 none
+
 ## 0.10.2
 
 What changed: `jig trace check`, in its search of the tree before the import,
