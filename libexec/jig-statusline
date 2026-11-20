@@ -55,10 +55,23 @@ Files it writes:
     time of the write, for other tools of the host that pace their own use.
     More than one Claude Code process runs this, and some pass stale
     rate_limits, so each window is merged with the one already in the file:
-    an earlier resets_at keeps the file's window, an equal one keeps the larger
-    used_percentage, and a later one starts a new window. An exclusive lock on
-    usage.json.lock covers the read, the merge and the write. The line shows
-    the merged values.
+    an earlier resets_at keeps the file's window, and a later one starts a new
+    window. For an equal resets_at the merge goes by time, because the use can
+    also fall within one window, at a reset of the use that keeps resets_at:
+    the file keeps the time of the value it shows (shown_at) and, for each
+    session_id of the input, the last value of each window with the time that
+    the session first gave it (sessions). A session that repeats a value keeps
+    that value's first time. A higher value then replaces the shown one when
+    its time is later, and a lower value when its time is later by more than
+    one refresh of the status line, 60 s, so neither an idle session's stale
+    value nor the lag between two sessions moves the line, while a real reset
+    shows at the next new value of a session. An input with no session_id
+    keeps the larger value, and a file without times reads as time 0. A
+    session's entry goes once none of its windows has a resets_at still to
+    come. The keys five_hour, seven_day, elapsed_fraction, pace and ts keep
+    their form for the other tools. An exclusive lock on usage.json.lock
+    covers the read, the merge and the write. The line shows the merged
+    values.
   Inside tmux (TMUX set), it renames the current window to $role_short:$branch
   (spec, impl or rev for the roles spec writer, implementer and reviewer; the
   user name without a role), only when the name differs, and writes the
@@ -81,6 +94,9 @@ WEEK_S = 7 * 24 * 3600
 PACE_MARGIN = 5.0
 HEALTH_STALE_S = 36 * 3600
 MAX_COLS = 99
+# Claude Code runs the status line about this often, in seconds.
+REFRESH_S = 60.0
+WINDOWS = ("five_hour", "seven_day")
 ROLE_SHORT = {"spec writer": "spec", "implementer": "impl", "reviewer": "rev"}
 # The host config file of jig, shared by every account. It names the two host
 # files that differ from host to host, so that no such path lives in this code.
@@ -188,17 +204,56 @@ def window(rate_limits: dict, name: str) -> dict | None:
     return w
 
 
-def merge_window(old, new: dict) -> dict:
-    """Return whichever of the file's window and the new one is current."""
+def number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def value_time(seen, new: dict, now: float) -> float:
+    """Return the time of a session's value: the time it first gave that value.
+
+    seen is the session's last value of the window in the file. While the session
+    repeats it with the same resets_at, the value keeps its first time, so an idle
+    session that shows an old value never looks newer than a value set since.
+    """
+    if isinstance(seen, dict) and seen.get("used_percentage") == new["used_percentage"] \
+            and seen.get("resets_at") == new.get("resets_at"):
+        at = seen.get("at")
+        return at if number(at) else 0.0
+    return now
+
+
+def merge_window(old, new: dict, old_at=0.0, new_at=0.0, session=False) -> tuple[dict, float]:
+    """Return whichever of the file's window and the new one is current, with its time.
+
+    old_at is the time of the file's value and new_at the time of the new one. Only
+    an input of a session has a time worth comparing; without one, as before times
+    were kept, the larger value of a window wins.
+    """
     new = {"used_percentage": new["used_percentage"], "resets_at": new.get("resets_at")}
-    if not isinstance(old, dict) or not isinstance(old.get("used_percentage"), (int, float)):
-        return new
+    if not isinstance(old, dict) or not number(old.get("used_percentage")):
+        return new, new_at
     o, n = old.get("resets_at"), new["resets_at"]
-    if not isinstance(o, (int, float)) or not isinstance(n, (int, float)):
-        return new  # nothing to compare
-    if n < o or (n == o and old["used_percentage"] > new["used_percentage"]):
-        return {"used_percentage": old["used_percentage"], "resets_at": o}
-    return new
+    if not number(o) or not number(n):
+        return new, new_at  # nothing to compare
+    kept = {"used_percentage": old["used_percentage"], "resets_at": o}
+    if n != o:
+        return (kept, old_at) if n < o else (new, new_at)
+    u, v = new["used_percentage"], old["used_percentage"]
+    if not session:
+        return (kept, old_at) if v >= u else (new, new_at)
+    # A lower value within one refresh of the shown one is the lag between two
+    # sessions, not a reset of the use.
+    if (u > v and new_at > old_at) or (u < v and new_at > old_at + REFRESH_S):
+        return new, new_at
+    return kept, old_at
+
+
+def live_sessions(sessions: dict, now: float) -> dict:
+    """Return the sessions that still have a window to come; the rest can say nothing new."""
+    return {sid: entry for sid, entry in sessions.items()
+            if isinstance(entry, dict) and any(
+                isinstance(w, dict) and number(w.get("resets_at")) and w["resets_at"] > now
+                for w in entry.values())}
 
 
 def read_usage(path: str) -> dict | None:
@@ -386,11 +441,29 @@ def render(data: dict, now: float, previous: dict | None = None) -> tuple[str, d
     if not isinstance(rl, dict):
         return "", None
     previous = previous or {}
-    five, week = window(rl, "five_hour"), window(rl, "seven_day")
-    if five:
-        five = merge_window(previous.get("five_hour"), five)
-    if week:
-        week = merge_window(previous.get("seven_day"), week)
+    sid = data.get("session_id")
+    sid = sid if isinstance(sid, str) and sid else None
+    sessions = previous.get("sessions")
+    sessions = dict(sessions) if isinstance(sessions, dict) else {}
+    seen = sessions.get(sid) if sid else None
+    seen = seen if isinstance(seen, dict) else {}
+    shown_at = previous.get("shown_at")
+    shown_at = shown_at if isinstance(shown_at, dict) else {}
+    merged, times, own = {}, {}, {}
+    for name in WINDOWS:
+        given = window(rl, name)
+        if not given:
+            merged[name] = None
+            continue
+        at = value_time(seen.get(name), given, now) if sid else now
+        old_at = shown_at.get(name)
+        merged[name], times[name] = merge_window(
+            previous.get(name), given, old_at if number(old_at) else 0.0, at, sid is not None)
+        own[name] = {"used_percentage": given["used_percentage"],
+                     "resets_at": given.get("resets_at"), "at": at}
+    if sid:
+        sessions[sid] = own
+    five, week = merged["five_hour"], merged["seven_day"]
     parts, usage = [], None
     if five:
         left, clock = time_left(five.get("resets_at"), now), reset_clock(five.get("resets_at"))
@@ -413,6 +486,8 @@ def render(data: dict, now: float, previous: dict | None = None) -> tuple[str, d
                     "elapsed_fraction": round(elapsed, 4),
                     "pace": p,
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+                    "shown_at": times,
+                    "sessions": live_sessions(sessions, now),
                 }
     return " · ".join(parts), usage
 

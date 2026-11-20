@@ -68,6 +68,12 @@ def sample(five=23.5, week=41.2, week_left_days=3.5, rate_limits=True, now=NOW):
     return data
 
 
+def no_session(data):
+    """Return the input without a session_id, as some callers of the tool give it."""
+    data.pop("session_id")
+    return data
+
+
 class PaceTest(unittest.TestCase):
     def test_elapsed_fraction(self):
         self.assertAlmostEqual(statusline.elapsed_fraction(NOW + 3.5 * DAY, NOW), 0.5)
@@ -174,9 +180,11 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(usage["pace"], "ahead")
         self.assertEqual(line, "5h 30% (2h24m · 02:24AM PST) · wk 60% · pace ahead")
 
-    def test_equal_reset_keeps_the_larger_use(self):
+    def test_equal_reset_keeps_the_larger_use_for_an_input_with_no_session(self):
+        # With no session_id there is no time to compare, so the larger use wins either
+        # way: the file's for the five-hour window, the input's for the weekly one.
         prev = self.previous(five=30.0, week=40.0)
-        line, usage = statusline.render(sample(five=20, week=50), NOW, prev)
+        line, usage = statusline.render(no_session(sample(five=20, week=50)), NOW, prev)
         self.assertEqual(usage["five_hour"]["used_percentage"], 30.0)
         self.assertEqual(usage["seven_day"]["used_percentage"], 50)
         self.assertEqual(line, "5h 30% (2h24m · 02:24AM PST) · wk 50% · pace even")
@@ -191,9 +199,9 @@ class MergeTest(unittest.TestCase):
 
     def test_windows_merge_separately(self):
         # The five-hour window rolled over; the weekly one is the same and the file's
-        # use is larger.
+        # use is larger, which an input with no session_id cannot lower.
         prev = self.previous(five=70.0, week=45.0, five_reset=NOW - 60)
-        _, usage = statusline.render(sample(five=2, week=41.2), NOW, prev)
+        _, usage = statusline.render(no_session(sample(five=2, week=41.2)), NOW, prev)
         self.assertEqual(usage["five_hour"]["used_percentage"], 2)
         self.assertEqual(usage["seven_day"]["used_percentage"], 45.0)
 
@@ -202,6 +210,90 @@ class MergeTest(unittest.TestCase):
             _, usage = statusline.render(sample(), NOW, prev)
             self.assertEqual(usage["five_hour"]["used_percentage"], 23.5, prev)
             self.assertEqual(usage["seven_day"]["used_percentage"], 41.2, prev)
+
+
+# One reset time for each window through a whole sequence of inputs.
+FIVE_RESET = NOW + FIVE_LEFT
+WEEK_RESET = NOW + 3.5 * DAY
+
+
+def session_input(use, session):
+    """Return an input of the session with the same use in both windows."""
+    return {"session_id": session, "rate_limits": {
+        "five_hour": {"used_percentage": use, "resets_at": FIVE_RESET},
+        "seven_day": {"used_percentage": use, "resets_at": WEEK_RESET}}}
+
+
+class SessionMergeTest(unittest.TestCase):
+    """Inputs of several sessions with the same reset times, merged by the time of each value.
+
+    Each step renders one input at a fixture time on the file that the step before
+    left, as the processes of the sessions do in turn.
+    """
+
+    def setUp(self):
+        in_zone(self)
+        self.usage = None
+
+    def step(self, use, session, at):
+        """Merge one input at NOW + at seconds; return the use that both windows show."""
+        _, self.usage = statusline.render(session_input(use, session), NOW + at, self.usage)
+        shown = (self.usage["five_hour"]["used_percentage"],
+                 self.usage["seven_day"]["used_percentage"])
+        self.assertEqual(shown[0], shown[1])
+        return shown[0]
+
+    def test_a_lower_value_more_than_a_refresh_later_shows_and_stale_values_do_not(self):
+        self.assertEqual(self.step(96, "first", 0), 96)
+        # A real reset of the use: a lower value 61 s after the 96 was set.
+        self.assertEqual(self.step(22, "second", 61), 22)
+        # The first session is idle and repeats its 96, which it gave before the 22.
+        self.assertEqual(self.step(96, "first", 120), 22)
+        # A new session with a higher value raises the shown one at once.
+        self.assertEqual(self.step(30, "third", 125), 30)
+
+    def test_a_repeated_lower_value_keeps_its_first_time_and_a_new_one_shows(self):
+        self.assertEqual(self.step(96, "first", 0), 96)
+        # Within 60 s the 22 is the lag between two sessions, not a reset.
+        self.assertEqual(self.step(22, "second", 30), 96)
+        # The same 22 again is still the value that came 30 s after the 96.
+        self.assertEqual(self.step(22, "second", 90), 96)
+        # The session's next new value is later than the 96 by more than 60 s.
+        self.assertEqual(self.step(23, "second", 120), 23)
+
+    def test_an_input_with_no_session_keeps_the_larger_value(self):
+        self.step(96, "first", 0)
+        self.assertEqual(self.step(22, "second", 61), 22)
+        _, usage = statusline.render(no_session(session_input(96, "x")), NOW + 62, self.usage)
+        self.assertEqual(usage["seven_day"]["used_percentage"], 96)
+        _, usage = statusline.render(no_session(session_input(22, "x")), NOW + 200, usage)
+        self.assertEqual(usage["seven_day"]["used_percentage"], 96)
+
+    def test_a_file_with_no_times_lets_a_session_lower_the_value(self):
+        # A file of an older version has the windows and no times, which read as 0.
+        self.usage = {"five_hour": {"used_percentage": 96, "resets_at": FIVE_RESET},
+                      "seven_day": {"used_percentage": 96, "resets_at": WEEK_RESET}}
+        self.assertEqual(self.step(22, "second", 0), 22)
+
+    def test_a_session_goes_once_each_of_its_windows_has_passed(self):
+        self.usage = {"sessions": {
+            "ended": {"five_hour": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1},
+                      "seven_day": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1}},
+            "weekly": {"five_hour": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1},
+                       "seven_day": {"used_percentage": 5, "resets_at": WEEK_RESET, "at": 1}}}}
+        self.step(40, "now", 0)
+        self.assertEqual(sorted(self.usage["sessions"]), ["now", "weekly"])
+
+    def test_the_keys_that_other_tools_read_keep_their_form(self):
+        self.step(96, "first", 0)
+        self.step(22, "second", 61)
+        self.assertLessEqual({"five_hour", "seven_day", "elapsed_fraction", "pace", "ts"},
+                             set(self.usage))
+        self.assertEqual(self.usage["five_hour"],
+                         {"used_percentage": 22, "resets_at": FIVE_RESET})
+        self.assertEqual(self.usage["seven_day"],
+                         {"used_percentage": 22, "resets_at": WEEK_RESET})
+        self.assertEqual(self.usage["pace"], "behind")
 
 
 class HealthTest(TempTestCase):
@@ -596,6 +688,9 @@ class UsageFileTest(StatuslineTestCase):
         self.assertEqual(data["five_hour"]["used_percentage"], 23.5)
         self.assertEqual(data["seven_day"]["used_percentage"], 41.2)
         self.assertEqual(data["pace"], "behind")
+        # The times that the next run merges by are in the file too.
+        self.assertEqual(data["sessions"]["abc"]["seven_day"]["used_percentage"], 41.2)
+        self.assertEqual(set(data["shown_at"]), {"five_hour", "seven_day"})
         self.assertEqual(sorted(os.listdir(self.dir)), ["usage.json", "usage.json.lock"])
 
     def test_stale_writer_does_not_overwrite(self):
