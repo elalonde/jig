@@ -355,7 +355,10 @@ class JigNewTest(JigNewCase):
         # The watcher takes several unit IDs, each with optional minutes, and ends with
         # the whole output of a wait. The standing prompt must say so, say how to give
         # it new arguments, and say why minutes go into one start only: a restart with
-        # the minutes of a unit that has ended makes the watcher exit at once.
+        # the minutes of a unit that has ended makes the watcher exit at once. It must
+        # also say when jig wait ends at a unit that sits at its input prompt with a
+        # commit that is not pushed, and that the orchestrator then reads the report and
+        # escalates instead of waiting on that unit again.
         text = self.made_text("impl/orch/ORCHESTRATOR.md")
         for rule in ("`jig orch demo events --next [<unit ID>[:<minutes>] ...]`",
                      "While units run, pass the ID of each running unit as a `<unit ID>`: "
@@ -370,7 +373,14 @@ class JigNewTest(JigNewCase):
                      "each restart after it: `jig wait` refuses `--expected` for a unit "
                      "with no lock, also when the report of that unit is on origin, so a "
                      "watcher that starts again with `<unit ID>:<minutes>` after the end of "
-                     "that unit exits at once with that refusal."):
+                     "that unit exits at once with that refusal.",
+                     "- A unit that waits at its input prompt with a commit that is not "
+                     "pushed: `jig wait` ends with its own code and a line that says so, "
+                     "at a check with no screen change, the input bar, no running turn, "
+                     "and a commit in the worker's `-dev` clone or product clone that its "
+                     "upstream does not have. Read its report with "
+                     "`jig cat demo <account> <ID>-report.md`, and escalate; do not start "
+                     "`jig wait` on that unit again."):
             self.assertIn(rule, text)
         # The form of the older watcher, one unit ID and one line at the end of a wait,
         # is gone.
