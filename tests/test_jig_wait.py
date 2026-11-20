@@ -27,7 +27,8 @@ FAST = {"JIG_WAIT_POLL": "0.05", "JIG_WAIT_CHECK": "0.4"}
 # A check that never comes during a test, for the ends that must come before it.
 NO_CHECK = {"JIG_WAIT_POLL": "0.05", "JIG_WAIT_CHECK": "600"}
 
-REPORT, REFUSED, USAGE, DIALOG, TIMEOUT, NO_CHANGE, ENDED, UNREACHABLE = 0, 1, 2, 3, 4, 5, 6, 7
+(REPORT, REFUSED, USAGE, DIALOG, TIMEOUT, NO_CHANGE, ENDED, UNREACHABLE,
+ UNPUSHED) = 0, 1, 2, 3, 4, 5, 6, 7, 8
 
 # A screen that differs at every capture, in its letters.
 CHANGING_SCREEN = """printf '● step %s\\n' "$(printf 'x%.0s' $(seq 1 "$1"))"
@@ -254,7 +255,7 @@ class JigWaitTest(UnitsTestCase):
         result = self.tool("wait", "jig")
         self.assertEqual(result.returncode, USAGE)
         self.assertIn("usage: jig wait <project> <ID> [--expected <minutes>]", result.stderr)
-        for code in range(8):
+        for code in range(9):
             self.assertRegex(result.stderr, rf"(?m)^  {code}  ")
 
     def test_wait_refuses_a_setting_that_is_not_a_positive_number(self):
@@ -262,6 +263,79 @@ class JigWaitTest(UnitsTestCase):
         result = self.tool("wait", "jig", "demo", JIG_WAIT_POLL="0")
         self.assertEqual(result.returncode, REFUSED)
 
+
+
+class WaitUnpushedTest(UnitsTestCase):
+    """The end of a wait on a unit that waits at its prompt with a commit not pushed.
+
+    The worker account holds the two clones of the project beside each other, cloned
+    from the fixture origin; a test adds a commit to one of them and does not push it.
+    """
+
+    # A check every 0.2 s and a poll every 0.02 s.
+    QUICK = {"JIG_WAIT_POLL": "0.02", "JIG_WAIT_CHECK": "0.2"}
+    # A turn at work: the spinner line just above the input box.
+    RUNNING_SCREEN = NORMAL_SCREEN.replace(
+        "● Running the tests\n", "● Running the tests\n✽ Ruminating… (18s · ↓ 1.2k tokens)\n")
+
+    def setUp(self):
+        super().setUp()
+        self.write_lock()
+        src = self.account("implementer") / "ws" / "src"
+        src.mkdir(parents=True)
+        self.clones = {name: src / name for name in ("jig-dev", "jig")}
+        for path in self.clones.values():
+            self.ok(["git", "clone", "-q", "-b", "master", self.origin, path])
+
+    def commit_in(self, name):
+        self.ok(["git", "-C", self.clones[name], "commit", "-q", "--no-verify",
+                 "--allow-empty", "-m", "a report that is not pushed"])
+
+    def wait(self):
+        return self.tool("wait", "jig", "demo", **self.QUICK)
+
+    def test_unchanged_screen_at_the_bar_with_an_unpushed_commit_ends_with_its_own_code(self):
+        # The same screen at the check, the input bar and no running turn: an unpushed
+        # commit in either clone ends the wait with code 8, its line and the screen.
+        for name in ("jig-dev", "jig"):
+            with self.subTest(name):
+                self.set_screen("implementer", NORMAL_SCREEN)
+                self.commit_in(name)
+                result = self.wait()
+                self.assertEqual(result.returncode, UNPUSHED, result.stdout + result.stderr)
+                self.assertIn("waits at its input prompt with a commit that is not pushed "
+                              f"in ~/ws/src/{name} ", result.stdout)
+                self.assertIn("Running the tests", result.stdout)
+                self.ok(["git", "-C", self.clones[name], "reset", "-q", "--hard",
+                         "origin/master"])
+
+    def test_unchanged_screen_with_every_commit_pushed_ends_as_no_change(self):
+        self.set_screen("implementer", NORMAL_SCREEN)
+        result = self.wait()
+        self.assertEqual(result.returncode, NO_CHANGE, result.stdout + result.stderr)
+
+    def test_unchanged_screen_with_a_running_turn_ends_as_no_change(self):
+        # A unit that runs a long command between its commit and its push shows the
+        # same screen at each check, with its spinner line: that is no stop.
+        self.set_screen("implementer", self.RUNNING_SCREEN)
+        self.commit_in("jig-dev")
+        result = self.wait()
+        self.assertEqual(result.returncode, NO_CHANGE, result.stdout + result.stderr)
+
+    def test_changed_screen_with_an_unpushed_commit_does_not_end_the_wait(self):
+        # Checks pass while the screen changes, until the session ends.
+        self.set_screen_script("implementer", CHANGING_SCREEN)
+        self.end_session_after("implementer", 14)
+        self.commit_in("jig-dev")
+        result = self.wait()
+        self.assertEqual(result.returncode, ENDED, result.stdout + result.stderr)
+        self.assertIn("check ok", result.stdout)
+
+    def test_dialog_with_an_unpushed_commit_is_a_dialog(self):
+        self.set_screen("implementer", DIALOG_SCREEN)
+        self.commit_in("jig")
+        result = self.wait()
+        self.assertEqual(result.returncode, DIALOG, result.stdout + result.stderr)
 
 
 class WaitExpectedTest(UnitsTestCase):

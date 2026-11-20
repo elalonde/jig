@@ -9,6 +9,9 @@ usage: jig wait <project> <ID> [--expected <minutes>]
   5  no change: the screen at a check is the screen at the last check
   6  the tmux session ended, and the report commit is not on origin
   7  the worker account could not be reached by ssh for 3 polls in a row
+  8  unpushed: at a check with no change, the session waits at its input bar with no
+     running turn, and its -dev clone or product clone has a commit on its branch that
+     the upstream of that branch does not have
   1  a refusal: no conf file, or no lock names a session of <ID>
   2  a usage error
 
@@ -25,6 +28,15 @@ at the start of this wait. What is kept between checks is a hash of the screen w
 the parts that change by themselves, never its text. On a dialog and on no change the
 screen goes to stdout, except for a session in the spec writer's account: its screen can
 show reference text, so only the end line and a line naming tmux attach are printed.
+
+The end with code 8 is for a unit that stopped before its last push: it would
+otherwise sit at its prompt, with a screen that never changes, until the timeout. A
+screen with no change alone does not show it, because a long test run shows that
+too, and the input bar alone does not, because the bar stays while a turn runs; so
+the screen as it is must also show no running turn (the test of lib/jig_tmux.py).
+The two clones, ~/ws/src/<project>-dev and ~/ws/src/<project> of the worker account,
+are read through ssh, as the screen is; a clone that is missing or has no upstream
+counts as pushed. The screen is printed as for code 5.
 
 That exception holds only while the project's clean room is on: the clean room is the
 setting that keeps reference material away from everyone but the spec writer. The
@@ -45,9 +57,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
 import jig_profile  # noqa: E402
 import jig_units  # noqa: E402
-from jig_tmux import DIALOG_POLLS, INPUT_BARS, has_input_bar, non_blank  # noqa: E402
+from jig_tmux import (DIALOG_POLLS, INPUT_BARS, has_input_bar, non_blank,  # noqa: E402
+                      running_turn)
 
-REPORT, REFUSED, USAGE, DIALOG, TIMEOUT, NO_CHANGE, ENDED, UNREACHABLE = 0, 1, 2, 3, 4, 5, 6, 7
+(REPORT, REFUSED, USAGE, DIALOG, TIMEOUT, NO_CHANGE, ENDED, UNREACHABLE,
+ UNPUSHED) = 0, 1, 2, 3, 4, 5, 6, 7, 8
 
 TIMEOUT_FACTOR = 3
 POLL_SECONDS = 30.0
@@ -106,6 +120,22 @@ def capture(running):
     return ("unreachable" if code == 255 else "ended"), ""
 
 
+def unpushed_clone(running):
+    """Return the clone of the worker account, as a path from its home, whose branch
+    has a commit that its upstream does not have, or None.
+
+    ssh starts the command in the home of the account, so the paths are relative. git
+    fails for a missing clone, a detached head or a branch with no upstream, and such a
+    clone counts as pushed: only a commit that is known to be unpushed ends the wait.
+    """
+    for clone in (f"ws/src/{running.project}-dev", f"ws/src/{running.project}"):
+        code, out, _ = jig_units.run_remote(
+            running.account, ["git", "-C", clone, "rev-list", "--count", "@{upstream}..HEAD"])
+        if code == 0 and out.strip().isdigit() and int(out.strip()) > 0:
+            return clone
+    return None
+
+
 class Wait:
     def __init__(self, conf, running):
         self.conf = conf
@@ -158,6 +188,15 @@ class Wait:
                     last = digest
                 elif time.monotonic() >= next_check:
                     if digest == last:
+                        # The running-turn test reads the screen as it is, with the
+                        # spinner line that the hash leaves out.
+                        clone = None
+                        if has_input_bar(screen) and not running_turn(screen):
+                            clone = unpushed_clone(running)
+                        if clone:
+                            return self.end(UNPUSHED, f"session {running.session} waits at "
+                                                      f"its input prompt with a commit that "
+                                                      f"is not pushed in ~/{clone}", screen)
                         return self.end(NO_CHANGE, f"no change in session {running.session} "
                                                    f"since the last check", screen)
                     last = digest
