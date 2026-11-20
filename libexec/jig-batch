@@ -28,11 +28,12 @@ impl/log/status.log on origin is "end OK", and a "report: <ID>" commit follows i
 newest "log: <ID>". That lets the orchestrator run the same file again after a stop. A
 row starts only when each ID it depends on reported OK in this run or is closed OK, and
 when no hold file exists. For a row that starts: jig start --expected, jig wait until
-the report commit lands (again after a wait that ends on an unchanged screen), then jig
-report. The account and role come from the prompt's first line, and jig start takes
-the model from the prompt and copies the inbox directory beside it. The next row starts
-only when jig report passed and the report says OK. A report of NEEDS SPEC blocks only
-the rows that depend on that row.
+the report commit lands (again after a wait that ends on an unchanged screen, or at a
+unit that waits at its input prompt with a commit that is not pushed), then jig report.
+The account and role come from the prompt's first line, and jig start takes the model
+from the prompt and copies the inbox directory beside it. The next row starts only when
+jig report passed and the report says OK. A report of NEEDS SPEC blocks only the rows
+that depend on that row.
 
 A pre-check or review session writes its findings to impl/log/<ID>-findings.md and
 commits the file with its report. Once such a row has reported OK, and again whenever a
@@ -137,6 +138,10 @@ WAIT_STOPS = {
 }
 WAIT_REPORT = 0
 WAIT_NO_CHANGE = 5
+# jig wait gives this code when the unit sits at its input prompt with a commit that is
+# not pushed. A healthy unit shows the same screen while a long check runs as a
+# background command before its push, so the batch waits again instead of stopping.
+WAIT_UNPUSHED = 8
 
 MAX_UNITS = 6
 KINDS = ("unit", "pre-check", "review")
@@ -438,6 +443,10 @@ class Batch:
                 return
             if code == WAIT_NO_CHANGE:
                 say(f"no change on the screen of {row.unit}; waiting again")
+                continue
+            if code == WAIT_UNPUSHED:
+                say(f"{row.unit} waits at its input prompt with a commit that is not pushed;"
+                    " waiting again")
                 continue
             stop, reason = WAIT_STOPS.get(code, (WAIT_REFUSED, f"jig wait refused, exit {code}"))
             raise Stop(stop, f"stop: {row.unit}: {reason}")

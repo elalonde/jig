@@ -274,6 +274,21 @@ class BatchRunTest(BatchCase):
         self.assertEqual(result.stdout.count("no change on the screen of u1"), 2)
         self.assertNotIn("screen of u1 after exit", result.stdout)
 
+    def test_a_unit_at_its_prompt_with_a_commit_not_pushed_is_waited_for_again(self):
+        # The first wait on u1 ends because u1 sits at its input prompt with a commit that
+        # is not pushed, as a healthy unit does while a long check runs in the background;
+        # the second wait sees the report. The batch does not stop: it shows what jig wait
+        # printed, says that it waits again, and starts u2 after u1 reported.
+        self.control("codes/wait-u1", "8 0")
+        result = self.batch(self.row("u1"), self.row("u2"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), ["start u1", "wait u1", "wait u1", "report u1",
+                                        "close u1"] + self.one_unit("u2"))
+        self.assertIn("screen of u1 after exit 8", result.stdout)
+        self.assertEqual(result.stdout.count(
+            "u1 waits at its input prompt with a commit that is not pushed; waiting again"), 1)
+        self.assertNotIn("stop:", result.stdout)
+
 
 class BatchStopTest(BatchCase):
 
