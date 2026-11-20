@@ -67,8 +67,8 @@ Files it writes:
     value nor the lag between two sessions moves the line, while a real reset
     shows at the next new value of a session. An input with no session_id
     keeps the larger value, and a file without times reads as time 0. A
-    session's entry goes once none of its windows has a resets_at still to
-    come. The keys five_hour, seven_day, elapsed_fraction, pace and ts keep
+    session's entry goes once the resets_at of each of its windows is in the
+    past. The keys five_hour, seven_day, elapsed_fraction, pace and ts keep
     their form for the other tools. An exclusive lock on usage.json.lock
     covers the read, the merge and the write. The line shows the merged
     values.
@@ -249,11 +249,16 @@ def merge_window(old, new: dict, old_at=0.0, new_at=0.0, session=False) -> tuple
 
 
 def live_sessions(sessions: dict, now: float) -> dict:
-    """Return the sessions that still have a window to come; the rest can say nothing new."""
+    """Return the sessions whose windows have not all reset; the rest can say nothing new.
+
+    An entry that is not a set of windows is left out, so a damaged file cannot grow.
+    """
+    def ended(entry: dict) -> bool:
+        return all(isinstance(w, dict) and number(w.get("resets_at")) and w["resets_at"] < now
+                   for w in entry.values())
+
     return {sid: entry for sid, entry in sessions.items()
-            if isinstance(entry, dict) and any(
-                isinstance(w, dict) and number(w.get("resets_at")) and w["resets_at"] > now
-                for w in entry.values())}
+            if isinstance(entry, dict) and entry and not ended(entry)}
 
 
 def read_usage(path: str) -> dict | None:

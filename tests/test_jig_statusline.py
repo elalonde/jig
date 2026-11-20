@@ -280,9 +280,13 @@ class SessionMergeTest(unittest.TestCase):
             "ended": {"five_hour": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1},
                       "seven_day": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1}},
             "weekly": {"five_hour": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1},
-                       "seven_day": {"used_percentage": 5, "resets_at": WEEK_RESET, "at": 1}}}}
+                       "seven_day": {"used_percentage": 5, "resets_at": WEEK_RESET, "at": 1}},
+            # A window with no reset time is not known to have passed.
+            "unknown": {"five_hour": {"used_percentage": 5, "resets_at": None, "at": 1},
+                        "seven_day": {"used_percentage": 5, "resets_at": NOW - 10, "at": 1}},
+            "damaged": "x"}}
         self.step(40, "now", 0)
-        self.assertEqual(sorted(self.usage["sessions"]), ["now", "weekly"])
+        self.assertEqual(sorted(self.usage["sessions"]), ["now", "unknown", "weekly"])
 
     def test_the_keys_that_other_tools_read_keep_their_form(self):
         self.step(96, "first", 0)
