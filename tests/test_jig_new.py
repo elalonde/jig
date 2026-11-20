@@ -501,7 +501,11 @@ class JigNewTest(JigNewCase):
                      "cells, with the same review ID and fix ID, also when the fix unit did "
                      "not change that document."):
             self.assertIn(rule, loop)
-        self.assertIsNone(re.search(r"\brounds?\b", text))
+        # Only the rule of a refused push counts rounds, those of fetch and rebase.
+        push = ("up to 3 rounds while git reports no conflict. A conflict in a rebase, or a "
+                "refused push in the third round,")
+        self.assertIn(push, text)
+        self.assertIsNone(re.search(r"\brounds?\b", text.replace(push, "")))
         self.assertIn("`backlog.md` (the findings of a spec or plan review that are not "
                       "must-fix,", text)
 
@@ -529,6 +533,53 @@ class JigNewTest(JigNewCase):
         self.assertIn("(the `inbox:` and `readback:` lines, the lines `report: <ID> <status>` "
                       "and the reminders)", text)
         self.assertNotIn("`hourly update`", text)
+
+    def test_standing_prompt_holds_the_end_of_a_turn_and_the_form_of_the_waiting_file(self):
+        # An orchestrator that ends its turn with no unit running and no declared wait
+        # sits idle in silence; the standing prompt names the three states that may end
+        # a turn, the waiting file and its form, and what to do at an idle event and at
+        # each line of jig batch.
+        text = self.made_text("impl/orch/ORCHESTRATOR.md")
+        for line in ("Before you end a turn, check that one of these holds: - a unit or a "
+                     "batch runs, and the watcher runs with the ID of each running unit; - "
+                     "you wait on purpose, because no work is ready, or the next step waits "
+                     "on Eric or on another project; you told Eric so once, in one plain "
+                     "line; and you wrote the waiting file for this wait; - you ran "
+                     "`jig orch demo rollover`. When none holds, do the next step.",
+                     "The waiting file is `~/ws/reviews/demo/orch/waiting`: one line, the "
+                     "output of `date -Iseconds`, one space, and the reason of the wait in "
+                     "plain words,",
+                     "When a wait follows a unit, write the file after the worker of that "
+                     "unit is closed.",
+                     "`idle: no unit since <HH:MM>; start the next step, or write why you "
+                     "wait in ~/ws/reviews/demo/orch/waiting`.",
+                     "- An idle event: do the next step, or write the waiting file and tell "
+                     "Eric once.",
+                     "- A line `batch: <batch file> refused: <reason>`: fix the batch file "
+                     "and start the batch again, or tell Eric.",
+                     "- A line `batch: <batch file> ended: <exit code>`: read the tail of the "
+                     "output file of the batch. When you still wait, write the waiting file "
+                     "again,"):
+            self.assertIn(line, text)
+
+    def test_templates_give_the_refused_push_in_three_rounds_and_no_single_rebase(self):
+        # The push of a report can lose a race with origin more than once, so every
+        # template gives up to 3 rounds of fetch, rebase and push, and a unit that still
+        # cannot push leaves its report where the orchestrator can read it.
+        rounds = ("push again, up to 3 rounds while git reports no conflict. A conflict in "
+                  "a rebase, or a refused push in the third round, is an escalation.")
+        claude = self.made_text("CLAUDE.md")
+        standing = self.made_text("impl/orch/ORCHESTRATOR.md")
+        self.assertIn("A push to `-dev` that is refused: fetch, rebase the unpushed commits, "
+                      "and " + rounds, claude)
+        self.assertIn("A unit that cannot push its report commit also writes its report to "
+                      "`~/ws/reviews/demo/<ID>-report.md`, and stops with the text of its "
+                      "report as its last message", claude)
+        self.assertIn("A push to `-dev` that is refused: fetch, rebase your unpushed commits, "
+                      "and " + rounds, standing)
+        for text in (claude, standing):
+            self.assertNotIn("rebase the unpushed commits once", text)
+            self.assertNotIn("a second refusal", text)
 
     def test_standing_prompt_moves_the_line_with_jig_branch_after_a_minor_or_major(self):
         # After a minor or major release the orchestrator runs jig branch before its next
@@ -1338,6 +1389,19 @@ class PromptTemplateTest(unittest.TestCase):
         economy = prompt_section(self.text, "SESSION ECONOMY", "STEPS")
         self.assertIn("Edit files with the edit tool, never with a shell heredoc or with a "
                       "script that writes files.", economy)
+
+    def test_steps_give_the_refused_push_in_three_rounds_and_the_report_in_reviews(self):
+        # Every unit learns from its prompt how many rounds a refused push gets, and
+        # where its report goes when the report commit cannot be pushed.
+        steps = prompt_section(self.text, "STEPS", "ESCALATION")
+        self.assertIn("A push to -dev that is refused: fetch, rebase the unpushed commits, "
+                      "and push again, up to 3 rounds while git reports no conflict; a "
+                      "conflict in a rebase, or a refused push in the third round, is an "
+                      "escalation.", steps)
+        self.assertIn("A unit that cannot push its report commit also writes its report to "
+                      "~/ws/reviews/<project>/<ID>-report.md, and stops with the text of its "
+                      "report as its last message.", steps)
+        self.assertNotIn("once", self.text.split("\nSTEPS:", 1)[1])
 
     def test_role_holds_the_security_defect_rule_for_a_project_with_a_reference(self):
         # The prompt of a project with a reference carries each part of the rule on a

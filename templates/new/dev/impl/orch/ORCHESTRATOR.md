@@ -159,6 +159,12 @@ each other end gives the whole output of the wait, then the line
   change, start the watcher with the unit ID once more; when that wait also
   ends with no change, escalate.
 - A dialog, or a timeout, is an escalation.
+- A unit that waits at its input prompt with a commit that is not pushed:
+  `jig wait` ends with its own code and a line that says so, at a check with
+  no screen change, the input bar, no running turn, and a commit in the
+  worker's `-dev` clone or product clone that its upstream does not have.
+  Read its report with `jig cat @PROJECT@ <account> <ID>-report.md`, and
+  escalate; do not start `jig wait` on that unit again.
 
 ## Waiting on another project
 
@@ -174,6 +180,47 @@ supervisor appends a line `stall: <other> ...` to the event file, and a line
   `state.md` (`~/ws/src/<other>-dev/impl/orch/state.md`), read only, and tell
   Eric at once what blocks it and whose step it is.
 - A resumed line: nothing more.
+
+## The end of a turn
+
+An idle orchestrator is correct when it declares its wait; one that is idle
+in silence is the failure. Before you end a turn, check that one of these
+holds:
+
+- a unit or a batch runs, and the watcher runs with the ID of each running
+  unit;
+- you wait on purpose, because no work is ready, or the next step waits on
+  Eric or on another project; you told Eric so once, in one plain line; and
+  you wrote the waiting file for this wait;
+- you ran `jig orch @PROJECT@ rollover`.
+
+When none holds, do the next step.
+
+The waiting file is `~/ws/reviews/@PROJECT@/orch/waiting`: one line, the
+output of `date -Iseconds`, one space, and the reason of the wait in plain
+words, for example
+`2026-11-19T20:41:07-08:00 waits on Eric: the yes for the release`. For each
+new wait, write the file again, in place of the old line. The supervisor
+reads only its modification time: the file holds a wait when it was written
+after the last end of a unit, so a wait holds until the next unit runs or the
+supervisor restarts. When a wait follows a unit, write the file after the
+worker of that unit is closed. A wait on another project also has its line in
+the waits file (`jig orch @PROJECT@ wait-on`). `jig orch @PROJECT@ status`
+prints the line of the file as `waiting: <line>`.
+
+When no unit runs and the file holds no wait, the supervisor wakes you once
+for each idle period with the event
+`idle: no unit since <HH:MM>; start the next step, or write why you wait in ~/ws/reviews/@PROJECT@/orch/waiting`.
+`jig batch` appends a line to the event file when it refuses a batch file and
+when it exits.
+
+- An idle event: do the next step, or write the waiting file and tell Eric
+  once.
+- A line `batch: <batch file> refused: <reason>`: fix the batch file and start
+  the batch again, or tell Eric.
+- A line `batch: <batch file> ended: <exit code>`: read the tail of the output
+  file of the batch. When you still wait, write the waiting file again,
+  because each unit of the batch made the old file hold no wait.
 
 ## Running a batch
 
@@ -328,6 +375,10 @@ each move of `BRANCH` stays an owner block that Eric runs.
   first update: a summary of the last session and the next steps, which cites
   the commit of `handoff.md`.
 - End every response with `orch <ID>`.
+- A push to `-dev` that is refused: fetch, rebase your unpushed commits, and
+  push again, up to 3 rounds while git reports no conflict. A conflict in a
+  rebase, or a refused push in the third round, is an escalation. This rebase
+  rewrites nothing on origin.
 - Never force-push, rewrite history, or delete tags or releases.
 
 ## Escalation list

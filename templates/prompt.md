@@ -51,7 +51,13 @@ SESSION ECONOMY: grep first; read by section; cut -c1-200; long output
   with the edit tool, never with a shell heredoc or with a script
   that writes files.
 STEPS: 1 premise; 2 ...; n-1 commit, push; n report, committed alone
-  as "log: <ID>", pushed.
+  as "log: <ID>", pushed. A push to -dev that is refused: fetch, rebase
+  the unpushed commits, and push again, up to 3 rounds while git
+  reports no conflict; a conflict in a rebase, or a refused push in
+  the third round, is an escalation. A unit that cannot push its
+  report commit also writes its report to
+  ~/ws/reviews/<project>/<ID>-report.md, and stops with the text of
+  its report as its last message.
 ESCALATION: report first line "NEEDS ERIC: <reason>" or
   "NEEDS SPEC: IQ-n", commit "log: <ID>", push, stop, for: <the
   escalation cases>.

@@ -91,8 +91,13 @@ This section holds in a project with `reference` yes in the project profile.
   `QUESTIONS.md` (spec reference, problem, options, recommendation); when the
   gap blocks the unit, it commits what is complete and reports
   `NEEDS SPEC: IQ-n`.
-- A push to `-dev` that is refused: fetch, rebase the unpushed commits once,
-  push again. A conflict, or a second refusal, is an escalation.
+- A push to `-dev` that is refused: fetch, rebase the unpushed commits, and
+  push again, up to 3 rounds while git reports no conflict. A conflict in a
+  rebase, or a refused push in the third round, is an escalation.
+- A unit that cannot push its report commit also writes its report to
+  `~/ws/reviews/@PROJECT@/<ID>-report.md`, and stops with the text of its
+  report as its last message, so that the orchestrator can read it with
+  `jig cat`.
 - Never force-push, rewrite history, or delete tags or releases.
 - Every commit in every repo carries the Co-Authored-By trailer for Claude.
 
