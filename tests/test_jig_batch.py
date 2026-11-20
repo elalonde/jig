@@ -811,3 +811,75 @@ class BatchExpectedTest(BatchCase):
         result = self.finish(batch)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.calls(), ["start u1", "report u1", "close u1"])
+
+
+class BatchEventTest(BatchCase):
+    """The lines that jig batch appends to the orchestrator's event file. No supervisor
+    loop runs in these tests, so each line comes from jig batch itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.orch = self.home / "ws" / "reviews" / "jig" / "orch"
+        self.orch.mkdir(parents=True)
+        self.path = self.tmp / "batch.tsv"
+
+    def event_lines(self):
+        path = self.orch / "events.log"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def test_a_refused_batch_file_gives_one_refused_line_with_the_reason(self):
+        # The second row is malformed: nothing starts, and the one line holds the
+        # reason that the batch prints.
+        self.prompt("u2")
+        result = self.batch(self.row("u1"), "u2\t~/ws/prompts/jig/u2.md\t30")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.event_lines(), [
+            f"batch: {self.path} refused: {self.path} line 2: 3 columns, not 4 or 5"])
+
+    def test_a_tab_or_a_newline_in_a_field_becomes_a_space(self):
+        path = self.tmp / "two\tlines\n.tsv"
+        result = run([self.tree / "libexec" / "jig-batch", "jig", path], env=self.base_env())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        shown = str(path).replace("\t", " ").replace("\n", " ")
+        [line] = self.event_lines()
+        self.assertTrue(line.startswith(f"batch: {shown} refused: cannot read {shown}: "), line)
+
+    def test_a_batch_whose_rows_all_run_gives_one_line_ended_0(self):
+        result = self.batch(self.row("u1"), self.row("u2"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.event_lines(), [f"batch: {self.path} ended: 0"])
+
+    def test_a_batch_that_stops_gives_one_line_with_its_exit_code(self):
+        self.control("status-u1", "NEEDS_ERIC:_a_choice")
+        result = self.batch(self.row("u1"), self.row("u2"))
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self.event_lines(), [f"batch: {self.path} ended: 3"])
+
+    def test_sigterm_gives_one_line_ended_143(self):
+        # The batch is in the jig wait of its first row when SIGTERM comes: it ends the
+        # wait, exits 143 and says so in its one line.
+        self.control("sleep/wait-u1", "30")
+        self.path.write_text(self.row("u1") + "\n", encoding="utf-8")
+        env = self.base_env(DOUBLE_CLONE=str(self.seed), JIG_HOLD_DIR=str(self.hold_dir),
+                            JIG_BATCH_CLOSE_DELAY="0")
+        process = subprocess.Popen([self.tree / "libexec" / "jig-batch", "jig", self.path],
+                                   env=env, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        for _ in range(200):
+            if "wait u1" in self.calls():
+                break
+            time.sleep(0.05)
+        process.terminate()
+        self.assertEqual(process.wait(timeout=20), 143)
+        self.assertEqual(self.event_lines(), [f"batch: {self.path} ended: 143"])
+
+    def test_with_no_orch_directory_a_line_on_stderr_and_the_same_exit_code(self):
+        self.orch.rmdir()
+        result = self.batch(self.row("u1"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        [line] = result.stderr.splitlines()
+        self.assertIn(f"cannot append to {self.orch / 'events.log'}", line)
+        self.assertTrue(line.endswith(f"batch: {self.path} ended: 0"), line)
+        self.assertFalse(self.orch.exists())

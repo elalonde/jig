@@ -63,7 +63,16 @@ every kind, and n their number; it removes the file at exit. The hold file is
 
 jig start, jig wait, jig report and jig close run from the directory this file is in,
 so a batch never mixes in tools of the installed version. Each start, report, close,
-skip and stop writes one line with a timestamp to stdout. The exit codes:
+skip and stop writes one line with a timestamp to stdout.
+
+The batch also appends one line to the orchestrator's event file,
+~/ws/reviews/<project>/orch/events.log, so that its watcher wakes: "batch: <batch file>
+refused: <reason>" when it refuses the batch file or its start, with the reason it
+prints, and "batch: <batch file> ended: <exit code>" when it exits after it began, for
+any reason. SIGTERM, SIGHUP and SIGINT end it with 128 plus the number of the signal.
+A tab or a newline in a field becomes a space. It writes no line at its start or for a
+row, because the supervisor announces each report. When the directory is missing or
+the write fails, a line on stderr says so and the exit code stays. The exit codes:
 
   0  every row reported OK or was skipped
   1  a refusal before the first start: the batch file, a prompt, the conf file or a setting
@@ -159,6 +168,10 @@ CLOSE_DELAY_SECONDS = 600.0
 # A jig wait that is ended for a close gets this long to exit with its git and ssh
 # children before they are killed outright.
 END_GRACE_SECONDS = 10.0
+# The signals that end a batch with the exit code 128 plus their number.
+END_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+# The event file under ~/ws/reviews/<project>/orch/, which jig orch also appends to.
+EVENTS_FILE = "events.log"
 
 
 class Stop(Exception):
@@ -563,14 +576,40 @@ def on_signal(number, _frame):
     raise SystemExit(128 + number)
 
 
-def main(argv):
-    args = parse_args(argv)
+def one_line(text):
+    return str(text).replace("\t", " ").replace("\n", " ")
+
+
+def announce(project, line):
+    """Append one line to the event file that the orchestrator's watcher reads.
+
+    The batch writes it itself, in one write to a file opened for appending, so that the
+    line arrives also when no supervisor loop runs, and a line that the loop appends at
+    the same time is not mixed into it. A failure costs one line on stderr and changes
+    no exit code: the output file of the batch still holds the stop.
+    """
+    path = pathlib.Path.home() / "ws" / "reviews" / project / "orch" / EVENTS_FILE
+    data = f"{line}\n".encode("utf-8")
     try:
-        batch = Batch(args.project, read_batch(args.project, args.batch_file))
-    except Stop as refused:
-        print(f"jig batch: refused: {refused.text}", file=sys.stderr)
-        return refused.code
-    signal.signal(signal.SIGTERM, on_signal)
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            if os.write(descriptor, data) != len(data):
+                raise OSError(0, "the line was written only in part")
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        print(f"jig batch: cannot append to {path} ({error.strerror or error}): {line}",
+              file=sys.stderr, flush=True)
+
+
+def exit_code(code):
+    """The exit code that Python gives for the code of a SystemExit."""
+    if code is None:
+        return DONE
+    return code if isinstance(code, int) else REFUSED
+
+
+def run_batch(batch):
     stop = None
     try:
         try:
@@ -586,6 +625,35 @@ def main(argv):
         say("done: every row reported OK or was skipped")
         return DONE
     return stop.code
+
+
+def main(argv):
+    args = parse_args(argv)
+    # The orchestrator learns of a refusal or an exit only from the event file: the
+    # output file of a detached batch wakes nobody.
+    shown = one_line(args.batch_file)
+    try:
+        batch = Batch(args.project, read_batch(args.project, args.batch_file))
+    except Stop as refused:
+        print(f"jig batch: refused: {refused.text}", file=sys.stderr)
+        announce(args.project, f"batch: {shown} refused: {one_line(refused.text)}")
+        return refused.code
+    for number in END_SIGNALS:
+        signal.signal(number, on_signal)
+    # An exception that ends Python makes it exit 1.
+    code = REFUSED
+    try:
+        code = run_batch(batch)
+        return code
+    except SystemExit as leaving:
+        code = exit_code(leaving.code)
+        raise
+    finally:
+        # A second signal must not cut the line short or end the batch with another
+        # code than the line gives.
+        for number in END_SIGNALS:
+            signal.signal(number, signal.SIG_IGN)
+        announce(args.project, f"batch: {shown} ended: {code}")
 
 
 if __name__ == "__main__":
