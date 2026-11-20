@@ -744,11 +744,26 @@ class ReportSpecWriterCopyTest(UnitVectorCase):
         implementer = COPIER_PROMPT_LINE.replace("specwriter", "implementer")
         before = self.records({prompt: f"{implementer}\nThe copy.\n"})
         self.refused_with(before, "names no spec writer account")
-        # With the right prompt copy, a conf that gives the role to another account still
-        # refuses; a conf with no such key counts the default account, and the copy passes.
-        before = self.records({prompt: f"{COPIER_PROMPT_LINE}\nThe copy.\n"})
+        # With the right prompt copy and the conf file as jig new writes it, which gives
+        # the role to specwriter, the copy passes: this is the path of every project.
+        self.records({prompt: f"{COPIER_PROMPT_LINE}\nThe copy.\n"})
+        self.write_conf(self.home)
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.origin_subjects()[0], "report: demo")
+        # The unit amends its report with a second log commit, so each run below checks
+        # the copy again instead of finding the report filled already. A conf that gives
+        # the role to another account refuses; a conf with no such key counts the
+        # default account, and the copy passes.
+        before = self.push_report(report_text(status="OK: done again"))
         self.write_conf(self.home, SPEC_ACCOUNT="writer")
-        self.refused_with(before, "names no spec writer account")
+        result = self.report()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refused: vectors:", result.stderr)
+        self.assertIn("changes tests/vectors/a.bin", result.stderr)
+        self.assertIn("names no spec writer account", result.stderr)
+        self.assertEqual(self.origin_head(), before)
+        self.assertEqual(self.origin_subjects()[0], "log: demo")
         conf = self.home / ".config" / "jig" / "jig.conf"
         conf.write_text("".join(entry for entry in conf.read_text(encoding="utf-8")
                                 .splitlines(keepends=True)
