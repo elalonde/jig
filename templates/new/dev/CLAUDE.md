@@ -148,7 +148,8 @@ rule to the code is the trace in the `-dev` repo.
 
 Every commit message in the product is written for the reader of the
 comment standard: a competent maintainer who has never seen the specs,
-the process or the `-dev` repo. The history of the product is public.
+the process or the `-dev` repo. The history of the product is written
+for a public reader, because a private product can become public later.
 
 - a. The subject says what the commit changes, in the imperative ("Add",
   "Fix", "Read"), in at most 72 characters, with no period at the end.

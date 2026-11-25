@@ -917,7 +917,9 @@ class JigNewTest(JigNewCase):
     def test_made_claude_md_has_the_commit_message_standard_after_the_comment_standard(self):
         # A new project's CLAUDE.md holds the commit message rules a to e in full, in
         # the section right after the comment rules, because the implementer's prompt
-        # names that section and jig validate prompt refuses one that does not.
+        # names that section and jig validate prompt refuses one that does not. Its
+        # opening says that the history is written for a public reader, which holds
+        # for a private product too, and no longer that the history is public.
         self.made()
         text = (self.home / "ws/src/demo-dev/CLAUDE.md").read_text(encoding="utf-8")
         headings = [line for line in text.splitlines() if line.startswith("## ")]
@@ -929,7 +931,9 @@ class JigNewTest(JigNewCase):
         self.assertTrue(flat.startswith(
             "Every commit message in the product is written for the reader of the comment "
             "standard: a competent maintainer who has never seen the specs, the process or "
-            "the `-dev` repo. The history of the product is public."), flat)
+            "the `-dev` repo. The history of the product is written for a public reader, "
+            "because a private product can become public later."), flat)
+        self.assertNotIn("The history of the product is public.", flat)
         for rule in (
                 "- a. The subject says what the commit changes, in the imperative (\"Add\", "
                 "\"Fix\", \"Read\"), in at most 72 characters, with no period at the end.",
