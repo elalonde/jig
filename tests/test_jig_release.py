@@ -645,13 +645,24 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
     the download URLs of the files, the repository, which hides itself from a request with
     no login while it is private, and the badge of the workflow ci.yml. Every request is
     kept with the Authorization header it carried.
+
+    While private is set, a request with no login finds no release and no download URL,
+    as on GitHub. The release asset API serves each file to the token, with the file
+    itself or with a redirect to a storage address, as asset_answer says. The storage
+    address refuses any request that carries a login, and the runs of ci.yml are served
+    from runs. repo_answer turns the answer about the repository into an HTTP error, a
+    body that is not JSON, one with no field private, or a redirect.
     """
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), FakeGitHubHandler)
         self.releases = {}
         self.files = {}
+        self.assets = {}
         self.private = False
+        self.asset_answer = "redirect"
+        self.repo_answer = None
+        self.runs = []
         self.badge = BADGE_PASSING
         self.uploads_left = None
         self.requests = []
@@ -670,11 +681,17 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
     def add_file(self, tag, name, data):
         path = f"/{SLUG}/releases/download/{tag}/{name}"
         self.files[path] = data
-        self.releases[tag]["assets"].append({"name": name,
+        number = len(self.assets) + 1
+        self.assets[number] = path
+        self.releases[tag]["assets"].append({"name": name, "id": number,
                                              "browser_download_url": self.url + path})
 
     def posts(self):
         return [path for method, path, _ in self.requests if method == "POST"]
+
+    def asked(self, part, since=0):
+        """Return the logins of the requests since that index whose path holds part."""
+        return [login for _, path, login in self.requests[since:] if part in path]
 
 
 class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
@@ -695,24 +712,70 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
         hub.requests.append(("GET", self.path, login))
         parsed = urllib.parse.urlparse(self.path)
         release_prefix = f"/repos/{SLUG}/releases/tags/"
+        asset_prefix = f"/repos/{SLUG}/releases/assets/"
+        hidden = hub.private and login is None
         if parsed.path.startswith(release_prefix):
             release = hub.releases.get(parsed.path[len(release_prefix):])
-            if release is None:
+            if release is None or hidden:
                 self.send_error(404)
             else:
                 self.answer(200, release)
+        elif parsed.path.startswith(asset_prefix):
+            self.asset(parsed.path[len(asset_prefix):], login)
+        elif parsed.path.startswith("/storage/"):
+            # Like the storage that GitHub redirects to: a second login is refused.
+            path = hub.assets.get(int(parsed.path.split("/")[2]))
+            if login is not None:
+                self.send_error(400)
+            else:
+                self.answer(200, hub.files[path], "application/octet-stream")
         elif parsed.path == f"/repos/{SLUG}":
-            if hub.private and login is None:
+            self.repo(hidden)
+        elif parsed.path == f"/repos/{SLUG}/actions/workflows/ci.yml/runs":
+            if login != f"Bearer {TOKEN}" or \
+                    parsed.query != "branch=master&status=completed&per_page=1":
                 self.send_error(404)
             else:
-                self.answer(200, {"full_name": SLUG, "private": hub.private})
-        elif parsed.path in hub.files:
+                self.answer(200, {"total_count": len(hub.runs), "workflow_runs": hub.runs})
+        elif parsed.path in hub.files and not hidden:
             self.answer(200, hub.files[parsed.path], "application/octet-stream")
         elif parsed.path == f"/{SLUG}/actions/workflows/ci.yml/badge.svg" \
                 and parsed.query == "branch=master":
             self.answer(200, hub.badge.encode(), "image/svg+xml")
         else:
             self.send_error(404)
+
+    def asset(self, number, login):
+        hub = self.server
+        path = hub.assets.get(int(number)) if number.isdigit() else None
+        if path is None or login != f"Bearer {TOKEN}":
+            self.send_error(404)
+        elif self.headers.get("Accept") != "application/octet-stream":
+            # GitHub answers with the asset's description unless the file is asked for.
+            self.answer(200, {"id": int(number), "name": path.rsplit("/", 1)[1]})
+        elif hub.asset_answer == "direct":
+            self.answer(200, hub.files[path], "application/octet-stream")
+        else:
+            self.send_response(302)
+            self.send_header("Location", f"{hub.url}/storage/{number}?signature=fixture")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def repo(self, hidden):
+        hub = self.server
+        if hidden or hub.repo_answer == "error":
+            self.send_error(404 if hidden else 500)
+        elif hub.repo_answer == "text":
+            self.answer(200, b"<html>not json</html>", "text/html")
+        elif hub.repo_answer == "no field":
+            self.answer(200, {"full_name": SLUG})
+        elif hub.repo_answer == "moved":
+            self.send_response(301)
+            self.send_header("Location", f"{hub.url}/moved/{SLUG}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.answer(200, {"full_name": SLUG, "private": hub.private})
 
     def do_POST(self):
         hub = self.server
@@ -817,6 +880,14 @@ class PublishCase(ReleaseCase):
         self.assertIn(f"publish failed at {step}: ", lines[0])
         self.assertIn(reason, lines[0])
 
+    def assert_verify_failed_at(self, step, reason):
+        """verify of 0.7.0 exits 1 with one line naming the step and the reason."""
+        code, _, err = result = self.release("verify", "0.7.0")
+        self.assertEqual(code, 1, result)
+        self.assertEqual(len(err.splitlines()), 1, result)
+        self.assertIn(f"verify failed at {step}: ", err)
+        self.assertIn(reason, err)
+
     def assert_untouched(self, before):
         """Neither origin, neither clone's tags and GitHub saw any change."""
         self.assertEqual(self.all_refs(), before)
@@ -828,11 +899,17 @@ class PublishPassTest(PublishCase):
         # A staged 0.7.0 on a line that master trails in both repos: publish exits 0,
         # each origin has the annotated tag at its line's head and master at that head,
         # the release holds the staged files and their sums, the readback carried no
-        # login, and neither clone's git config changed.
+        # login, and neither clone's git config changed. The repo is public, and publish
+        # says so before its first action.
         configs = [self.git("-C", clone, "config", "--local", "--list")
                    for clone in (self.product, self.dev)]
         result = self.release("publish")
         self.assertEqual(result[0], 0, result)
+        out = result[1]
+        self.assertLess(out.index(f"the repo {SLUG} is public\n"),
+                        out.index("publish 6/11: the tag in the product\n"))
+        self.assertIn("files of the release match the staged files, read with no login\n"
+                      "jig release: publish 10/11", out)
         self.assertEqual(self.tag_target(self.origin), self.release_commit)
         self.assertEqual(self.tag_target(self.dev_origin), self.dev_line)
         for bare in (self.origin, self.dev_origin):
@@ -847,20 +924,79 @@ class PublishPassTest(PublishCase):
         self.assertIn(None, readback)
         downloads = [login for _, path, login in self.hub.requests if "/download/" in path]
         self.assertEqual(set(downloads), {None})
+        last_upload = max(number for number, (method, _, _) in enumerate(self.hub.requests)
+                          if method == "POST")
+        self.assertEqual(set(self.hub.asked("/", last_upload + 1)), {None})
+        self.assertEqual(self.hub.asked("/releases/assets/"), [])
         self.assertEqual([self.git("-C", clone, "config", "--local", "--list")
                           for clone in (self.product, self.dev)], configs)
         for number, name in enumerate(("the staged release", "SHA256SUMS of the staged files",
                                        "the release commit",
-                                       "the merge to master can fast-forward"), 1):
-            self.assertIn(f"publish {number}/10: {name}\n", result[1])
+                                       "the merge to master can fast-forward",
+                                       "the visibility"), 1):
+            self.assertIn(f"publish {number}/11: {name}\n", out)
+        self.assertIn("publish 9/11: the readback\n", out)
+
+    def test_a_private_repo_publishes_and_verifies_with_the_token(self):
+        # The repo is private, so its download URLs and its badge answer no request with
+        # no login, and the release asset API redirects to a storage address that
+        # refuses the token. publish says the repo is private before its first action,
+        # reads each file back through the asset API with the token, follows each
+        # redirect with no login, and touches no download URL. A second publish finds
+        # every file on the release with the staged hash, read the same way, and
+        # uploads nothing. verify then passes when the newest completed run of ci.yml on
+        # master succeeded, and does not fail at the visibility; a run that failed fails
+        # it with its ID, commit and conclusion in the line, and no run fails it too.
+        self.hub.private = True
+        self.hub.runs = [{"id": 41, "head_sha": self.release_commit, "status": "completed",
+                          "conclusion": "success"}]
+        result = self.release("publish")
+        self.assertEqual(result[0], 0, result)
+        out = result[1]
+        self.assertLess(out.index(f"the repo {SLUG} is private\n"),
+                        out.index("publish 6/11: the tag in the product\n"))
+        self.assertIn("the 3 files of the release match the staged files, read with the "
+                      "token\n", out)
+        self.assertEqual(self.hub_files(), self.staged_bytes())
+        self.assertEqual(self.master(self.origin), self.release_commit)
+        self.assertEqual(self.hub.asked("/download/"), [])
+        self.assertEqual(set(self.hub.asked("/releases/assets/")), {f"Bearer {TOKEN}"})
+        self.assertEqual(set(self.hub.asked("/storage/")), {None})
+        self.assertEqual(len(self.hub.asked("/storage/")), 3)
+        seen = len(self.hub.requests)
+        posts = len(self.hub.posts())
+        again = self.release("publish")
+        self.assertEqual(again[0], 0, again)
+        self.assertEqual(len(self.hub.posts()), posts)
+        self.assertIn("3 files are on the release already with the staged hashes", again[1])
+        self.assertEqual(len(self.hub.asked("/releases/assets/", seen)), 6)
+        self.assertEqual(self.hub.asked("/download/", seen), [])
+        verified = self.release("verify", "0.7.0")
+        self.assertEqual(verified[0], 0, verified)
+        self.assertIn(f"the repo {SLUG} is private\n", verified[1])
+        self.assertIn("read with the token\n", verified[1])
+        self.assertEqual(self.hub.asked("/download/"), [])
+        self.assertEqual(self.hub.asked("/badge.svg"), [])
+        self.hub.runs[0]["conclusion"] = "failure"
+        self.assert_verify_failed_at(
+            "the CI state of master",
+            f"run 41 of ci.yml on master, at the commit {self.release_commit}, has the "
+            f"conclusion failure")
+        self.hub.runs = []
+        self.assert_verify_failed_at("the CI state of master",
+                                     "ci.yml has no completed run on master")
 
     def test_dry_run_changes_nothing_and_prints_each_action(self):
-        # The same state with --dry-run: exit 0, every action says what it would do, and
-        # no ref on either origin or clone moved and GitHub got no write.
+        # The same state with --dry-run: exit 0, the visibility is read and printed, every
+        # action says what it would do, and no ref on either origin or clone moved and
+        # GitHub got no write.
         before = self.all_refs()
         result = self.release("publish", "--dry-run")
         self.assertEqual(result[0], 0, result)
         self.assert_untouched(before)
+        self.assertIn(f"the repo {SLUG} is public\n", result[1])
+        self.assertIn("would read the release v0.7.0 and its files back with no login",
+                      result[1])
         self.assertEqual(result[1].count("would make and push the annotated tag"), 2)
         for text in (f"would make the release {TAG}", "would upload SHA256SUMS",
                      "would read the release", "would push"):
@@ -1007,6 +1143,23 @@ class PublishFailTest(PublishCase):
                                       "the merge to master can fast-forward", "master of -dev")
         self.assert_untouched(before)
 
+    def test_a_visibility_that_cannot_be_read_stops_publish_before_the_tag(self):
+        # The repo is private, and its visibility cannot be read: the API answers with
+        # an HTTP error, with a body that is not JSON, or with no field private. Each
+        # time publish exits 1 at the visibility with one line that names the repo and
+        # the reason, and neither origin got a tag, GitHub got no write and nothing was
+        # pushed.
+        self.hub.private = True
+        before = self.all_refs()
+        for answer, reason in (("error", "HTTP 500"), ("text", "did not answer with JSON"),
+                               ("no field", "is not true or false")):
+            with self.subTest(answer=answer):
+                self.hub.repo_answer = answer
+                result = self.release("publish")
+                self.assert_publish_failed_at(result, "the visibility", reason)
+                self.assertIn(f"the visibility of the repo {SLUG}: ", result[2])
+                self.assert_untouched(before)
+
     def test_a_tag_that_exists_at_another_commit_is_refused(self):
         # v0.7.0 is on the product's origin already, at a commit off the line: publish
         # refuses it, and tags nothing in -dev, makes no release and merges nothing.
@@ -1042,8 +1195,8 @@ class PublishFailTest(PublishCase):
 
         self.hub.add_file = add_changed.__get__(self.hub)
         result = self.release("publish")
-        self.assert_publish_failed_at(result, "the readback with no login",
-                                      "differs from the staged file")
+        self.assert_publish_failed_at(result, "the readback",
+                                      "read with no login, differs from the staged file")
         self.assertNotEqual(self.master(self.origin), self.release_commit)
 
     def test_a_master_whose_tree_differs_after_the_push_fails_the_merge_check(self):
@@ -1066,22 +1219,22 @@ class VerifyTest(PublishCase):
         self.assertEqual(published[0], 0, published)
         self.seen = len(self.hub.requests)
 
-    def test_verify_passes_after_a_publish_with_no_login(self):
-        # Right after a publish every check passes, and no request of verify carried a
-        # login.
+    def test_verify_of_a_public_repo_reads_only_the_visibility_with_the_token(self):
+        # Right after a publish on a public repo every step passes, in the order the
+        # visibility, the files, the tag and the CI state of master, and the read of the
+        # visibility is the only request of verify with a login. Then, with the token
+        # file gone, verify of the same release fails at the visibility with one line,
+        # because it needs the token on a public repo too.
         result = self.release("verify", "0.7.0")
         self.assertEqual(result[0], 0, result)
-        for number, name in enumerate(("the published files", "the tag",
-                                       "the repo is public", "the badge"), 1):
+        for number, name in enumerate(("the visibility", "the published files", "the tag",
+                                       "the CI state of master"), 1):
             self.assertIn(f"verify {number}/4: {name}\n", result[1])
-        self.assertEqual({login for _, _, login in self.hub.requests[self.seen:]}, {None})
-
-    def assert_verify_failed_at(self, step, reason):
-        code, _, err = result = self.release("verify", "0.7.0")
-        self.assertEqual(code, 1, result)
-        self.assertEqual(len(err.splitlines()), 1, result)
-        self.assertIn(f"verify failed at {step}: ", err)
-        self.assertIn(reason, err)
+        self.assertIn(f"the repo {SLUG} is public\n", result[1])
+        with_login = [path for _, path, login in self.hub.requests[self.seen:] if login]
+        self.assertEqual(with_login, [f"/repos/{SLUG}"])
+        (self.home / ".config" / "jig" / f"{PROJECT}-token").unlink()
+        self.assert_verify_failed_at("the visibility", "cannot read the token file")
 
     def test_a_published_file_that_differs_from_the_staged_file_fails_verify(self):
         # The download of SHA256SUMS serves other bytes than the staged file.
@@ -1096,15 +1249,85 @@ class VerifyTest(PublishCase):
                  f"{self.release_commit}^")
         self.assert_verify_failed_at("the tag", "does not point at the release commit")
 
-    def test_a_private_repo_fails_verify(self):
-        # The repository answers only with a login: verify fails at the public check.
-        self.hub.private = True
-        self.assert_verify_failed_at("the repo is public", "is not public")
-
     def test_a_badge_that_does_not_read_passing_fails_verify(self):
-        # The badge of ci.yml on master reads failing.
+        # On a public repo the badge of ci.yml on master reads failing.
         self.hub.badge = BADGE_FAILING
-        self.assert_verify_failed_at("the badge", "does not read passing")
+        self.assert_verify_failed_at("the CI state of master", "does not read passing")
+
+
+@unittest.skipUnless(loopback_works(), "no loopback network for the fake API")
+class PrivateReadTest(unittest.TestCase):
+    """The reads of a private release, run in this process against the fake GitHub.
+
+    The release v0.7.0 holds the two staged files, and the repo is private, so each
+    file can be read only through the release asset API with the token.
+    """
+
+    def setUp(self):
+        self.hub = FakeGitHub()
+        threading.Thread(target=self.hub.serve_forever, args=(0.05,), daemon=True).start()
+        self.addCleanup(self.hub.server_close)
+        self.addCleanup(self.hub.shutdown)
+        self.hub.private = True
+        self.hub.make_release(TAG)
+        for name, data in sorted(STAGED.items()):
+            self.hub.add_file(TAG, name, data)
+        self.staged = {name: hashlib.sha256(data).hexdigest() for name, data in STAGED.items()}
+
+    def read_back(self):
+        return release.read_back(self.hub.url, SLUG, TAG, self.staged, TOKEN)
+
+    def test_a_file_served_directly_and_one_served_by_a_redirect_are_both_read(self):
+        # The asset API answers once with the file itself and once with a redirect to
+        # the storage: both give the file's bytes, and the storage got no login.
+        for answer in ("direct", "redirect"):
+            with self.subTest(answer=answer):
+                self.hub.asset_answer = answer
+                self.assertEqual(release.read_release_file(self.hub.url, SLUG, 1, TOKEN),
+                                 self.hub.files[self.hub.assets[1]])
+        self.assertEqual(self.hub.asked("/storage/"), [None])
+
+    def test_a_readback_with_the_staged_files_passes_with_the_token_alone(self):
+        # The staged files match the release: the readback passes and names the token,
+        # every request to the API carried it, and no download URL was asked.
+        self.assertEqual(self.read_back(),
+                         "the 2 files of the release match the staged files, read with "
+                         "the token")
+        self.assertEqual(set(self.hub.asked(f"/repos/{SLUG}/")), {f"Bearer {TOKEN}"})
+        self.assertEqual(self.hub.asked("/download/"), [])
+
+    def test_a_file_with_another_hash_fails_the_readback(self):
+        # The release holds other bytes for the package than the staged file.
+        self.hub.files[self.hub.assets[1]] = b"other bytes\n"
+        with self.assertRaisesRegex(release.StepFailed, "read with the token, differs"):
+            self.read_back()
+
+    def test_a_file_missing_from_the_release_fails_the_readback(self):
+        # The release lacks one of the staged files.
+        self.hub.releases[TAG]["assets"].pop()
+        with self.assertRaisesRegex(release.StepFailed, "holds .*, the staging directory"):
+            self.read_back()
+
+    def test_a_redirect_of_a_request_with_the_token_is_not_followed(self):
+        # The API answers the read of the visibility with a redirect elsewhere: the read
+        # fails and names the redirect, and its target got no request at all.
+        self.hub.repo_answer = "moved"
+        with self.assertRaisesRegex(release.StepFailed, "does not follow"):
+            release.read_visibility(self.hub.url, SLUG, TOKEN)
+        self.assertEqual(self.hub.asked("/moved/"), [])
+
+    def test_the_visibility_reads_true_and_false_with_the_token(self):
+        # A private repo reads True, which needs the token, and a public one False.
+        self.assertIs(release.read_visibility(self.hub.url, SLUG, TOKEN), True)
+        self.hub.private = False
+        self.assertIs(release.read_visibility(self.hub.url, SLUG, TOKEN), False)
+        self.assertEqual(set(self.hub.asked(f"/repos/{SLUG}")), {f"Bearer {TOKEN}"})
+
+    def test_an_asset_id_that_is_not_a_number_is_refused_before_any_request(self):
+        # A file list whose ID would change the path that the token is sent to.
+        listed = {"assets": [{"name": "demo-0.7.0.tar.gz", "id": "1/../../../elsewhere"}]}
+        with self.assertRaisesRegex(release.StepFailed, "asset ID"):
+            release.asset_names(listed, private=True)
 
 
 class UsageTest(TempTestCase):

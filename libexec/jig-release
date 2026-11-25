@@ -75,7 +75,7 @@ the -dev commits after the tag v<X.Y.Z> of the previous release; when the line h
 release yet, those added in the commits of origin/<line> that origin/master does not
 hold. The output of the commands goes to ~/ws/reviews/<project>/release/<X.Y.Z>-prepare.txt.
 
-publish puts the staged release on GitHub. It runs four checks, and then the actions;
+publish puts the staged release on GitHub. It runs five checks, and then the actions;
 each prints its name, and the first that fails prints one line on stderr with the step
 and the reason, and publish exits 1.
 
@@ -90,13 +90,29 @@ and the reason, and publish exits 1.
     head of origin/<line> of the -dev clone.
   the merge to master can fast-forward: in each repo, master on origin is an ancestor
     of the line's commit, so that no action runs when the merge would be refused.
+  the visibility: the field private of GET /repos/<owner>/<repo>, read with the token,
+    prints "the repo <owner>/<repo> is public" for false and "... is private" for true.
+    When the token file cannot be read, the API answers with an HTTP error or with no
+    JSON, or the field is not true or false, publish stops here, before its first
+    action, so that no tag is pushed for a release whose files it could not read
+    back. --dry-run reads and prints it too.
   the actions: the annotated tag v<X.Y.Z> at the release commit in the product and at
     the -dev commit in -dev; the GitHub release of that tag with the staged files and
-    SHA256SUMS; the readback of the release by tag and of each file from its download
-    URL, with no login, compared with the staged files by name and hash; and the push
+    SHA256SUMS; the readback, which reads the release by its tag and each of its
+    files, compares them with the staged files by name and hash, and names in its
+    last line the way it read them, "with no login" or "with the token"; and the push
     of the line's commit to master in the product and then in -dev, which git refuses
     unless it is a fast-forward, each followed by the merge check: after a new fetch,
     the tree of master equals the tree of the line's commit.
+
+A release file is read in one of two ways, by the visibility. On a public repo, the
+release by its tag and each file from its download URL, with no login at all. On a
+private repo, where those need a login, the release by its tag through the API with the
+token, and each file through GET /repos/<owner>/<repo>/releases/assets/<asset ID> with
+the token and "Accept: application/octet-stream". That request is answered with the
+file, or with a redirect to it; publish takes the file from either answer, and follows
+the redirect with no login. This holds for the readback and for the check of the files
+that a rerun finds on the release, and verify reads its files the same way.
 
 A rerun after a publish that stopped partway is safe: an action whose result exists
 already and matches passes without acting, and one whose result differs fails. A tag
@@ -108,15 +124,34 @@ would do, and changes nothing on GitHub or on either origin.
 
 The product pushes go to the product clone's push URL, which tools/push-on-token.sh
 points at the token; the -dev pushes go to the -dev clone's origin, on its deploy key.
-publish changes no git config of either clone. The GitHub calls that write use the
-token file ~/.config/jig/<project>-token. The API base is JIG_GITHUB_API
-(https://api.github.com unless set) and the web base is JIG_GITHUB_WEB
-(https://github.com unless set); owner and repo come from the product's origin URL.
+publish changes no git config of either clone. The GitHub calls that write, the read of
+the visibility and every read of a private repo use the token file
+~/.config/jig/<project>-token. The token goes only to addresses that the tool builds
+from the API base, never to one that an answer names, and a request with the token
+never follows a redirect, because the request after a redirect would carry the token to
+the host that the redirect names. The uploads go to the upload URL of the release, as
+GitHub gives it. The API base is JIG_GITHUB_API (https://api.github.com unless set) and
+the web base is JIG_GITHUB_WEB (https://github.com unless set); owner and repo come from
+the product's origin URL.
 
-verify <version> checks, with no login, that the published files equal the staged files
-by hash, that the tag v<version> on the product's origin points at the release commit of
-that version (its subject, VERSION and top change log entry, as above), that the repo is
-public, and that the status badge of the workflow ci.yml on master reads passing.
+verify <version> runs four steps in this order, and fails at the first that does not
+pass:
+
+  the visibility: read and printed as in publish. It fails only when it cannot be read;
+    a private repo passes. verify reads it with the token on a public repo too, so it
+    needs the token file ~/.config/jig/<project>-token on both kinds of repo, where up
+    to 0.10.3 it needed none.
+  the published files: the files of the release, read by the way of the visibility,
+    equal the staged files by name and hash.
+  the tag: the tag v<version> on the product's origin points at the release commit of
+    that version (its subject, VERSION and top change log entry, as above).
+  the CI state of master: on a public repo, the status badge of the workflow ci.yml on
+    master, read with no login, reads passing. On a private repo the badge cannot be
+    read with no login, so the newest run of ci.yml on master with the status completed
+    must have the conclusion success; the badge reports that same run. It is read with
+    the token from GET /repos/<owner>/<repo>/actions/workflows/ci.yml/runs with the
+    query branch=master&status=completed&per_page=1. Another conclusion fails with the
+    run's ID, its commit and its conclusion, and no such run fails too.
 
 Every command exits 0 when every step passes, 1 when one fails, 2 on a usage error.
 """
@@ -749,20 +784,56 @@ def origin_slug(clone):
     return match.group(1)
 
 
-def http(url, token=None, data=None, content_type=None, method=None):
-    """Return the body of a request; with no token the request carries no login at all."""
+class Redirected(StepFailed):
+    """A request with the token was answered with a redirect, which it does not follow."""
+
+    def __init__(self, message, location):
+        super().__init__(message)
+        self.location = location
+
+
+class KeepRedirects(urllib.request.HTTPRedirectHandler):
+    """Hand a redirect back to the caller as an HTTP error instead of following it.
+
+    urllib copies the headers of a request into the request that follows a redirect,
+    the Authorization header among them, so a request with the token that followed a
+    redirect would send the token to whatever host the redirect names.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+WITH_TOKEN = urllib.request.build_opener(KeepRedirects)
+
+
+def http(url, token=None, data=None, content_type=None, method=None, accept=None):
+    """Return the body of a request; with no token the request carries no login at all.
+
+    A request with the token raises Redirected on a redirect, with its target.
+    """
     headers = {}
     if token is not None:
         headers = {"Accept": "application/vnd.github+json",
                    "Authorization": f"Bearer {token}",
                    "X-GitHub-Api-Version": "2022-11-28"}
+    if accept:
+        headers["Accept"] = accept
     if content_type:
         headers["Content-Type"] = content_type
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = WITH_TOKEN.open if token is not None else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        with opener(request, timeout=HTTP_TIMEOUT) as response:
             return response.read()
     except urllib.error.HTTPError as error:
+        location = error.headers.get("Location") if error.headers else None
+        if token is not None and error.code in REDIRECT_CODES and location:
+            target = urllib.parse.urljoin(url, location)
+            raise Redirected(f"{method or 'GET'} {url}: HTTP {error.code} to {target}, "
+                             f"which a request with the token does not follow",
+                             target) from None
         raise StepFailed(f"{method or 'GET'} {url}: HTTP {error.code}") from None
     except (urllib.error.URLError, OSError) as error:
         raise StepFailed(f"{method or 'GET'} {url}: {error}") from None
@@ -786,12 +857,100 @@ def missing_is_none(call):
         raise
 
 
-def asset_names(release):
+def read_token(project):
+    """Return the project's token, or fail the step with the reason it cannot be read."""
+    path = pathlib.Path(os.path.expanduser(f"~/.config/jig/{project}-token"))
     try:
-        return {asset["name"]: asset["browser_download_url"]
-                for asset in release.get("assets") or []}
+        token = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as error:
+        reason = getattr(error, "strerror", None) or "it is not text"
+        raise StepFailed(f"cannot read the token file {path}: {reason}") from None
+    if not token:
+        raise StepFailed(f"the token file {path} is empty")
+    return token
+
+
+def read_visibility(api, slug, token):
+    """Return True when the repo is private and False when it is public."""
+    url = f"{api}/repos/{slug}"
+    repo = http_json(url, token=token)
+    private = repo.get("private") if isinstance(repo, dict) else None
+    if not isinstance(private, bool):
+        raise StepFailed(f"the field private of {url} is not true or false")
+    return private
+
+
+def asset_names(release, private):
+    """Return {name: where to read the file} of a release's files.
+
+    That is the download URL on a public repo, and the asset ID on a private one, where
+    the download URL needs a login that only the browser has.
+    """
+    key = "id" if private else "browser_download_url"
+    try:
+        found = {asset["name"]: asset[key] for asset in release.get("assets") or []}
     except (KeyError, TypeError, AttributeError):
-        raise StepFailed("the release's file list has no name or download URL") from None
+        found = None
+    # The asset ID becomes part of an address that carries the token, so only a number
+    # may go there: anything else could turn the request towards another path.
+    if found is None or (private and not all(type(value) is int for value in found.values())):
+        what = "asset ID" if private else "download URL"
+        raise StepFailed(f"the release's file list has no name or {what} for each file")
+    return found
+
+
+def read_release_file(api, slug, where, token):
+    """Return the bytes of one release file; token is None on a public repo.
+
+    On a private repo the release asset API answers with the file itself or with a
+    redirect to it. The redirect is followed with no login, so that the token never
+    leaves the API base.
+    """
+    if token is None:
+        return http(where)
+    url = f"{api}/repos/{slug}/releases/assets/{where}"
+    try:
+        return http(url, token=token, accept="application/octet-stream")
+    except Redirected as moved:
+        return http(moved.location)
+
+
+def read_back(api, slug, tag, staged, token):
+    """Compare a release with the staged files by name and hash; token is None if public.
+
+    Returns the line that names the way the files were read.
+    """
+    way = "with no login" if token is None else "with the token"
+    url = f"{api}/repos/{slug}/releases/tags/{urllib.parse.quote(tag)}"
+    published = asset_names(http_json(url, token=token), private=token is not None)
+    if set(published) != set(staged):
+        raise StepFailed(f"the release {tag}, read {way}, holds {sorted(published)}, "
+                         f"the staging directory {sorted(staged)}")
+    for name, where in sorted(published.items()):
+        if hashlib.sha256(read_release_file(api, slug, where, token)).hexdigest() \
+                != staged[name]:
+            raise StepFailed(f"{name}, read {way}, differs from the staged file")
+    return f"the {len(published)} files of the release match the staged files, read {way}"
+
+
+def master_run(api, slug, token):
+    """Return (passed, line) for the newest completed run of ci.yml on master.
+
+    This is the run that the status badge reports, which a private repo shows to no
+    reader without a login.
+    """
+    url = (f"{api}/repos/{slug}/actions/workflows/ci.yml/runs"
+           f"?branch=master&status=completed&per_page=1")
+    answer = http_json(url, token=token)
+    runs = answer.get("workflow_runs") if isinstance(answer, dict) else None
+    if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+        raise StepFailed(f"{url} gave no list of workflow runs")
+    if not runs:
+        return False, "ci.yml has no completed run on master"
+    run = runs[0]
+    line = (f"run {run.get('id')} of ci.yml on master, at the commit {run.get('head_sha')}, "
+            f"has the conclusion {run.get('conclusion')}")
+    return run.get("conclusion") == "success", line
 
 
 class Published:
@@ -812,6 +971,9 @@ class Published:
         self.staging = None
         self.staged = None
         self.commit = None
+        self.slug = None
+        self.token = None
+        self.private = None
 
     @property
     def tag(self):
@@ -841,21 +1003,33 @@ class Published:
     def say(self, text):
         print(f"jig release:   {text}", flush=True)
 
-    def release_url(self, slug):
-        return f"{self.api}/repos/{slug}/releases/tags/{urllib.parse.quote(self.tag)}"
+    def release_url(self):
+        return f"{self.api}/repos/{self.slug}/releases/tags/{urllib.parse.quote(self.tag)}"
+
+    @property
+    def file_token(self):
+        """The token for the reads of release files: None on a public repo."""
+        return self.token if self.private else None
+
+    @property
+    def way(self):
+        return "with the token" if self.private else "with no login"
+
+    def visibility(self):
+        """Read whether the repo is private, which decides how its release files are read."""
+        if not (self.product / ".git").exists():
+            raise StepFailed(f"no product clone at {self.product}")
+        self.slug = origin_slug(self.product)
+        try:
+            self.token = read_token(self.project)
+            self.private = read_visibility(self.api, self.slug, self.token)
+        except StepFailed as error:
+            raise StepFailed(f"cannot read the visibility of the repo {self.slug}: "
+                             f"{error}") from None
+        self.say(f"the repo {self.slug} is {'private' if self.private else 'public'}")
 
     def read_back(self):
-        """Compare the release, read with no login, with the staged files by name and hash."""
-        release = http_json(self.release_url(origin_slug(self.product)))
-        published = asset_names(release)
-        if set(published) != set(self.staged):
-            raise StepFailed(f"the release {self.tag} holds {sorted(published)}, "
-                             f"the staging directory {sorted(self.staged)}")
-        for name, url in sorted(published.items()):
-            if hashlib.sha256(http(url)).hexdigest() != self.staged[name]:
-                raise StepFailed(f"{name}, read from {url} with no login, differs from "
-                                 f"the staged file")
-        self.say(f"{len(published)} files read back with no login match the staged files")
+        self.say(read_back(self.api, self.slug, self.tag, self.staged, self.file_token))
 
 
 class Publish(Published):
@@ -872,12 +1046,15 @@ class Publish(Published):
                 ("SHA256SUMS of the staged files", self.check_sums),
                 ("the release commit", self.release_commit),
                 ("the merge to master can fast-forward", self.merge_possible),
+                # The last check: a private repo whose files could not be read back
+                # must stop here, before the tag, which can never be taken back.
+                ("the visibility", self.visibility),
                 ("the tag in the product", lambda: self.make_tag(self.product, "the product",
                                                                  self.commit, False)),
                 ("the tag in -dev", lambda: self.make_tag(self.dev, "-dev", self.dev_commit,
                                                           True)),
                 ("the GitHub release", self.github_release),
-                ("the readback with no login", self.readback),
+                ("the readback", self.readback),
                 ("the merge to master in the product",
                  lambda: self.merge(self.product, "the product", self.commit)),
                 ("the merge to master in -dev",
@@ -968,27 +1145,18 @@ class Publish(Published):
                              f"{last_line(result.stderr)}")
         self.say(f"{tag} pushed to the origin of {where}")
 
-    def token(self):
-        path = pathlib.Path(os.path.expanduser(f"~/.config/jig/{self.project}-token"))
-        try:
-            token = path.read_text(encoding="utf-8").strip()
-        except OSError as error:
-            raise StepFailed(f"cannot read the token file {path}: {error.strerror}") from None
-        if not token:
-            raise StepFailed(f"the token file {path} is empty")
-        return token
-
     def github_release(self):
-        slug = origin_slug(self.product)
-        token = self.token()
-        release = missing_is_none(lambda: http_json(self.release_url(slug), token=token))
-        published = asset_names(release) if release else {}
+        slug = self.slug
+        token = self.token
+        release = missing_is_none(lambda: http_json(self.release_url(), token=token))
+        published = asset_names(release, self.private) if release else {}
         extra = sorted(set(published) - set(self.staged))
         if extra:
             raise StepFailed(f"the release {self.tag} holds files that are not staged: "
                              f"{', '.join(extra)}")
-        for name, url in sorted(published.items()):
-            if hashlib.sha256(http(url)).hexdigest() != self.staged[name]:
+        for name, where in sorted(published.items()):
+            data = read_release_file(self.api, slug, where, self.file_token)
+            if hashlib.sha256(data).hexdigest() != self.staged[name]:
                 raise StepFailed(f"the release {self.tag} holds {name} with another hash "
                                  f"than the staged file")
         missing = sorted(set(self.staged) - set(published))
@@ -1017,7 +1185,7 @@ class Publish(Published):
 
     def readback(self):
         if self.dry_run:
-            self.say(f"would read the release {self.tag} and its files back with no login")
+            self.say(f"would read the release {self.tag} and its files back {self.way}")
             return
         self.read_back()
 
@@ -1054,21 +1222,17 @@ class Verify(Published):
     def __init__(self, project, version):
         super().__init__(project)
         self.version = version
-        self.slug = None
 
     def steps(self):
-        return (("the published files", self.published_files),
+        return (("the visibility", self.visibility),
+                ("the published files", self.published_files),
                 ("the tag", self.check_tag),
-                ("the repo is public", self.public),
-                ("the badge", self.badge))
+                ("the CI state of master", self.ci_state))
 
     def finished(self):
         return f"{self.project} {self.version} is verified: {self.tag} at {self.commit}"
 
     def published_files(self):
-        if not (self.product / ".git").exists():
-            raise StepFailed(f"no product clone at {self.product}")
-        self.slug = origin_slug(self.product)
         self.staging = self.releases / self.version
         if not self.staging.is_dir():
             raise StepFailed(f"no staged release of {self.version} in {self.staging}")
@@ -1089,17 +1253,13 @@ class Verify(Published):
             raise StepFailed(f"{self.tag} does not point at the release commit: {problem}")
         self.commit = target
 
-    def public(self):
-        url = f"{self.api}/repos/{self.slug}"
-        try:
-            repo = http_json(url)
-        except StepFailed as error:
-            raise StepFailed(f"the repo {self.slug} cannot be read with no login, so it "
-                             f"is not public: {error}") from None
-        if repo.get("private") is not False:
-            raise StepFailed(f"the repo {self.slug} is not public")
-
-    def badge(self):
+    def ci_state(self):
+        if self.private:
+            passed, line = master_run(self.api, self.slug, self.token)
+            if not passed:
+                raise StepFailed(line)
+            self.say(line)
+            return
         url = f"{self.web}/{self.slug}/actions/workflows/ci.yml/badge.svg?branch=master"
         text = http(url).decode("utf-8", errors="replace")
         if "passing" not in text:
