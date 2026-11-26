@@ -5,6 +5,45 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.5
+
+What changed: `jig trace coverage` accepts a requirement whose proof is a
+check of the phase gate, such as a row of `checks.tsv`, which no product test
+can read. Up to 0.10.4, such a requirement had no control row and failed with
+`no control row`.
+
+A line that starts with `Checked by: <check>`, between the heading of a
+requirement and the next heading, now takes the place of a control row for that
+requirement; a requirement can have several. For each one, `coverage` prints
+`<path>:<line>: <ID>: checked by the phase gate: <check>` on stdout, which is
+no failure and leaves the exit code alone. A `Checked by:` line that names no
+check fails with `no check named` and takes the place of no control row. A
+`Checked by:` line under no requirement heading fails with the line
+`<path>:<line>: Checked by: not under a requirement`.
+
+Files and formats: changed files: `libexec/jig-trace` with its usage text, and
+`lib/jig_trace.py`. New format: the `Checked by:` line in the records of a
+requirement class. New output: the stdout line of each `Checked by:` line. The
+ledger, the trace and the conf file are unchanged.
+
+Migration: a host and its projects move from 0.10.4 to 0.10.5 in this order. A
+host still on 0.10.3 first takes the migration of 0.10.4, or takes both at once
+with `jig upgrade 0.10.5` and the steps of 0.10.4 after it.
+
+1. As the orchestrator account, run `jig upgrade 0.10.5`. It installs 0.10.5
+   under `/opt/jig/0.10.5/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.5` as the orchestrator
+   account. It sets `JIG_VERSION=0.10.5` in the conf file of the project in
+   each role account, and refuses while a unit holds a lock. Check in each
+   account that the conf file of the project reads `JIG_VERSION=0.10.5`.
+3. A project whose records have no `Checked by:` line changes nothing and sees
+   no change.
+
+Requested by: another project, whose requirement with a row of `checks.tsv` as
+its proof could not pass the coverage check.
+
+Units: 0 minor, 1 patch, 4 none
+
 ## 0.10.4
 
 What changed: `jig release` publishes and verifies a release on a private
