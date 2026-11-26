@@ -1,5 +1,6 @@
 """jig trace on fixture projects: a -dev clone with the product clone beside it."""
 
+import ast
 import json
 import shutil
 import sys
@@ -1669,6 +1670,145 @@ class CoverageTest(TraceCase):
         result = self.coverage("specs")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("coverage takes no arguments", result.stderr)
+
+
+# A register where the requirement Start has a control row and the requirement
+# Release has none, only a line that names the check of the phase gate that
+# proves it, with spaces around the check.
+CHECKED_REQUIREMENTS = ("# Requirements\n\n### R-1 Start\n\nOwner: jig-spec.md\n\n"
+                        "### R-2 Release\n\nOwner: jig-spec.md\n"
+                        "Checked by:  the row dev-check of checks.tsv  \n\n## Later\n")
+CHECKED_SPEC = "# Spec\n\nThe rules R-1, R-2 and R-3 hold, and the control C-core-2 tests R-1.\n"
+R2_LINE = ("specs/requirements.md:10: R-2: checked by the phase gate: "
+           "the row dev-check of checks.tsv")
+
+
+class CheckedByTest(TraceCase):
+    """jig trace coverage on a -dev tree with no product clone, whose register
+    proves a requirement by a check of the phase gate in place of a control row."""
+
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(self.product)
+        self.write(self.dev / "specs/jig-spec.md", CHECKED_SPEC)
+        self.write(self.dev / "specs/requirements.md", CHECKED_REQUIREMENTS)
+        self.write(self.dev / "specs/03-controls.md", CONTROLS)
+        self.trace("tests/test_tool.py",
+                   [entry(5, "def test_main_returns_zero(self):", ["C-core-2"])])
+
+    def add_r3(self, *lines):
+        """Add the requirement Stop at line 12, its Owner line at 14 and the given
+        lines from 15."""
+        block = "### R-3 Stop\n\nOwner: jig-spec.md\n" + "".join(f"{line}\n" for line in lines)
+        self.write(self.dev / "specs/requirements.md",
+                   CHECKED_REQUIREMENTS.replace("## Later", block + "\n## Later"))
+
+    def assert_result(self, code, stdout, stderr):
+        result = run([TRACE, "coverage"], env=self.env(), cwd=self.dev)
+        self.assertEqual((result.returncode, result.stdout.splitlines(),
+                          result.stderr.splitlines()), (code, stdout, stderr))
+
+    def test_requirement_with_only_a_checked_by_line_passes(self):
+        # Release has no control row and one line that names a check, in a fixture
+        # whose specs/ids.tsv keeps the four columns of the release before. It
+        # passes, prints the line of Release with the check stripped of its spaces,
+        # and nothing on stderr.
+        self.assertFalse(self.product.exists())
+        header = (self.dev / "specs/ids.tsv").read_text(encoding="utf-8").split("\n")[0]
+        self.assertEqual(header.split("\t"), ["class", "regex", "defined", "coverage"])
+        self.assert_result(0, [R2_LINE], [])
+
+    def test_requirement_with_several_checked_by_lines_prints_each(self):
+        # Stop names two checks; each gives its own line, in line order.
+        self.add_r3("Checked by: the row privacy of checks.tsv",
+                    "Checked by: the clean-clone step of the phase gate")
+        self.assert_result(0, [R2_LINE,
+                               "specs/requirements.md:15: R-3: checked by the phase gate: "
+                               "the row privacy of checks.tsv",
+                               "specs/requirements.md:16: R-3: checked by the phase gate: "
+                               "the clean-clone step of the phase gate"], [])
+
+    def test_requirement_with_a_control_row_and_a_checked_by_line_passes(self):
+        # Start keeps its control row and gains a line; both are valid together.
+        self.write(self.dev / "specs/requirements.md", CHECKED_REQUIREMENTS.replace(
+            "Owner: jig-spec.md\n\n###", "Owner: jig-spec.md\nChecked by: the row terms\n\n###"))
+        self.assert_result(0, ["specs/requirements.md:6: R-1: checked by the phase gate: "
+                               "the row terms", R2_LINE.replace(":10:", ":11:")], [])
+
+    def test_requirement_with_neither_has_no_control_row(self):
+        # Stop has an Owner line only, so it fails as before; the line of Release
+        # still goes to stdout.
+        self.add_r3()
+        self.assert_result(1, [R2_LINE], ["specs/requirements.md:12: R-3: no control row"])
+
+    def test_empty_checked_by_line_names_no_check_and_is_no_control_row(self):
+        # Stop has only a line with spaces after the sign: it names no check at its
+        # own line, and Stop still has no control row.
+        self.add_r3("Checked by:   ")
+        self.assert_result(1, [R2_LINE], ["specs/requirements.md:12: R-3: no control row",
+                                          "specs/requirements.md:15: R-3: no check named"])
+
+    def test_empty_line_beside_a_line_that_names_a_check(self):
+        # Stop has an empty line and one that names a check. The named check takes
+        # the place of the control row, so only the empty line fails.
+        self.add_r3("Checked by:", "Checked by: the row dev-check of checks.tsv")
+        self.assert_result(1, [R2_LINE, "specs/requirements.md:16: R-3: checked by the phase "
+                               "gate: the row dev-check of checks.tsv"],
+                           ["specs/requirements.md:15: R-3: no check named"])
+
+    def test_checked_by_line_above_the_first_requirement_heading(self):
+        # A line that names a check on line 1, before any heading, is under no
+        # requirement and gives that one failure.
+        self.write(self.dev / "specs/requirements.md",
+                   "Checked by: the row terms\n" + CHECKED_REQUIREMENTS)
+        self.assert_result(1, [R2_LINE.replace(":10:", ":11:")],
+                           ["specs/requirements.md:1: Checked by: not under a requirement"])
+
+    def test_empty_line_under_another_heading_gives_only_its_place(self):
+        # An empty line under the heading Later, which defines no requirement, has
+        # no ID to name: it gives the one line of its place, and no line that it
+        # names no check.
+        self.write(self.dev / "specs/requirements.md", CHECKED_REQUIREMENTS + "Checked by:\n")
+        self.assert_result(1, [R2_LINE],
+                           ["specs/requirements.md:13: Checked by: not under a requirement"])
+
+    def test_file_of_two_requirement_classes_is_read_once(self):
+        # A second requirement class names the same register. The misplaced line and
+        # the line of Release each still print once. A line in a spec document that no
+        # requirement class names is not read.
+        self.write(self.dev / "specs/ids.tsv",
+                   ID_CLASSES + "S\tS-[0-9]+\tspecs/requirements.md\trequirement\n")
+        self.write(self.dev / "specs/requirements.md", CHECKED_REQUIREMENTS + "Checked by:\n")
+        self.write(self.dev / "specs/jig-spec.md", CHECKED_SPEC + "Checked by:\n")
+        self.assert_result(1, [R2_LINE],
+                           ["specs/requirements.md:13: Checked by: not under a requirement"])
+
+    def test_records_without_the_line_give_the_output_of_the_release_before(self):
+        # With no line that starts with "Checked by:", complete records print nothing
+        # and exit 0, and records with gaps give the same failures, the same empty
+        # stdout and the same exit code as the release before this line existed.
+        self.write(self.dev / "specs/requirements.md",
+                   CHECKED_REQUIREMENTS.replace("Checked by:  the row dev-check of checks.tsv  \n",
+                                                "### R-2 Again\n"))
+        self.assert_result(1, [], ["specs/requirements.md:10: R-2: defined twice",
+                                   "specs/requirements.md:7: R-2: no control row"])
+        self.write(self.dev / "specs/requirements.md",
+                   CHECKED_REQUIREMENTS.replace("Checked by:  the row dev-check of checks.tsv  \n",
+                                                ""))
+        self.write(self.dev / "specs/03-controls.md",
+                   CONTROLS.replace("| R-1 |", "| R-1, R-2 |"))
+        self.assert_result(0, [], [])
+
+    def test_usage_text_names_the_line_and_its_output(self):
+        # The text at the head of the tool explains the line under the check
+        # requirement, with the line it prints.
+        text = ast.get_docstring(ast.parse(TRACE.read_text(encoding="utf-8")))
+        requirement = " ".join(
+            text.split("- requirement:", 1)[1].split("\n- control:", 1)[0].split())
+        self.assertIn('"Checked by:"', requirement)
+        self.assertIn("<path>:<line>: <ID>: checked by the phase gate: <check> on stdout",
+                      requirement)
+        self.assertIn("<path>:<line>: Checked by: not under a requirement", requirement)
 
 
 class IdClassFormTest(TraceCase):

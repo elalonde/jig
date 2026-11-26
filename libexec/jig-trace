@@ -54,7 +54,18 @@ check:
 
 - requirement: each ID, defined by a heading, has one Owner line under it, which
   names a spec document that writes the ID, and the ID is in a cell after the
-  first of a control row;
+  first of a control row, or has a Checked by line in its place. A Checked by
+  line is a line that starts with "Checked by:", between the heading of the ID
+  and the next heading, and names the check of the phase gate, the checks that
+  run before a phase of the project closes, that proves the ID. It is for a
+  proof that no product test can read, such as a row of checks.tsv; an ID can
+  have several. Each one that names a check prints the line
+  <path>:<line>: <ID>: checked by the phase gate: <check> on stdout, which is no
+  failure and leaves the exit code alone. One that names no check fails with no
+  check named and does not take the place of a control row; one under no
+  requirement heading fails with only the line
+  <path>:<line>: Checked by: not under a requirement. A project whose records
+  have no such line sees no change;
 - control: each control row, a table row that defines a control, has a cell in
   the column whose header starts with Mutation that holds more than spaces, and
   its ID is in an entry of the trace, which is how its test is known;
@@ -97,6 +108,8 @@ hunk headers, or one row for a file whose hunks name none, with every rules cell
 holding <fill>. It writes nothing.
 
 Prints one line on stderr for each failure; the lines of coverage have no prefix.
+On stdout, coverage prints only the line of each Checked by line that names a
+check.
 Exit 0 when nothing fails, 1 when something does, and 2 on a usage error.
 """
 
@@ -518,7 +531,30 @@ def control_cells(dev, classes):
     return cells
 
 
-def check_requirement(definition, documents, cells):
+def checked_by(dev, classes):
+    """Read the "Checked by:" lines of the requirements.
+
+    Return the lines for stdout, one for each line that names a check; the IDs
+    that such a line covers in place of a control row; and the failures. A line
+    under no requirement gives only its own failure, also when it names no check,
+    because it has no ID to report.
+    """
+    notes, named, failures = [], set(), []
+    for found in jig_trace.checked_by_lines(dev, classes):
+        if found.record is None:
+            failures.append(problem(found.path, found.line, "Checked by",
+                                    "not under a requirement"))
+        elif not found.check:
+            failures.append(problem(found.path, found.line, found.record, "no check named"))
+        else:
+            named.add(found.record)
+            notes.append(problem(found.path, found.line, found.record,
+                                 f"checked by the phase gate: {found.check}"))
+    return notes, named, failures
+
+
+def check_requirement(definition, documents, cells, named):
+    """Check one requirement; named holds the IDs that a "Checked by:" line covers."""
     record, where = definition.record, (definition.path, definition.line, definition.record)
     failures = []
     owners = jig_trace.owner_lines(definition.lines, definition.line)
@@ -530,7 +566,9 @@ def check_requirement(definition, documents, cells):
         failures.append(problem(*where, "owner not a spec document"))
     elif not jig_trace.occurrences(documents[f"specs/{owners[0]}"], record):
         failures.append(problem(*where, "not in its owner"))
-    if not any(jig_trace.occurrences(cell, record) for cell in cells):
+    # A check of the phase gate that a "Checked by:" line names takes the place
+    # of a control row, for a proof that no product test can read.
+    if record not in named and not any(jig_trace.occurrences(cell, record) for cell in cells):
         failures.append(problem(*where, "no control row"))
     return failures
 
@@ -578,31 +616,40 @@ def referenced(record, places, documents, traced):
 
 
 def coverage(start):
-    """Run the coverage checks of every class of specs/ids.tsv; return the failure lines."""
+    """Run the coverage checks of every class of specs/ids.tsv.
+
+    Return the lines for stdout, which name the requirements that a check of the
+    phase gate proves, and the failure lines.
+    """
     dev = jig_trace.dev_root(start)
     if dev is None:
-        return [f"{start} is not inside a -dev clone"]
+        return [], [f"{start} is not inside a -dev clone"]
     path = dev / "specs" / "ids.tsv"
     if not path.exists():
-        return []
+        return [], []
     try:
         classes = jig_trace.read_id_classes(path)
     except FormError as error:
-        return [f"specs/ids.tsv: {error}"]
+        return [], [f"specs/ids.tsv: {error}"]
     documents = jig_trace.spec_documents(dev)
     entries, failures = coverage_trace(dev)
     traced = {record for _name, entry in entries for record in entry["ids"]}
-    cells = None
+    notes, cells, named = [], None, None
     for item in classes:
         found = jig_trace.definitions(dev, item, defining_kinds(item))
         first, again = first_definitions(found)
         failures += [problem(definition.path, definition.line,
                              definition.record, "defined twice") for definition in again]
         if item.coverage == "requirement":
+            # The control rows and the "Checked by:" lines serve every requirement
+            # class, so they are read once, at the first such class.
+            more = []
             if cells is None:
                 cells = control_cells(dev, classes)
+                notes, named, more = checked_by(dev, classes)
             for definition in first.values():
-                failures += check_requirement(definition, documents, cells)
+                failures += check_requirement(definition, documents, cells, named)
+            failures += more
         elif item.coverage == "control":
             for definition in first.values():
                 failures += check_control(definition, traced)
@@ -614,7 +661,7 @@ def coverage(start):
                 if not referenced(record, places, documents, traced):
                     failures.append(problem(definition.path, definition.line, record,
                                             "not referenced"))
-    return failures
+    return notes, failures
 
 
 class Comments:
@@ -979,7 +1026,12 @@ def main(argv):
     elif args.command == "coverage":
         if extra:
             parser.error("coverage takes no arguments")
-        failures = coverage(os.getcwd())
+        notes, failures = coverage(os.getcwd())
+        # The lines of the requirements that the phase gate proves go to stdout,
+        # so that the failure lines on stderr stay as they were. They are no
+        # failure and leave the exit code alone.
+        for note in notes:
+            print(note)
         # Each line is the whole of a failure, starting with its path, so that a
         # search for the lines of one file finds them with nothing in front.
         for failure in failures:

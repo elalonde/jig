@@ -343,6 +343,42 @@ def owner_lines(lines, number):
     return owners
 
 
+CHECKED_BY = "Checked by:"
+# One line that starts with "Checked by:", which names the check of the phase
+# gate that proves a requirement no control row covers. record is the
+# requirement whose heading the line is under, or None when it is under no
+# requirement; check is the text after the sign, empty when it names no check.
+CheckedBy = collections.namedtuple("CheckedBy", "path line record check")
+
+
+def checked_by_lines(dev, classes):
+    """Every "Checked by:" line of the files that the requirement classes name.
+
+    A line belongs to the requirement whose heading comes before it, up to the
+    next heading of any kind. A heading counts only where it defines an ID of a
+    requirement class that names its file. A file that two requirement classes
+    name is read once, so that each line is reported once.
+    """
+    headings, files = {}, []
+    for item in classes:
+        if item.coverage != "requirement":
+            continue
+        for definition in definitions(dev, item, ("heading",)):
+            headings[(definition.path, definition.line)] = definition.record
+        files += [name for name in defined_files(dev, item.defined) if name not in files]
+    found = []
+    for relative in files:
+        text = (dev / relative).read_text(encoding="utf-8", errors="replace")
+        record = None
+        for number, line in enumerate(text.split("\n"), 1):
+            if HEADING.match(line):
+                record = headings.get((relative, number))
+            elif line.startswith(CHECKED_BY):
+                found.append(CheckedBy(relative, number, record,
+                                       line[len(CHECKED_BY):].strip()))
+    return found
+
+
 def git(product, *args):
     return subprocess.run(["git", "-C", str(product), *args], capture_output=True, text=True,
                           check=False)
