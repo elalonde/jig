@@ -5,6 +5,71 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.4
+
+What changed: `jig release` publishes and verifies a release on a private
+product repo. Up to 0.10.3, `publish` read each release file back with no
+login, which fails on a private repo after the tag and the GitHub release are
+made.
+
+`publish` now reads the visibility of the product repo with the project's
+token, the field `private` of `GET /repos/<owner>/<repo>`, as a check of its
+own after the merge check and before the tag; `--dry-run` reads it too. It
+prints `the repo <owner>/<repo> is public` or `the repo <owner>/<repo> is
+private`. When the visibility cannot be read (the token file, an HTTP error,
+no JSON, or a field that is not `true` or `false`), `publish` stops there with
+one line that names the repo and the reason, before any action.
+
+On a public repo the release files are read as before, with no login. On a
+private repo the release is read by its tag through the API with the token,
+and each file through the release asset API. A request with the token follows
+no redirect; the redirect to a file is followed with no login. This holds for
+the readback, for the check of the files that a rerun finds, and for `verify`.
+The step `the readback with no login` is now `the readback`, and its last line
+ends `with no login` or `with the token`.
+
+`verify` steps: the visibility, the published files, the tag, and the CI state
+of master: the badge of `ci.yml` on a public repo; on a private repo, the
+newest completed run of `ci.yml` on master, read with the token, which must
+have the conclusion `success`. The step "the repo is public" is gone, so
+`verify` no longer fails on a private repo. `verify` needs the token file on a
+public repo too; without it, it fails at the visibility with one line.
+
+The template `CLAUDE.md` of `jig new`: the section "Commit message standard"
+says the history of the product is written for a public reader, because a
+private product can become public later.
+
+Files and formats: changed files: `libexec/jig-release` with its help text, and
+the template `CLAUDE.md` under `templates/new/dev/`. New output: the visibility
+line, and the last line of the readback. The ledger, the trace and the conf
+file are unchanged.
+
+Migration: a host and its projects move from 0.10.3 to 0.10.4 in this order. A
+host still on 0.10.2 first takes the migration of 0.10.3, or takes both at once
+with `jig upgrade 0.10.4` and the steps of 0.10.3 after it.
+
+1. As the orchestrator account, run `jig upgrade 0.10.4`. It installs 0.10.4
+   under `/opt/jig/0.10.4/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.4` as the orchestrator
+   account. It sets `JIG_VERSION=0.10.4` in the conf file of the project in
+   each role account, and refuses while a unit holds a lock. Check in each
+   account that the conf file of the project reads `JIG_VERSION=0.10.4`.
+3. The orchestrator of each running project replaces, in the section "Commit
+   message standard" of the project's own `CLAUDE.md`, the sentence "The
+   history of the product is public." with "The history of the product is
+   written for a public reader, because a private product can become public
+   later." `jig upgrade` changes no file of a project's repo.
+4. `verify` now needs the token file `~/.config/jig/<project>-token` of the
+   implementer account on a public repo too, as `publish` does.
+5. A project with a private product repo runs `jig release <project> publish
+   --dry-run` before its first publish with 0.10.4; it must print `the repo
+   <owner>/<repo> is private` and exit 0.
+
+Requested by: another project, whose release of a private product repo failed
+after the tag.
+
+Units: 0 minor, 1 patch, 4 none
+
 ## 0.10.3
 
 What changed: `jig orch` announces an idle orchestrator. When the project has
