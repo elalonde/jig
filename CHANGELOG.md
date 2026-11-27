@@ -5,6 +5,48 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.6
+
+What changed: `jig release <project> publish` gives each release upload a time
+limit that grows with the size of the file: 60 s plus 1 s for each started
+128 KiB, so a file of 129404073 bytes has 1048 s. The limit holds for the
+connection, the whole send and each wait for an answer. Up to 0.10.5, each
+wait had 60 s, and a large file failed to upload. Every other request keeps
+60 s for each wait. A failed upload prints `the upload of <name> (<S> bytes,
+limit <L> s) failed: <reason>`.
+
+A rerun of `publish` keeps what exists: a tag already on an origin, the
+release, and each file already on the release with the staged size and hash,
+each with a line that says so. A file in the state `starter`, an upload that
+did not complete, is removed with the line `removed <name>, an upload that did
+not complete (state starter)` and uploaded again; `--dry-run` prints `would
+remove <name>`. A rerun never removes an uploaded file: a kept file that
+differs from the staged one, or a file in any other state, stops the step
+before any removal.
+
+Each release upload sends a `User-Agent` header; GitHub refuses an upload
+without one with HTTP 403.
+
+Files and formats: changed file: `libexec/jig-release`. New output: the lines
+of a rerun and the line of a failed upload. The ledger, the trace and the conf
+file are unchanged.
+
+Migration: a host and its projects move from 0.10.5 to 0.10.6 in this order. A
+host still on 0.10.4 first takes the migration of 0.10.5, or takes both at once
+with `jig upgrade 0.10.6` and the steps of 0.10.5 after it.
+
+1. As the orchestrator account, run `jig upgrade 0.10.6`. It installs 0.10.6
+   under `/opt/jig/0.10.6/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.6` as the orchestrator
+   account. Check in each account that the conf file of the project reads
+   `JIG_VERSION=0.10.6`.
+3. Nothing else changes for a host or a project.
+
+Requested by: another project, whose release file of about 129 MB failed to
+upload in `publish`, and whose rerun failed at the same step.
+
+Units: 0 minor, 2 patch, 5 none
+
 ## 0.10.5
 
 What changed: `jig trace coverage` accepts a requirement whose proof is a
