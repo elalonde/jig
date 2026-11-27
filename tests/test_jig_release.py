@@ -8,6 +8,8 @@ import pathlib
 import pwd
 import shlex
 import shutil
+import socket
+import sys
 import threading
 import time
 import unittest
@@ -634,8 +636,39 @@ class ChangelogEntryTest(unittest.TestCase):
 SLUG = "someowner/somerepo"
 TAG = f"v{LINE}.0"
 STAGED = {"demo-0.7.0.tar.gz": b"the package\n", "demo-0.7.0-src.tar.gz": b"the source archive\n"}
+SOURCE = "demo-0.7.0-src.tar.gz"
+PACKAGE = "demo-0.7.0.tar.gz"
 BADGE_PASSING = '<svg xmlns="http://www.w3.org/2000/svg"><text>CI</text><text>passing</text></svg>'
 BADGE_FAILING = '<svg xmlns="http://www.w3.org/2000/svg"><text>CI</text><text>failing</text></svg>'
+
+# Runs jig release with its upload limit made small, when a base and a block size are
+# given, so that a test can watch an upload pass its limit in moments. Each connection
+# that the tool opens appends its timeout to the log, in the order of the requests.
+LAUNCHER = """\
+import importlib.machinery
+import importlib.util
+import socket
+import sys
+
+tool, log, base, block = sys.argv[1:5]
+loader = importlib.machinery.SourceFileLoader("jig_release", tool)
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader("jig_release", loader))
+loader.exec_module(module)
+if base:
+    module.UPLOAD_BASE = int(base)
+    module.UPLOAD_BLOCK = int(block)
+connect = socket.create_connection
+
+
+def logged(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, *args, **options):
+    with open(log, "a", encoding="utf-8") as stream:
+        stream.write(f"{timeout}\\n")
+    return connect(address, timeout, *args, **options)
+
+
+socket.create_connection = logged
+sys.exit(module.main(sys.argv[5:]))
+"""
 
 
 class FakeGitHub(http.server.ThreadingHTTPServer):
@@ -652,20 +685,42 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
     address refuses any request that carries a login, and the runs of ci.yml are served
     from runs. repo_answer turns the answer about the repository into an HTTP error, a
     body that is not JSON, one with no field private, or a redirect.
+
+    Each file of a release has a state, as on GitHub. A file in a state other than
+    uploaded cannot be downloaded: each attempt is answered with 404 and kept in
+    unready_reads. The release asset API removes a file for the token, or answers the
+    removal with the code that delete_answer gives; "gone" removes the file and still
+    answers 404, as when it went away between the list and the removal. held_upload
+    names a file whose upload is read with no byte taken ("stall") or a little at a
+    time ("slow"), until the client gives up or release_held is set. window, when
+    given, shrinks the receive buffer of each connection, so that a large upload cannot
+    vanish into the buffers of the loopback network while it is held.
     """
 
-    def __init__(self):
+    def __init__(self, window=None):
+        self.window = window
         super().__init__(("127.0.0.1", 0), FakeGitHubHandler)
         self.releases = {}
         self.files = {}
+        self.states = {}
         self.assets = {}
+        self.next_asset = 1
         self.private = False
         self.asset_answer = "redirect"
         self.repo_answer = None
         self.runs = []
         self.badge = BADGE_PASSING
         self.uploads_left = None
+        self.delete_answer = None
+        self.held_upload = None
+        self.release_held = threading.Event()
+        self.unready_reads = []
         self.requests = []
+
+    def server_bind(self):
+        if self.window:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.window)
+        super().server_bind()
 
     @property
     def url(self):
@@ -678,16 +733,39 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
             "upload_url": f"{self.url}/uploads/repos/{SLUG}/releases/{number}/assets{{?name,label}}"}
         return self.releases[tag]
 
-    def add_file(self, tag, name, data):
+    def add_file(self, tag, name, data, state="uploaded", size=None):
+        """Add a file to a release and return its asset ID; size is that of data unless given."""
         path = f"/{SLUG}/releases/download/{tag}/{name}"
         self.files[path] = data
-        number = len(self.assets) + 1
+        self.states[path] = state
+        number = self.next_asset
+        self.next_asset += 1
         self.assets[number] = path
-        self.releases[tag]["assets"].append({"name": name, "id": number,
-                                             "browser_download_url": self.url + path})
+        self.releases[tag]["assets"].append({
+            "name": name, "id": number, "state": state,
+            "size": len(data) if size is None else size,
+            "browser_download_url": self.url + path})
+        return number
+
+    def remove_file(self, number):
+        path = self.assets.pop(number)
+        del self.files[path], self.states[path]
+        for release in self.releases.values():
+            release["assets"] = [asset for asset in release["assets"] if asset["id"] != number]
+
+    def readable(self, path):
+        """Whether a file can be downloaded; an attempt on one that cannot is kept."""
+        if self.states.get(path) == "uploaded":
+            return True
+        self.unready_reads.append(path)
+        return False
 
     def posts(self):
         return [path for method, path, _ in self.requests if method == "POST"]
+
+    def deletes(self, since=0):
+        return [(path, login) for method, path, login in self.requests[since:]
+                if method == "DELETE"]
 
     def asked(self, part, since=0):
         """Return the logins of the requests since that index whose path holds part."""
@@ -727,6 +805,8 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
             path = hub.assets.get(int(parsed.path.split("/")[2]))
             if login is not None:
                 self.send_error(400)
+            elif not hub.readable(path):
+                self.send_error(404)
             else:
                 self.answer(200, hub.files[path], "application/octet-stream")
         elif parsed.path == f"/repos/{SLUG}":
@@ -738,7 +818,10 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self.answer(200, {"total_count": len(hub.runs), "workflow_runs": hub.runs})
         elif parsed.path in hub.files and not hidden:
-            self.answer(200, hub.files[parsed.path], "application/octet-stream")
+            if hub.readable(parsed.path):
+                self.answer(200, hub.files[parsed.path], "application/octet-stream")
+            else:
+                self.send_error(404)
         elif parsed.path == f"/{SLUG}/actions/workflows/ci.yml/badge.svg" \
                 and parsed.query == "branch=master":
             self.answer(200, hub.badge.encode(), "image/svg+xml")
@@ -753,6 +836,8 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
         elif self.headers.get("Accept") != "application/octet-stream":
             # GitHub answers with the asset's description unless the file is asked for.
             self.answer(200, {"id": int(number), "name": path.rsplit("/", 1)[1]})
+        elif not hub.readable(path):
+            self.send_error(404)
         elif hub.asset_answer == "direct":
             self.answer(200, hub.files[path], "application/octet-stream")
         else:
@@ -781,12 +866,16 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
         hub = self.server
         login = self.headers.get("Authorization")
         hub.requests.append(("POST", self.path, login))
+        parsed = urllib.parse.urlparse(self.path)
+        parts = parsed.path.split("/")
+        if hub.held_upload and urllib.parse.parse_qs(parsed.query).get("name") == \
+                [hub.held_upload[0]]:
+            self.hold_upload(hub.held_upload[1])
+            return
         data = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if login != f"Bearer {TOKEN}":
             self.send_error(401)
             return
-        parsed = urllib.parse.urlparse(self.path)
-        parts = parsed.path.split("/")
         if parsed.path == f"/repos/{SLUG}/releases":
             asked = json.loads(data)
             if asked["tag_name"] in hub.releases:
@@ -811,6 +900,40 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
             self.answer(201, release["assets"][-1])
         else:
             self.send_error(404)
+
+    def hold_upload(self, how):
+        """Take an upload's body slowly or not at all, until the client gives up."""
+        hub = self.server
+        while not hub.release_held.is_set():
+            if how == "stall":
+                hub.release_held.wait(0.05)
+                continue
+            try:
+                taken = self.rfile.read1(16384)
+            except OSError:
+                return
+            if not taken:
+                return
+            time.sleep(0.02)
+
+    def do_DELETE(self):
+        hub = self.server
+        login = self.headers.get("Authorization")
+        hub.requests.append(("DELETE", self.path, login))
+        prefix = f"/repos/{SLUG}/releases/assets/"
+        number = self.path[len(prefix):] if self.path.startswith(prefix) else ""
+        if login != f"Bearer {TOKEN}" or not number.isdigit() \
+                or int(number) not in hub.assets:
+            self.send_error(404)
+        elif hub.delete_answer == "gone":
+            hub.remove_file(int(number))
+            self.send_error(404)
+        elif hub.delete_answer:
+            self.send_error(hub.delete_answer)
+        else:
+            hub.remove_file(int(number))
+            self.send_response(204)
+            self.end_headers()
 
 
 class PublishCase(ReleaseCase):
@@ -838,16 +961,40 @@ class PublishCase(ReleaseCase):
             (self.staging / name).write_bytes(data)
             sums += f"{hashlib.sha256(data).hexdigest()}  {name}\n"
         (self.staging / "SHA256SUMS").write_text(sums, encoding="utf-8")
-        self.hub = FakeGitHub()
+        self.start_hub()
+
+    def start_hub(self, window=None):
+        self.hub = FakeGitHub(window)
         threading.Thread(target=self.hub.serve_forever, args=(0.05,), daemon=True).start()
         self.addCleanup(self.hub.server_close)
         self.addCleanup(self.hub.shutdown)
+        self.addCleanup(self.hub.release_held.set)
 
-    def release(self, *args):
-        """Run jig release in the -dev clone with the fake GitHub; return code, out, err."""
-        result = run([RELEASE, PROJECT, *args], cwd=self.dev,
+    def stage(self, name, data):
+        """Put other bytes into a staged file, with SHA256SUMS to match."""
+        (self.staging / name).write_bytes(data)
+        sums = "".join(f"{release.file_hash(self.staging / staged)}  {staged}\n"
+                       for staged in sorted(STAGED))
+        (self.staging / "SHA256SUMS").write_text(sums, encoding="utf-8")
+
+    def release(self, *args, launcher=None):
+        """Run jig release in the -dev clone with the fake GitHub; return code, out, err.
+
+        launcher, when given, is the list of the launcher script and its arguments, which
+        run the tool in place of its own entry point.
+        """
+        command = [sys.executable, *launcher] if launcher else [RELEASE]
+        result = run([*command, PROJECT, *args], cwd=self.dev,
                      env=self.env(JIG_GITHUB_API=self.hub.url, JIG_GITHUB_WEB=self.hub.url))
         return result.returncode, result.stdout, result.stderr
+
+    def launcher(self, base="", block=""):
+        """Return the launcher's arguments, with the limit made small if base is given,
+        and the path of its log of connection timeouts."""
+        script = self.tmp / "launch.py"
+        script.write_text(LAUNCHER, encoding="utf-8")
+        log = self.tmp / "connections.txt"
+        return [script, RELEASE, log, base, block], log
 
     def refs(self, bare):
         return self.git("--git-dir", bare, "for-each-ref", "--format=%(objectname) %(refname)")
@@ -937,6 +1084,56 @@ class PublishPassTest(PublishCase):
             self.assertIn(f"publish {number}/11: {name}\n", out)
         self.assertIn("publish 9/11: the readback\n", out)
 
+    def test_a_first_publish_keeps_its_lines_and_gives_each_upload_the_limit_of_its_file(self):
+        # GitHub has no release yet, and the package is staged with 131073 bytes, one
+        # more than 128 KiB. publish prints exactly the steps and lines that it printed
+        # before a rerun could keep or remove a release file, with no line about a kept
+        # release or a kept file, and nothing on stderr. It opens one connection for each
+        # request: each upload gets the limit of its own file, 61 s for SHA256SUMS and
+        # the source archive and 62 s for the package, and every other request, the
+        # reads of the API and of the files and the request that makes the release, gets
+        # 60 s.
+        self.stage("demo-0.7.0.tar.gz", b"p" * 131073)
+        launcher, log = self.launcher()
+        result = self.release("publish", launcher=launcher)
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(result[2], "")
+        timeouts = [float(text) for text in log.read_text(encoding="utf-8").split()]
+        expected = []
+        for method, path, _ in self.hub.requests:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+            if method == "POST" and "/uploads/" in path:
+                size = (self.staging / query["name"][0]).stat().st_size
+                expected.append(float(release.upload_limit(size)))
+            else:
+                expected.append(60.0)
+        self.assertEqual(timeouts, expected)
+        self.assertEqual(sorted(timeout for timeout in timeouts if timeout != 60), [61, 61, 62])
+        steps = ("the staged release", "SHA256SUMS of the staged files", "the release commit",
+                 "the merge to master can fast-forward", "the visibility",
+                 "the tag in the product", "the tag in -dev", "the GitHub release",
+                 "the readback", "the merge to master in the product",
+                 "the merge to master in -dev")
+        said = {
+            1: [f"version 0.7.0, files in {self.staging}"],
+            3: [f"release commit {self.release_commit}, -dev commit {self.dev_line}"],
+            5: [f"the repo {SLUG} is public"],
+            6: [f"{TAG} pushed to the origin of the product"],
+            7: [f"{TAG} pushed to the origin of -dev"],
+            8: [f"made the release {TAG} of {SLUG}", "uploaded SHA256SUMS",
+                "uploaded demo-0.7.0-src.tar.gz", "uploaded demo-0.7.0.tar.gz"],
+            9: ["the 3 files of the release match the staged files, read with no login"],
+            10: [f"master of the product has the tree of {self.release_commit}"],
+            11: [f"master of -dev has the tree of {self.dev_line}"],
+        }
+        expected = []
+        for number, name in enumerate(steps, 1):
+            expected.append(f"jig release: publish {number}/11: {name}")
+            expected += [f"jig release:   {text}" for text in said.get(number, [])]
+        expected.append(f"jig release: {PROJECT} 0.7.0 is published: {TAG} at "
+                        f"{self.release_commit}")
+        self.assertEqual(result[1].splitlines(), expected)
+
     def test_a_private_repo_publishes_and_verifies_with_the_token(self):
         # The repo is private, so its download URLs and its badge answer no request with
         # no login, and the release asset API redirects to a storage address that
@@ -968,7 +1165,8 @@ class PublishPassTest(PublishCase):
         again = self.release("publish")
         self.assertEqual(again[0], 0, again)
         self.assertEqual(len(self.hub.posts()), posts)
-        self.assertIn("3 files are on the release already with the staged hashes", again[1])
+        self.assertEqual(again[1].count("is on the release already, with the staged size and "
+                                        "hash\n"), 3)
         self.assertEqual(len(self.hub.asked("/releases/assets/", seen)), 6)
         self.assertEqual(self.hub.asked("/download/", seen), [])
         verified = self.release("verify", "0.7.0")
@@ -1162,7 +1360,8 @@ class PublishFailTest(PublishCase):
 
     def test_a_tag_that_exists_at_another_commit_is_refused(self):
         # v0.7.0 is on the product's origin already, at a commit off the line: publish
-        # refuses it, and tags nothing in -dev, makes no release and merges nothing.
+        # refuses it before the step of the GitHub release, and tags nothing in -dev,
+        # makes no release and merges nothing.
         side = self.git("-C", self.product, "commit-tree", "-p", self.release_commit,
                         "-m", "side", f"{self.release_commit}^{{tree}}").strip()
         self.git("-C", self.product, "tag", "-a", TAG, "-m", "elsewhere", side)
@@ -1170,6 +1369,7 @@ class PublishFailTest(PublishCase):
         self.git("-C", self.product, "tag", "-d", TAG)
         result = self.release("publish")
         self.assert_publish_failed_at(result, "the tag in the product", f"points at {side}")
+        self.assertNotIn("the GitHub release", result[1])
         self.assertEqual(self.git("--git-dir", self.dev_origin, "tag", "--list"), "")
         self.assertEqual(self.hub.posts(), [])
         self.assertNotEqual(self.master(self.origin), self.release_commit)
@@ -1210,6 +1410,182 @@ class PublishFailTest(PublishCase):
         self.assert_publish_failed_at(result, "the merge to master in the product",
                                       "the merge check")
         self.assertNotEqual(self.master(self.dev_origin), self.dev_line)
+
+
+class UploadLimitTest(PublishCase):
+    def test_an_upload_that_stalls_or_only_crawls_fails_at_the_limit_of_its_file(self):
+        # The package is 16 MiB, more than the buffers of the loopback network take in,
+        # and the limit is made 1 s for each file. First the server takes no byte of the
+        # package's body; then, in a rerun, it reads the body all the time at about
+        # 800 KiB/s, below the 16 MiB in 1 s that the limit asks for, so that no single
+        # wait comes near the limit. Each time publish exits 1 with the line of a failed
+        # upload that names the package, its size and the limit, and ends soon after the
+        # limit, because the limit holds for the send of the whole body.
+        self.start_hub(window=8192)
+        size = 16 << 20
+        self.stage(PACKAGE, b"p" * size)
+        launcher, _ = self.launcher(base="0", block=str(size))
+        for how in ("stall", "slow"):
+            with self.subTest(how=how):
+                self.hub.held_upload = (PACKAGE, how)
+                started = time.monotonic()
+                result = self.release("publish", launcher=launcher)
+                self.assertLess(time.monotonic() - started, 10)
+                self.assert_publish_failed_at(
+                    result, "the GitHub release",
+                    f"the upload of {PACKAGE} ({size} bytes, limit 1 s) failed: the send "
+                    f"of the file took longer than the limit")
+                self.assertEqual(len(self.hub.releases[TAG]["assets"]), 2)
+
+
+class UploadLimitValueTest(unittest.TestCase):
+    def test_the_limit_is_60_s_plus_1_s_for_each_started_128_kib(self):
+        # The sizes at each edge of a block of 128 KiB, and the source archive of 129404073
+        # bytes that once failed at a limit of 60 s.
+        for size, limit in ((0, 60), (1, 61), (131072, 61), (131073, 62), (129404073, 1048)):
+            with self.subTest(size=size):
+                self.assertEqual(release.upload_limit(size), limit)
+
+
+class RerunTest(PublishCase):
+    """A rerun of publish on a release that an earlier run left behind."""
+
+    def failed_upload(self, private):
+        """Leave the state of an upload that failed partway, as GitHub shows it.
+
+        A first run tags both repos, makes the release and uploads SHA256SUMS; then the
+        upload server answers the upload of the source archive with HTTP 500, which fails
+        the run with one line that names the file, its size and its limit of 61 s. GitHub
+        then lists that file in the state starter, with some of its bytes. Returns the
+        asset ID of that file.
+        """
+        self.hub.private = private
+        self.hub.uploads_left = 1
+        result = self.release("publish")
+        self.assert_publish_failed_at(
+            result, "the GitHub release",
+            f"the upload of {SOURCE} ({len(STAGED[SOURCE])} bytes, limit 61 s) failed: POST ")
+        self.assertTrue(result[2].rstrip().endswith(": HTTP 500"), result)
+        self.hub.uploads_left = None
+        return self.hub.add_file(TAG, SOURCE, STAGED[SOURCE][:4], state="starter",
+                                 size=len(STAGED[SOURCE]))
+
+    def assert_rerun_removes_the_starter_file_and_uploads_it_again(self, private):
+        # A dry run first prints that it would remove the starter file and upload it,
+        # and sends no DELETE and no POST. The rerun then keeps both tags, the release and
+        # SHA256SUMS, each with its line, removes the starter file with one DELETE with
+        # the token and its line, uploads it and the package once each, never asks for
+        # the bytes of the starter file, and exits 0 after the readback, with the release
+        # equal to the staged files.
+        starter = self.failed_upload(private)
+        seen = len(self.hub.requests)
+        dry = self.release("publish", "--dry-run")
+        self.assertEqual(dry[0], 0, dry)
+        self.assertIn(f"would remove {SOURCE}\njig release:   would upload {SOURCE}\n", dry[1])
+        self.assertEqual([method for method, _, _ in self.hub.requests[seen:]
+                          if method not in ("GET", "HEAD")], [])
+        seen = len(self.hub.requests)
+        result = self.release("publish")
+        self.assertEqual(result[0], 0, result)
+        out = result[1]
+        lines = [f"{TAG} exists already on the origin of the product, at {self.release_commit}",
+                 f"{TAG} exists already on the origin of -dev, at {self.dev_line}",
+                 f"the release {TAG} exists already",
+                 "SHA256SUMS is on the release already, with the staged size and hash",
+                 f"removed {SOURCE}, an upload that did not complete (state starter)",
+                 f"uploaded {SOURCE}", f"uploaded {PACKAGE}"]
+        places = [out.index(f"jig release:   {line}\n") for line in lines]
+        self.assertEqual(places, sorted(places))
+        self.assertEqual(self.hub.deletes(seen),
+                         [(f"/repos/{SLUG}/releases/assets/{starter}", f"Bearer {TOKEN}")])
+        uploads = [urllib.parse.parse_qs(urllib.parse.urlparse(path).query)["name"][0]
+                   for method, path, _ in self.hub.requests[seen:] if method == "POST"]
+        self.assertEqual(uploads, [SOURCE, PACKAGE])
+        self.assertEqual(self.hub.unready_reads, [])
+        self.assertEqual(self.hub_files(), self.staged_bytes())
+        self.assertEqual(self.master(self.origin), self.release_commit)
+
+    def test_a_rerun_on_a_public_repo_replaces_the_file_that_did_not_upload(self):
+        self.assert_rerun_removes_the_starter_file_and_uploads_it_again(private=False)
+
+    def test_a_rerun_on_a_private_repo_replaces_the_file_that_did_not_upload(self):
+        self.assert_rerun_removes_the_starter_file_and_uploads_it_again(private=True)
+
+    def test_a_kept_file_that_differs_or_a_file_in_another_state_stops_before_any_removal(self):
+        # The release holds the package in the state uploaded and the source archive in
+        # the state starter. The package has another size, then the staged size and other
+        # bytes, then the state open. Each time publish exits 1 at the GitHub release with
+        # one line, sends no DELETE and uploads nothing, the package stays on the release,
+        # and the bytes of a file in the state open are never asked for.
+        self.hub.make_release(TAG)
+        package = self.hub.add_file(TAG, PACKAGE, b"x" * (len(STAGED[PACKAGE]) + 1))
+        self.hub.add_file(TAG, SOURCE, b"", state="starter", size=len(STAGED[SOURCE]))
+        listed = self.hub.releases[TAG]["assets"][0]
+        path = self.hub.assets[package]
+        for case, data, state, reason in (
+                ("size", b"x" * (len(STAGED[PACKAGE]) + 1), "uploaded",
+                 f"holds {PACKAGE} with another size than the staged file"),
+                ("hash", b"x" * len(STAGED[PACKAGE]), "uploaded",
+                 f"holds {PACKAGE} with another hash than the staged file"),
+                ("state", STAGED[PACKAGE], "open",
+                 f"the release {TAG} holds {PACKAGE} in the state open, not uploaded and "
+                 f"not starter")):
+            with self.subTest(case=case):
+                self.hub.files[path] = data
+                self.hub.states[path] = listed["state"] = state
+                listed["size"] = len(data)
+                result = self.release("publish")
+                self.assert_publish_failed_at(result, "the GitHub release", reason)
+                self.assertEqual(self.hub.deletes(), [])
+                self.assertEqual(self.hub.posts(), [])
+                self.assertEqual(self.hub_files()[PACKAGE], data)
+        self.assertEqual(self.hub.unready_reads, [])
+
+    def test_a_removal_that_fails_stops_the_step_and_one_that_finds_no_file_goes_on(self):
+        # The API answers the removal of the starter file with HTTP 500: publish exits 1
+        # with one line that names the file, and uploads nothing. Then it answers 404
+        # after the file went away: the rerun says the file was gone already, uploads it
+        # and exits 0.
+        self.failed_upload(private=False)
+        posts = len(self.hub.posts())
+        self.hub.delete_answer = 500
+        self.assert_publish_failed_at(
+            self.release("publish"), "the GitHub release",
+            f"the removal of {SOURCE}, an upload that did not complete, failed: DELETE ")
+        self.assertEqual(len(self.hub.posts()), posts)
+        self.hub.delete_answer = "gone"
+        result = self.release("publish")
+        self.assertEqual(result[0], 0, result)
+        self.assertIn(f"{SOURCE} was gone already, an upload that did not complete "
+                      f"(state starter)\n", result[1])
+        self.assertNotIn("removed ", result[1])
+        self.assertEqual(self.hub_files(), self.staged_bytes())
+
+
+class ReleaseFilesTest(unittest.TestCase):
+    def test_a_file_list_without_a_state_or_a_size_or_with_a_name_twice_is_refused(self):
+        # One entry lacks its state, one its size, and two entries share a name: each
+        # fails the step, so that no check of a rerun runs on a file it cannot judge.
+        whole = {"name": PACKAGE, "id": 1, "state": "uploaded", "size": 3,
+                 "browser_download_url": "http://127.0.0.1/file"}
+        for case, assets, reason in (
+                ("no state", [{**whole, "state": None}], "no name, asset ID, state"),
+                ("no size", [{key: value for key, value in whole.items() if key != "size"}],
+                 "no name, asset ID, state"),
+                ("twice", [whole, {**whole, "id": 2}], f"names {PACKAGE} more than once")):
+            for private in (False, True):
+                with self.subTest(case=case, private=private):
+                    with self.assertRaisesRegex(release.StepFailed, reason):
+                        release.release_files({"assets": assets}, private)
+
+    def test_the_files_come_in_the_order_of_their_names(self):
+        # The list names the package before SHA256SUMS; the files come back by name.
+        listed = [{"name": name, "id": number, "state": "uploaded", "size": 1,
+                   "browser_download_url": f"http://127.0.0.1/{name}"}
+                  for number, name in enumerate((PACKAGE, "SHA256SUMS"), 1)]
+        self.assertEqual([item.name for item in release.release_files({"assets": listed},
+                                                                      False)],
+                         ["SHA256SUMS", PACKAGE])
 
 
 class VerifyTest(PublishCase):

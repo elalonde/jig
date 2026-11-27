@@ -98,7 +98,9 @@ and the reason, and publish exits 1.
     back. --dry-run reads and prints it too.
   the actions: the annotated tag v<X.Y.Z> at the release commit in the product and at
     the -dev commit in -dev; the GitHub release of that tag with the staged files and
-    SHA256SUMS; the readback, which reads the release by its tag and each of its
+    SHA256SUMS, where the upload of a file of S bytes has a limit of 60 + ceil(S /
+    131072) seconds, 60 s plus 1 s for each started 128 KiB, so that any file passes at a
+    steady 128 KiB/s; the readback, which reads the release by its tag and each of its
     files, compares them with the staged files by name and hash, and names in its
     last line the way it read them, "with no login" or "with the token"; and the push
     of the line's commit to master in the product and then in -dev, which git refuses
@@ -114,13 +116,44 @@ file, or with a redirect to it; publish takes the file from either answer, and f
 the redirect with no login. This holds for the readback and for the check of the files
 that a rerun finds on the release, and verify reads its files the same way.
 
-A rerun after a publish that stopped partway is safe: an action whose result exists
-already and matches passes without acting, and one whose result differs fails. A tag
-must point at the same commit; in -dev it may also point at an earlier head of the
-line, because status and report commits land there between two runs. A release file
-must have the staged hash, and the release must hold no other file. Nothing is ever
-deleted or forced. With --dry-run publish runs the checks, prints what each action
-would do, and changes nothing on GitHub or on either origin.
+The limits of the requests. The limit of an upload holds for the connection, for the
+send of the whole body, and for each wait for bytes of the answer. Every other request
+of prepare, publish and verify has a limit of 60 s for each wait on the network, not
+for the whole request, so a large file that is read at a steady rate does not fail on
+it. A failed upload fails the step of the GitHub release with the line "the upload of
+<name> (<S> bytes, limit <L> s) failed: <reason>", for a timeout, an HTTP error or any
+other failure.
+
+A rerun after a publish that stopped partway runs in the order of a first run. It keeps
+each result that exists and matches, with one line, does each action that has no
+result, and fails where a result differs. A tag must point at the same commit, and is
+kept with "v<X.Y.Z> exists already on the origin of <where>, at <commit>"; in -dev it
+may also point at an earlier head of the line, because status and report commits land
+there between two runs. A release that exists is kept with "the release v<X.Y.Z> exists
+already". Its file list, read by the tag with the token, gives each file's name, state
+and size, and the release must hold no file that is not staged. Each file is checked in
+the order of the names before anything is removed:
+
+  - the state uploaded: the file is kept, with "<name> is on the release already, with
+    the staged size and hash", when its size equals that of the staged file and the
+    sha256 of its bytes equals that of the staged file. Its bytes are read by the way of
+    the visibility (below), and only when the size matches. Another size or another hash
+    fails the step, and such a file is never removed, because a user can download it.
+  - the state starter: an upload that did not complete, which cannot be downloaded, so
+    its bytes are not read.
+  - any other state fails the step with "the release v<X.Y.Z> holds <name> in the state
+    <state>, not uploaded and not starter".
+
+When every file passes, each file in the state starter is removed with DELETE
+/repos/<owner>/<repo>/releases/assets/<asset ID> and the token, with "removed <name>, an
+upload that did not complete (state starter)", and is uploaded again with the files that
+the release lacks. An answer of 404 to a removal means the file is gone already: the
+line is then "<name> was gone already, ...", and publish goes on. Any other failure of a
+removal fails the step with "the removal of <name>, an upload that did not complete,
+failed: <reason>". Such a removal is the only one that publish makes; it never deletes
+or moves a tag, removes no other release file, and never forces a push. With --dry-run
+publish runs the checks, prints what each action would do, "would remove <name>" and
+"would upload <name>" among them, and changes nothing on GitHub or on either origin.
 
 The product pushes go to the product clone's push URL, which tools/push-on-token.sh
 points at the token; the -dev pushes go to the -dev clone's origin, on its deploy key.
@@ -156,6 +189,7 @@ pass:
 Every command exits 0 when every step passes, 1 when one fails, 2 on a usage error.
 """
 
+import collections
 import hashlib
 import json
 import os
@@ -166,9 +200,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+# Imported under another name, because http is the name of this tool's request function.
+from http import client as http_client
 
 sys.dont_write_bytecode = True
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -197,6 +234,15 @@ VERSION_FORM = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 SUMS_LINE = re.compile(r"([0-9a-f]{64})  ([^/\s][^/]*)")
 ORIGIN_SLUG = re.compile(r"[:/]([^/:]+/[^/:]+?)(?:\.git)?/?$")
 HTTP_TIMEOUT = 60
+# The limit of an upload grows with the file: UPLOAD_BASE seconds plus one second for
+# each started UPLOAD_BLOCK bytes, so that any file passes at a steady 128 KiB/s.
+UPLOAD_BASE = 60
+UPLOAD_BLOCK = 131072
+SEND_BLOCK = 65536
+# GitHub's states of a release file: "uploaded" can be downloaded, and "starter" is an
+# upload that never completed, which cannot.
+UPLOADED = "uploaded"
+STARTER = "starter"
 STEPS = (
     "the change log entry and the release commit",
     "CI green on the release commit",
@@ -808,16 +854,28 @@ REDIRECT_CODES = (301, 302, 303, 307, 308)
 WITH_TOKEN = urllib.request.build_opener(KeepRedirects)
 
 
+class HttpError(StepFailed):
+    """A request was answered with an HTTP error, whose code the caller may act on."""
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def token_headers(token):
+    return {"Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
 def http(url, token=None, data=None, content_type=None, method=None, accept=None):
     """Return the body of a request; with no token the request carries no login at all.
 
-    A request with the token raises Redirected on a redirect, with its target.
+    A request with the token raises Redirected on a redirect, with its target. The limit
+    of HTTP_TIMEOUT seconds holds for each wait on the network, not for the whole
+    request, so a large file that comes at a steady rate is read to its end.
     """
-    headers = {}
-    if token is not None:
-        headers = {"Accept": "application/vnd.github+json",
-                   "Authorization": f"Bearer {token}",
-                   "X-GitHub-Api-Version": "2022-11-28"}
+    headers = token_headers(token) if token is not None else {}
     if accept:
         headers["Accept"] = accept
     if content_type:
@@ -834,9 +892,61 @@ def http(url, token=None, data=None, content_type=None, method=None, accept=None
             raise Redirected(f"{method or 'GET'} {url}: HTTP {error.code} to {target}, "
                              f"which a request with the token does not follow",
                              target) from None
-        raise StepFailed(f"{method or 'GET'} {url}: HTTP {error.code}") from None
+        raise HttpError(f"{method or 'GET'} {url}: HTTP {error.code}", error.code) from None
     except (urllib.error.URLError, OSError) as error:
         raise StepFailed(f"{method or 'GET'} {url}: {error}") from None
+
+
+def upload_limit(size):
+    """Return the seconds that the upload of a file of size bytes may take."""
+    return UPLOAD_BASE + -(-size // UPLOAD_BLOCK)
+
+
+def send_file(url, token, path, size, limit):
+    """POST the file at path, of size bytes, with the token, within limit seconds.
+
+    The limit holds for the connection, for the send of the whole body, and for each
+    wait for bytes of the answer. A timeout of urllib holds for each wait on the socket
+    only, so a send that is slow but never stops would never time out; the body is sent
+    here in blocks instead, each with the time that is left. The request follows no
+    redirect, because it carries the token. Raises StepFailed with the reason.
+    """
+    parts = urllib.parse.urlsplit(url)
+    kinds = {"https": http_client.HTTPSConnection, "http": http_client.HTTPConnection}
+    if parts.scheme not in kinds or not parts.hostname:
+        raise StepFailed(f"the upload URL {url} is not an http or https address")
+    connection = kinds[parts.scheme](parts.hostname, parts.port, timeout=limit)
+    target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+    stage = "the connection"
+    try:
+        connection.connect()
+        stage = "the send of the file"
+        deadline = time.monotonic() + limit
+        connection.putrequest("POST", target)
+        for name, value in token_headers(token).items():
+            connection.putheader(name, value)
+        connection.putheader("Content-Type", "application/octet-stream")
+        connection.putheader("Content-Length", str(size))
+        connection.endheaders()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(SEND_BLOCK), b""):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                connection.sock.settimeout(left)
+                connection.send(block)
+        stage = "the answer"
+        connection.sock.settimeout(limit)
+        response = connection.getresponse()
+        response.read()
+    except TimeoutError:
+        raise StepFailed(f"{stage} took longer than the limit") from None
+    except (OSError, http_client.HTTPException) as error:
+        raise StepFailed(f"{stage}: {error or type(error).__name__}") from None
+    finally:
+        connection.close()
+    if not 200 <= response.status < 300:
+        raise StepFailed(f"POST {url}: HTTP {response.status}")
 
 
 def http_json(url, **options):
@@ -897,6 +1007,39 @@ def asset_names(release, private):
         what = "asset ID" if private else "download URL"
         raise StepFailed(f"the release's file list has no name or {what} for each file")
     return found
+
+
+# One file of a release as the API lists it: where is the place to read its bytes, as
+# in asset_names, and asset is the ID by which a removal names it.
+ReleaseFile = collections.namedtuple("ReleaseFile", "name asset state size where")
+
+
+def release_files(release, private):
+    """Return the files of a release in the order of their names.
+
+    Fails the step when an entry lacks a field that the checks of a rerun need, or when
+    two entries share a name, because a check by name could then pass the wrong one.
+    """
+    key = "id" if private else "browser_download_url"
+    try:
+        found = [ReleaseFile(asset["name"], asset["id"], asset["state"], asset["size"],
+                             asset[key])
+                 for asset in release.get("assets") or []]
+    except (KeyError, TypeError, AttributeError):
+        found = None
+    # The asset ID goes into the address of a removal, which carries the token on both
+    # kinds of repo, so only a number may go there.
+    if found is None or not all(isinstance(item.name, str) and isinstance(item.state, str)
+                                and type(item.asset) is int and type(item.size) is int
+                                for item in found):
+        what = "name, asset ID, state or size" if private else \
+            "name, asset ID, state, size or download URL"
+        raise StepFailed(f"the release's file list has no {what} for each file")
+    names = [item.name for item in found]
+    twice = sorted({name for name in names if names.count(name) > 1})
+    if twice:
+        raise StepFailed(f"the release's file list names {', '.join(twice)} more than once")
+    return sorted(found)
 
 
 def read_release_file(api, slug, where, token):
@@ -1149,25 +1292,37 @@ class Publish(Published):
         slug = self.slug
         token = self.token
         release = missing_is_none(lambda: http_json(self.release_url(), token=token))
-        published = asset_names(release, self.private) if release else {}
-        extra = sorted(set(published) - set(self.staged))
+        if release is not None:
+            self.say(f"the release {self.tag} exists already")
+        files = release_files(release, self.private) if release else []
+        extra = [item.name for item in files if item.name not in self.staged]
         if extra:
             raise StepFailed(f"the release {self.tag} holds files that are not staged: "
                              f"{', '.join(extra)}")
-        for name, where in sorted(published.items()):
-            data = read_release_file(self.api, slug, where, self.file_token)
-            if hashlib.sha256(data).hexdigest() != self.staged[name]:
-                raise StepFailed(f"the release {self.tag} holds {name} with another hash "
-                                 f"than the staged file")
-        missing = sorted(set(self.staged) - set(published))
-        if published:
-            self.say(f"{len(published)} files are on the release already with the staged hashes")
+        # Every file is checked before anything is removed, so that a release with one
+        # file that fails its check is left exactly as it was found.
+        starters = []
+        for item in files:
+            if item.state == STARTER:
+                # Such a file cannot be downloaded, so a read of it could only fail.
+                starters.append(item)
+            elif item.state != UPLOADED:
+                raise StepFailed(f"the release {self.tag} holds {item.name} in the state "
+                                 f"{item.state}, not {UPLOADED} and not {STARTER}")
+            else:
+                self.check_kept(item)
+        kept = {item.name for item in files if item.state == UPLOADED}
+        missing = sorted(set(self.staged) - kept)
         if self.dry_run:
             if release is None:
                 self.say(f"would make the release {self.tag} of {slug}")
+            for item in starters:
+                self.say(f"would remove {item.name}")
             for name in missing:
                 self.say(f"would upload {name}")
             return
+        for item in starters:
+            self.remove(item)
         if release is None:
             body = json.dumps({"tag_name": self.tag, "name": self.version, "body": self.notes,
                                "draft": False, "prerelease": False}).encode()
@@ -1178,10 +1333,49 @@ class Publish(Published):
         if missing and not upload:
             raise StepFailed(f"the release {self.tag} has no upload URL")
         for name in missing:
-            data = (self.staging / name).read_bytes()
-            http(f"{upload}?name={urllib.parse.quote(name)}", token=token, data=data,
-                 content_type="application/octet-stream", method="POST")
+            path = self.staging / name
+            size = path.stat().st_size
+            limit = upload_limit(size)
+            try:
+                send_file(f"{upload}?name={urllib.parse.quote(name)}", token, path, size,
+                          limit)
+            except StepFailed as error:
+                raise StepFailed(f"the upload of {name} ({size} bytes, limit {limit} s) "
+                                 f"failed: {error}") from None
             self.say(f"uploaded {name}")
+
+    def check_kept(self, item):
+        """Pass a file that the release holds already when it equals the staged file.
+
+        Its size is compared first, so that a file of another size is never read. A file
+        that differs is never removed, because a user may have downloaded it already.
+        """
+        if item.size != (self.staging / item.name).stat().st_size:
+            raise StepFailed(f"the release {self.tag} holds {item.name} with another size "
+                             f"than the staged file")
+        data = read_release_file(self.api, self.slug, item.where, self.file_token)
+        if hashlib.sha256(data).hexdigest() != self.staged[item.name]:
+            raise StepFailed(f"the release {self.tag} holds {item.name} with another hash "
+                             f"than the staged file")
+        self.say(f"{item.name} is on the release already, with the staged size and hash")
+
+    def remove(self, item):
+        """Remove a file whose upload did not complete, so that it can be uploaded again.
+
+        GitHub refuses an upload under a name that the release holds already, so the file
+        must go first. An answer of 404 means that it is gone already.
+        """
+        url = f"{self.api}/repos/{self.slug}/releases/assets/{item.asset}"
+        try:
+            http(url, token=self.token, method="DELETE")
+        except StepFailed as error:
+            if not (isinstance(error, HttpError) and error.code == 404):
+                raise StepFailed(f"the removal of {item.name}, an upload that did not "
+                                 f"complete, failed: {error}") from None
+            self.say(f"{item.name} was gone already, an upload that did not complete "
+                     f"(state {item.state})")
+            return
+        self.say(f"removed {item.name}, an upload that did not complete (state {item.state})")
 
     def readback(self):
         if self.dry_run:
