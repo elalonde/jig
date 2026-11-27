@@ -927,6 +927,10 @@ def send_file(url, token, path, size, limit):
             connection.putheader(name, value)
         connection.putheader("Content-Type", "application/octet-stream")
         connection.putheader("Content-Length", str(size))
+        # GitHub refuses a request with no User-Agent with HTTP 403. urllib adds one to
+        # every other request of this tool, but http.client adds none, so the upload
+        # names the tool itself.
+        connection.putheader("User-Agent", "jig-release")
         connection.endheaders()
         with open(path, "rb") as stream:
             for block in iter(lambda: stream.read(SEND_BLOCK), b""):

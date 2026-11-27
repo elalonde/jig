@@ -677,7 +677,9 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
     It serves releases by tag, makes releases and takes uploads with the token only, serves
     the download URLs of the files, the repository, which hides itself from a request with
     no login while it is private, and the badge of the workflow ci.yml. Every request is
-    kept with the Authorization header it carried.
+    kept with the Authorization header it carried. As on GitHub, an upload with no
+    User-Agent header is refused with 403; the User-Agent of each upload is kept in
+    upload_agents.
 
     While private is set, a request with no login finds no release and no download URL,
     as on GitHub. The release asset API serves each file to the token, with the file
@@ -716,6 +718,7 @@ class FakeGitHub(http.server.ThreadingHTTPServer):
         self.release_held = threading.Event()
         self.unready_reads = []
         self.requests = []
+        self.upload_agents = []
 
     def server_bind(self):
         if self.window:
@@ -885,6 +888,11 @@ class FakeGitHubHandler(http.server.BaseHTTPRequestHandler):
             release.update(name=asked["name"], body=asked["body"])
             self.answer(201, release)
         elif parts[:5] == ["", "uploads", "repos", *SLUG.split("/")] and parts[-1] == "assets":
+            agent = self.headers.get("User-Agent")
+            hub.upload_agents.append(agent)
+            if not agent:
+                self.send_error(403)
+                return
             if hub.uploads_left == 0:
                 self.send_error(500)
                 return
@@ -1092,7 +1100,7 @@ class PublishPassTest(PublishCase):
         # request: each upload gets the limit of its own file, 61 s for SHA256SUMS and
         # the source archive and 62 s for the package, and every other request, the
         # reads of the API and of the files and the request that makes the release, gets
-        # 60 s.
+        # 60 s. Each of the three uploads names the tool in its User-Agent header.
         self.stage("demo-0.7.0.tar.gz", b"p" * 131073)
         launcher, log = self.launcher()
         result = self.release("publish", launcher=launcher)
@@ -1109,6 +1117,7 @@ class PublishPassTest(PublishCase):
                 expected.append(60.0)
         self.assertEqual(timeouts, expected)
         self.assertEqual(sorted(timeout for timeout in timeouts if timeout != 60), [61, 61, 62])
+        self.assertEqual(self.hub.upload_agents, ["jig-release"] * 3)
         steps = ("the staged release", "SHA256SUMS of the staged files", "the release commit",
                  "the merge to master can fast-forward", "the visibility",
                  "the tag in the product", "the tag in -dev", "the GitHub release",
