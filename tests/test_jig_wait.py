@@ -6,6 +6,7 @@ import time
 import unittest
 
 from tests.support import NO_CLEAN_ROOM, ROOT
+from tests.test_jig_ctx import context_file
 from tests.units_support import DIALOG_SCREEN, NORMAL_SCREEN, UnitsTestCase
 
 sys.path.insert(0, str(ROOT / "lib"))
@@ -437,6 +438,193 @@ class WaitExpectedTest(UnitsTestCase):
                 self.assertEqual(result.returncode, USAGE, result.stdout + result.stderr)
                 self.assertIn("usage: jig wait", result.stderr)
                 self.assertEqual(self.expected_file().read_text(encoding="utf-8"), "45\n")
+
+
+# Stands in for ssh as the double of tests/units_support.py does, and also notes the
+# process that called it, so that a test can tell when each wait has polled. The worker
+# part of jig send is the one command with a fifth word, the text as base64: the double
+# writes the text to the file sent, or refuses it with the reason in send-refused, as
+# the worker part does, and types nothing into any session.
+CONTEXT_SSH_DOUBLE = """#!/bin/bash
+account=${1%@*}
+echo "$1" >> "$FAKE/ssh-targets"
+echo "$PPID" >> "$FAKE/callers"
+home=$FAKE/accounts/$account
+[ -d "$home" ] || exit 255
+cd "$home" || exit 255
+read -ra words <<< "$2"
+if [ "${words[0]} ${words[1]} ${words[2]}" = "python3 -I -" ] && [ "${#words[@]}" -ge 5 ]; then
+    cat > /dev/null
+    if [ -f "$home/send-refused" ]; then
+        echo "refused: $(cat "$home/send-refused")" >&2; exit 1
+    fi
+    { printf '%s' "${words[4]}" | base64 -d; echo; } >> "$home/sent"
+    exit 0
+fi
+HOME=$home exec bash -c "$2"
+"""
+
+SESSION = "jig-impl-demo"
+SOFT_LINE = ("jig: your context is {} tokens, at or above the soft limit of 200000: start no "
+             "new step; finish the step in hand, push it, and report STOPPED if steps are "
+             "left.")
+HARD_LINE = ("jig: your context is {} tokens, at or above the hard limit of 230000: stop "
+             "after your last complete pushed commit, with a clean tree, and report STOPPED "
+             "if steps are left.")
+
+
+class WaitContextTest(UnitsTestCase):
+    """jig wait sends a running unit one line at each context limit, once for each start."""
+
+    def setUp(self):
+        super().setUp()
+        self.ssh = self.script("ssh-double", CONTEXT_SSH_DOUBLE)
+        self.set_screen("implementer", NORMAL_SCREEN)
+        self.events_file = self.home / "ws" / "reviews" / "jig" / "orch" / "events.log"
+        self.events_file.parent.mkdir(parents=True)
+        self.start = self.write_lock()
+        self.push_subject("status: demo start")
+
+    def readout(self, tokens):
+        context_file(self.ctx_dir, SESSION, tokens, datetime.datetime.now().astimezone())
+
+    def lines(self, path):
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def sent(self):
+        return self.lines(self.fake / "accounts" / "implementer" / "sent")
+
+    def events(self):
+        return self.lines(self.events_file)
+
+    def mark(self):
+        return self.lines(self.lock_dir / "jig-implementer.ctx")
+
+    def start_wait(self):
+        process = subprocess.Popen(
+            [ROOT / "libexec" / "jig-wait", "jig", "demo"], env=self.base_env(**NO_CHECK),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop, process)
+        return process
+
+    def stop(self, process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+
+    def polled(self, *processes, calls=3):
+        """Return once each wait has made a few ssh calls from now on.
+
+        A poll reads the screen and then the readout, so three calls of one wait hold a
+        read of the readout as it is now, and the call after it: the line that read
+        decided on has been sent. The cap is long, so that only a hung wait reaches it.
+        """
+        callers = self.fake / "callers"
+        callers.write_text("", encoding="utf-8")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            seen = self.lines(callers)
+            if all(seen.count(str(process.pid)) >= calls for process in processes):
+                return
+            for process in processes:
+                self.assertIsNone(process.poll(), "a jig wait ended while it should poll")
+            time.sleep(0.02)
+        self.fail("a jig wait did not poll within 30 s")
+
+    def ends_on_the_report(self, process):
+        self.push_subject("log: demo")
+        try:
+            out, err = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("jig wait did not end on the report commit")
+        self.assertEqual(process.returncode, REPORT, out + err)
+
+    def test_a_reading_under_the_soft_limit_sends_nothing(self):
+        self.readout(199999)
+        process = self.start_wait()
+        self.polled(process)
+        self.ends_on_the_report(process)
+        self.assertEqual((self.sent(), self.events()), ([], []))
+
+    def test_each_line_goes_once_and_a_later_wait_on_the_same_start_sends_none_again(self):
+        # A wait at 200000 tokens sends the soft line once over many polls; a second wait
+        # on the same start sends nothing at the same reading; at 230000 it sends the hard
+        # line once. Each send is one event line, and the sends do not end the waits.
+        self.readout(200000)
+        first = self.start_wait()
+        self.polled(first)
+        self.polled(first)
+        self.stop(first)
+        self.assertEqual(self.sent(), [SOFT_LINE.format(200000)])
+        second = self.start_wait()
+        self.polled(second)
+        self.assertEqual(self.sent(), [SOFT_LINE.format(200000)])
+        self.readout(230000)
+        self.polled(second)
+        self.polled(second)
+        self.ends_on_the_report(second)
+        self.assertEqual(self.sent(), [SOFT_LINE.format(200000), HARD_LINE.format(230000)])
+        self.assertEqual(self.events(), [
+            "ctx: demo 200000 tokens, at or above 200000: soft line sent",
+            "ctx: demo 230000 tokens, at or above 230000: hard line sent"])
+        self.assertEqual(self.mark(), [f"start={self.start.isoformat()}", "soft", "hard"])
+
+    def test_a_first_reading_at_the_hard_limit_sends_only_the_hard_line(self):
+        self.readout(231000)
+        process = self.start_wait()
+        self.polled(process)
+        self.readout(200000)
+        self.polled(process)
+        self.ends_on_the_report(process)
+        self.assertEqual(self.sent(), [HARD_LINE.format(231000)])
+        self.assertEqual(self.events(),
+                         ["ctx: demo 231000 tokens, at or above 230000: hard line sent"])
+
+    def test_a_refused_send_writes_its_not_sent_line_and_is_not_tried_again(self):
+        (self.fake / "accounts" / "implementer" / "send-refused").write_text(
+            "no input bar in the session\n", encoding="utf-8")
+        self.readout(200000)
+        process = self.start_wait()
+        self.polled(process)
+        self.polled(process)
+        self.ends_on_the_report(process)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.events(), [
+            "ctx: demo 200000 tokens, at or above 200000: soft line not sent: "
+            "session: no input bar in the session"])
+
+    def test_a_mark_of_another_start_counts_as_no_mark(self):
+        # The mark of an earlier run of the unit names both lines, but the unit started
+        # again with a new lock, so it gets the soft line again.
+        earlier = self.start - datetime.timedelta(hours=2)
+        (self.lock_dir / "jig-implementer.ctx").write_text(
+            f"start={earlier.isoformat()}\nsoft\nhard\n", encoding="utf-8")
+        self.readout(200000)
+        process = self.start_wait()
+        self.polled(process)
+        self.ends_on_the_report(process)
+        self.assertEqual(self.sent(), [SOFT_LINE.format(200000)])
+        self.assertEqual(self.mark(), [f"start={self.start.isoformat()}", "soft"])
+
+    def test_two_waits_at_once_on_one_start_send_each_line_once(self):
+        # Two waits poll the same unit, as the wait of jig batch and one of the
+        # orchestrator do. Both run before the readout reaches each limit, so both see
+        # it at a poll: still only one of them sends each line.
+        self.readout(199999)
+        first, second = self.start_wait(), self.start_wait()
+        self.polled(first, second)
+        self.readout(200000)
+        self.polled(first, second)
+        self.assertEqual(self.sent(), [SOFT_LINE.format(200000)])
+        self.readout(230000)
+        self.polled(first, second)
+        self.assertEqual(self.sent(), [SOFT_LINE.format(200000), HARD_LINE.format(230000)])
+        self.assertEqual(len(self.events()), 2, self.events())
+
+    def test_a_limit_that_is_not_a_number_is_refused(self):
+        result = self.tool("wait", "jig", "demo", JIG_CTX_SOFT="200k", **NO_CHECK)
+        self.assertEqual(result.returncode, REFUSED, result.stdout + result.stderr)
+        self.assertIn("JIG_CTX_SOFT", result.stderr)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,10 @@ class UnitsTestCase(TempTestCase):
         self.lock_dir.mkdir()
         self.batch_dir = self.tmp / "batch"
         self.batch_dir.mkdir()
+        # jig wait reads each unit's context readout; the tests keep it away from the
+        # readouts of the host's real sessions.
+        self.ctx_dir = self.tmp / "ctx"
+        self.ctx_dir.mkdir()
 
         self.origin = self.tmp / "origin.git"
         self.ok(["git", "init", "-q", "--bare", "-b", "master", self.origin])
@@ -102,7 +106,7 @@ class UnitsTestCase(TempTestCase):
     def base_env(self, **extra):
         env = self.env(PATH=f"{self.bin_dir}:{os.environ['PATH']}", JIG_SSH=str(self.ssh),
                        FAKE=str(self.fake), JIG_LOCK_DIR=str(self.lock_dir),
-                       JIG_BATCH_DIR=str(self.batch_dir))
+                       JIG_BATCH_DIR=str(self.batch_dir), JIG_CTX_DIR=str(self.ctx_dir))
         env.update(extra)
         return env
 

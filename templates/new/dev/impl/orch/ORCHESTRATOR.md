@@ -346,11 +346,11 @@ each move of `BRANCH` stays an owner block that Eric runs.
 - After each step, run `jig ctx`. It prints the context size that the status
   line wrote for this session, and its exit code says what to do next:
   - 0: go on.
-  - 3, at about 250k tokens: roll over. Start no new step. Finish the step in
+  - 3, at about 200k tokens: roll over. Start no new step. Finish the step in
     hand, write `state.md` and `handoff.md`, commit them, and end the session:
     stop every background shell and the watcher, but not a detached
     `jig batch`, then run `jig orch @PROJECT@ rollover`. The supervisor starts a fresh session.
-  - 4, at about 280k tokens: exit after the current tool call. Stop every
+  - 4, at about 230k tokens: exit after the current tool call. Stop every
     background shell and the watcher, but not a detached `jig batch`, then
     run `jig orch @PROJECT@ rollover`.
   - 2, no size: go on. A fresh session has none until its status line first

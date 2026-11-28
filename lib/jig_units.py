@@ -137,7 +137,9 @@ def running_units(project):
     if not directory.is_dir():
         return units
     for lock in sorted(directory.glob(f"{project}-*")):
-        if lock.name.endswith(".expected") or not lock.is_file():
+        # Beside each lock lie the expected minutes and the mark of the context lines
+        # that jig wait sent; neither is a lock.
+        if lock.name.endswith((".expected", ".ctx")) or not lock.is_file():
             continue
         values = _read_lock(lock)
         matched = session_form.fullmatch(values.get("session", ""))

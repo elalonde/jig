@@ -107,6 +107,8 @@ UPDATES_LOG = "impl/orch/updates.log"
 ROLE_KEYS = {"spec": "SPEC_ACCOUNT", "impl": "IMPL_ACCOUNT", "rev": "REV_ACCOUNT"}
 # The permission mode of every session jig starts, unless the clone already names one.
 PERMISSION_MODE = "auto"
+# The rule that lets a session run jig ctx, with or without an argument, with no prompt.
+ALLOW_CTX = "Bash(jig ctx:*)"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 # An answer the folder-trust dialog offers. The session waits there with no output.
@@ -293,11 +295,14 @@ def bring_to_origin(conf, head):
         refuse("head", f"{clone} does not contain {head}")
 
 
-def set_effort(clone, model, effort):
-    """Merge the effort and the permission mode into the clone's local settings.
+def set_effort(clone, model, effort, allow_ctx=False):
+    """Merge the effort and the permission mode into the clone's local settings, and,
+    with allow_ctx, the rule for jig ctx.
 
     The mode decides the text under the input bar, which jig wait and the supervisor
-    read; a mode that is already set stays, and so does every other key.
+    read; a mode that is already set stays, and so does every other key and every other
+    rule of the allow list. jig start asks for the rule for each unit it starts; jig orch
+    shares this function for the orchestrator's session, and does not.
     """
     path = pathlib.Path(clone) / ".claude" / "settings.local.json"
     settings = {}
@@ -317,6 +322,15 @@ def set_effort(clone, model, effort):
     if not isinstance(permissions, dict):
         refuse("settings", f"{path} has a permissions that is not an object")
     permissions.setdefault("defaultMode", PERMISSION_MODE)
+    # A unit runs jig ctx after each step. A permission prompt for it would stop an
+    # unattended unit at its first step, so the rule goes in once, beside the rules the
+    # clone already has.
+    if allow_ctx:
+        allowed = permissions.setdefault("allow", [])
+        if not isinstance(allowed, list):
+            refuse("settings", f"{path} has a permissions.allow that is not a list")
+        if ALLOW_CTX not in allowed:
+            allowed.append(ALLOW_CTX)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=path.name)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -837,7 +851,7 @@ def launch(args, conf, session):
     try:
         bring_to_origin(conf, args.head)
         place_hook(conf, args.project, args.hook)
-        set_effort(clone, args.model, args.effort)
+        set_effort(clone, args.model, args.effort, allow_ctx=True)
         prompt = place_prompt(args.prompt, args.project, args.unit)
         if args.approved_tag:
             refresh_approved(clone, args.approved_tag)

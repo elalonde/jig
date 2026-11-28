@@ -32,6 +32,9 @@ sections hold the rules they follow.
 The words "Spec tag:" in the ROLE section stand on one line, because jig start reads
 the approved tag only from such a line; a ROLE section that ends one line with "Spec"
 and starts the next with "tag:" is refused (see lib/jig_spec_tag.py).
+
+The SESSION ECONOMY section holds the words "jig ctx": a unit runs that command after
+each step to learn its own context size, and a prompt that does not say so is refused.
 """
 
 import argparse
@@ -72,6 +75,8 @@ IMPLEMENTER = re.compile(r"(?<![A-Za-z0-9_-])implementer(?![A-Za-z0-9_-])")
 IMPLEMENTER_SECTIONS = tuple(
     (name, re.compile(r"\s+".join(map(re.escape, name.split()))))
     for name in ("Comment standard", "Commit message standard"))
+# The command that tells a unit its own context size, as a whole word on either side.
+JIG_CTX = re.compile(r"(?<![A-Za-z0-9_-])jig\s+ctx(?![A-Za-z0-9_-])")
 
 # Words of the READ section. Anything that can end a word in a shell or in a sentence
 # ends one here, so a path in quotes or after "tag:" is found. A part cut off this way
@@ -197,6 +202,20 @@ def split_tag_failures(lines):
             f"write 'Spec tag:' on one line"]
 
 
+def economy_failures(lines):
+    """Refuse a SESSION ECONOMY section that does not tell the unit to run jig ctx.
+
+    Without that command a unit cannot see its own context size, and goes on past its
+    limits. The two words may wrap onto the next line of the section.
+    """
+    number, text = section_text(lines, "SESSION ECONOMY")
+    # A missing SESSION ECONOMY section is already a failure of its own.
+    if number is None or JIG_CTX.search(text):
+        return []
+    return [f"line {number}: the SESSION ECONOMY section must tell the unit to run jig ctx "
+            f"after each step"]
+
+
 def read_section_lines(lines):
     """Yield the number and text of each line of READ, up to "DO NOT READ"."""
     in_read = False
@@ -319,6 +338,7 @@ def prompt_failures(lines):
     failures += read_failures(lines, clean_room_on(lines))
     failures += implementer_section_failures(lines)
     failures += split_tag_failures(lines)
+    failures += economy_failures(lines)
     failures += last_line_failures(max(len(lines), 1), last, first_id)
     return failures
 

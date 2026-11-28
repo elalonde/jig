@@ -21,8 +21,9 @@ STEPS: 1 premise; 2 the demonstration; 3 commit, push; 4 report, committed
   alone as "log: demo", pushed.
 SESSION ECONOMY: grep first; read by section; cut -c1-200; long output to
   ~/ws/reviews/jig/demo-*.txt; pass or fail from exit codes; the full suite
-  once per product commit, timed. Start no new step above 250k tokens; stop
-  at 280k after the last complete pushed commit, with a clean tree.
+  once per product commit, timed. After each step, run jig ctx; at exit 3
+  start no new step; at exit 4 stop after the last complete pushed commit,
+  with a clean tree.
 ESCALATION: report first line "NEEDS ERIC: <reason>" or "NEEDS SPEC: IQ-n",
   commit "log: demo", push, stop, for: a failed premise check.
 REPORT: jig-dev/impl/log/demo-report.md, in the form of templates/report.md.

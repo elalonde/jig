@@ -8,7 +8,7 @@ The status line of a session running in tmux writes the harness's own token coun
 <directory>/<tmux session>.json about once a minute (lib/jig_context.py reads it; the
 directory is /run/jig/ctx unless JIG_CTX_DIR names another). This prints the reading as
 tokens over window, for example 84213/200000. With no argument it reads the tmux session
-it runs in.
+it runs in, so a unit runs it after each step with no argument.
 
 It prints "none (...)" instead of a reading it cannot trust:
   none (no file)               the status line has not written for this session
@@ -27,54 +27,27 @@ and the fresh start fall in the same second. tmux gives the creation of a sessio
 in whole seconds, so a reading written in that second still counts.
 
 Exit codes:
-  0  a reading below the soft limit
-  3  at or above the soft limit, 250000 tokens: start no new step, finish the one in
+  0  a reading below the soft limit: go on
+  3  at or above the soft limit, 200000 tokens: start no new step, finish the one in
      hand, save the state and exit
-  4  at or above the hard limit, 280000 tokens: exit after the current tool call
-  2  no reading (none), or a usage error
+  4  at or above the hard limit, 230000 tokens: exit after the current tool call
+  2  no reading (none), or a usage error: go on, and run jig ctx again after the
+     next step
 JIG_CTX_SOFT and JIG_CTX_HARD set other limits, in tokens.
 """
 
 import argparse
-import datetime
 import os
 import pathlib
-import subprocess
 import sys
-import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 
 import jig_context  # noqa: E402
 
-SOFT_LIMIT = 250000
-HARD_LIMIT = 280000
-MAX_AGE = datetime.timedelta(minutes=3)
-ONE_SECOND = datetime.timedelta(seconds=1)
-TMUX_TIMEOUT = 10
-
 
 class UsageError(Exception):
     pass
-
-
-def limit(name, default):
-    value = os.environ.get(name)
-    if not value:
-        return default
-    if not value.isdigit():
-        raise UsageError(f"{name} must be a whole number of tokens, not {value!r}")
-    return int(value)
-
-
-def tmux(*args):
-    """Return tmux's output, or None when tmux fails, is missing or does not answer."""
-    try:
-        result = subprocess.run(["tmux", *args], capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL, timeout=TMUX_TIMEOUT, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def own_session():
@@ -82,84 +55,10 @@ def own_session():
     # whatever session the default server last used, which is not this process's.
     if not os.environ.get("TMUX"):
         raise UsageError("not inside tmux: name the tmux session")
-    name = tmux("display-message", "-p", "#S")
+    name = jig_context.tmux("display-message", "-p", "#S")
     if not name:
         raise UsageError("tmux did not name the session this runs in")
     return name
-
-
-def process_started(pid):
-    """Return when a process started, to one tick of the kernel's clock, or None when /proc
-    cannot tell."""
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
-            # The command name in parentheses can hold blanks, so the fields after it
-            # are counted from its closing parenthesis; the start time is the 20th.
-            ticks = int(stream.read().rsplit(")", 1)[1].split()[19])
-    except (OSError, ValueError, IndexError):
-        return None
-    # /proc counts the start in clock ticks since boot. The boot time in /proc/stat is cut
-    # to whole seconds; added to whole seconds of ticks, it can put the start up to two
-    # seconds early, and the figure that the session before wrote just before its pane
-    # was started again would then pass as the fresh session's own, so the fresh session
-    # would stop at once. The boot moment comes from the two clocks instead, the boot clock
-    # read first so that any delay between the reads makes the start later, not earlier.
-    # The start is also rounded up to the next tick, so that it is never before the true
-    # one; a figure written in that last tick reads as none until the next write.
-    since_boot = time.clock_gettime(time.CLOCK_BOOTTIME)
-    now = time.time()
-    seconds = now - since_boot + (ticks + 1) / os.sysconf("SC_CLK_TCK")
-    return datetime.datetime.fromtimestamp(seconds).astimezone()
-
-
-def figure_time(context):
-    """Return the moment the figure in the file was written, as finely as the file tells.
-
-    The status line gives that moment in whole seconds, cut down, so the true moment lies
-    in the second that starts at "written". It writes a new file and renames it into
-    place, so the file's modification time is the same moment to a fraction of a second,
-    and is taken when it falls in that second. A file copied or touched later keeps only
-    "written", which is never after the true moment.
-    """
-    written, modified = context.written, context.modified
-    if modified is not None and written <= modified < written + ONE_SECOND:
-        return modified
-    return written
-
-
-def session_created(session):
-    """Return when the running session started, or None when it does not run.
-
-    That is the later of the tmux session's creation and the start of the process in its
-    pane. A pane started again in the same session (tmux respawn-pane) runs a fresh
-    Claude Code whose figure starts anew, so a reading from before it is not its own.
-    """
-    # The "=" asks for this exact name, so a session whose name only starts with it
-    # is not taken instead.
-    value = tmux("display-message", "-p", "-t", f"={session}:",
-                 "#{session_created} #{pane_pid}")
-    parts = (value or "").split()
-    if len(parts) != 2 or not all(part.isdigit() for part in parts):
-        return None
-    created = datetime.datetime.fromtimestamp(int(parts[0])).astimezone()
-    # A dead pane has no process; the creation of the session is then all there is.
-    started = process_started(int(parts[1]))
-    return max(created, started) if started else created
-
-
-def reading(session, now):
-    """Return the text to print for a session: the readout, or none with its reason."""
-    if not (jig_context.context_dir() / f"{session}.json").exists():
-        return "none (no file)", None
-    context = jig_context.read_context(session, now=now)
-    if context is None:
-        return "none (bad file)", None
-    created = session_created(session)
-    if created is not None and figure_time(context) < created:
-        return "none (before session start)", None
-    if context.age > MAX_AGE:
-        return f"none ({int(context.age.total_seconds())} s old)", None
-    return context.readout(), context
 
 
 def main(argv):
@@ -169,7 +68,10 @@ def main(argv):
     parser.add_argument("session", nargs="?", help="the tmux session; default: this one")
     args = parser.parse_args(argv)
     try:
-        soft, hard = limit("JIG_CTX_SOFT", SOFT_LIMIT), limit("JIG_CTX_HARD", HARD_LIMIT)
+        try:
+            soft, hard = jig_context.limits()
+        except ValueError as error:
+            raise UsageError(str(error)) from None
         session = args.session if args.session is not None else own_session()
         # The name becomes a file name in the context directory, so it may not climb
         # out of it.
@@ -178,7 +80,7 @@ def main(argv):
     except UsageError as error:
         print(f"jig ctx: {error}", file=sys.stderr)
         return 2
-    text, context = reading(session, datetime.datetime.now().astimezone())
+    text, context = jig_context.reading(session)
     print(text)
     if context is None:
         return 2

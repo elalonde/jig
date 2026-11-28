@@ -67,21 +67,37 @@ class JigCtxTest(TempTestCase):
         self.assertNotIn("Traceback", result.stderr)
 
     def test_below_the_soft_limit_prints_the_reading_and_exits_0(self):
-        self.write(249999)
-        self.assert_reads(self.ctx(SESSION), f"249999/{WINDOW}", 0)
+        # One token under the default soft limit of 200000: the session goes on.
+        self.write(199999)
+        self.assert_reads(self.ctx(SESSION), f"199999/{WINDOW}", 0)
 
     def test_at_the_soft_limit_exits_3(self):
-        # 250000 tokens is the default soft limit itself: the session starts no new step.
-        self.write(250000)
+        # 200000 tokens is the default soft limit itself: the session starts no new step.
+        self.write(200000)
         result = self.ctx(SESSION)
-        self.assert_reads(result, f"250000/{WINDOW}", 3)
-        self.assertIn("soft limit", result.stderr)
+        self.assert_reads(result, f"200000/{WINDOW}", 3)
+        self.assertIn("soft limit of 200000", result.stderr)
+
+    def test_just_under_the_hard_limit_still_exits_3(self):
+        self.write(229999)
+        self.assert_reads(self.ctx(SESSION), f"229999/{WINDOW}", 3)
 
     def test_at_the_hard_limit_exits_4(self):
-        self.write(280000)
+        # 230000 tokens is the default hard limit: the session stops.
+        self.write(230000)
         result = self.ctx(SESSION)
-        self.assert_reads(result, f"280000/{WINDOW}", 4)
-        self.assertIn("hard limit", result.stderr)
+        self.assert_reads(result, f"230000/{WINDOW}", 4)
+        self.assertIn("hard limit of 230000", result.stderr)
+
+    def test_usage_text_gives_the_default_limits(self):
+        # The help names both default limits, so a reader of it learns the numbers that
+        # the exit codes stand for.
+        result = self.ctx("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("200000 tokens", result.stdout)
+        self.assertIn("230000 tokens", result.stdout)
+        self.assertNotIn("250000", result.stdout)
+        self.assertNotIn("280000", result.stdout)
 
     def test_limits_from_the_environment_replace_the_defaults(self):
         # With a soft limit of 100 and a hard one of 200, 150 tokens is between them.
@@ -240,15 +256,15 @@ class RolloverTest(OrchTestCase):
         self.assertEqual(self.orch("start").returncode, 0, self.log())
         self.until(lambda: "none (no file)" in self.read(self.home / "ctx-readings"),
                    what="the first session's reading")
-        # The status line of the first session writes 260000 tokens, over the default
-        # soft limit of 250000 and under the hard one.
-        context_file(ctx_dir, ORCH_SESSION, 260000, datetime.datetime.now().astimezone())
+        # The status line of the first session writes 210000 tokens, over the default
+        # soft limit of 200000 and under the hard one.
+        context_file(ctx_dir, ORCH_SESSION, 210000, datetime.datetime.now().astimezone())
         self.until(lambda: "none (before session start)" in
                    self.read(self.home / "ctx-readings"), what="the second session's reading")
         self.until(self.ready, what="the second session's input bar")
         readings = [line for line in self.read(self.home / "ctx-readings").splitlines()
                     if not line.endswith("none (no file)")]
-        self.assertEqual(readings, [f"3 260000/{WINDOW}", "2 none (before session start)"])
+        self.assertEqual(readings, [f"3 210000/{WINDOW}", "2 none (before session start)"])
         # The fresh session stays up: a few polls later there is still no third start.
         time.sleep(6 * float(POLL))
         self.assertTrue(self.alive())

@@ -388,6 +388,30 @@ class JigNewTest(JigNewCase):
         self.assertNotIn("one line `jig wait", text)
         self.assertNotIn("each other end gives the line", text)
 
+    def test_made_claude_md_has_the_context_limits_and_the_run_of_jig_ctx_after_each_step(self):
+        # A unit of a new project learns its limits, 200k and 230k, what each exit code of
+        # jig ctx asks of it, and that the report is still written at a limit; the old
+        # limits of 250k and 280k are gone.
+        text = self.made_text("CLAUDE.md")
+        for rule in ("Start no new step above about 200k tokens of context. At about 230k, "
+                     "stop after the last complete pushed commit, with a clean tree.",
+                     "After each step, run `jig ctx`",
+                     "At exit 3 (200k), start no new step.",
+                     "At exit 4 (230k), stop after the last complete pushed commit, with a "
+                     "clean tree.",
+                     "At exit 2, no size, go on, and run `jig ctx` again after the next step",
+                     "At exit 3 or 4 the unit still writes, commits and pushes its report: "
+                     "the report is no new step, and its status is `OK` when every step "
+                     "before the report is done, else not `OK`, with the steps left."):
+            self.assertIn(rule, text)
+        self.assertNotIn("250k", text)
+        self.assertNotIn("280k", text)
+
+    def test_made_orchestrator_md_gives_no_old_context_limit(self):
+        text = self.made_text("impl/orch/ORCHESTRATOR.md")
+        self.assertNotIn("250k", text)
+        self.assertNotIn("280k", text)
+
     def test_made_claude_md_has_the_vector_rules_the_checks_and_every_tool(self):
         # An implementer must learn the vector rule before jig report refuses its report,
         # and every session must know how a check is run and which tools exist.
@@ -799,10 +823,10 @@ class JigNewTest(JigNewCase):
         # the rollover there out.
         flat = self.made_text("impl/orch/ORCHESTRATOR.md")
         only = "Roll over only when `jig ctx` exits 3 or 4, never at a batch boundary."
-        for rule in ("3, at about 250k tokens: roll over. Start no new step. Finish the step "
+        for rule in ("3, at about 200k tokens: roll over. Start no new step. Finish the step "
                      "in hand, write `state.md` and `handoff.md`, commit them, and end the "
                      "session",
-                     "4, at about 280k tokens: exit after the current tool call. Stop every "
+                     "4, at about 230k tokens: exit after the current tool call. Stop every "
                      "background shell and the watcher, but not a detached `jig batch`, then "
                      "run `jig orch demo rollover`.", only):
             self.assertIn(rule, flat)
@@ -872,8 +896,8 @@ class JigNewTest(JigNewCase):
         self.assertEqual(orchestrator.count("ASD-STE100"), 1)
         self.assertNotIn("will be in `prefs.md`", orchestrator)
         flat = " ".join(orchestrator.split())
-        for rule in ("After each step, run `jig ctx`.", "3, at about 250k tokens: roll over.",
-                     "4, at about 280k tokens: exit after the current tool call.",
+        for rule in ("After each step, run `jig ctx`.", "3, at about 200k tokens: roll over.",
+                     "4, at about 230k tokens: exit after the current tool call.",
                      "a rollover does not affect it",
                      "Its first message to the console is its first update: a summary of "
                      "the last session and the next steps, which cites the commit of "

@@ -38,6 +38,18 @@ The two clones, ~/ws/src/<project>-dev and ~/ws/src/<project> of the worker acco
 are read through ssh, as the screen is; a clone that is missing or has no upstream
 counts as pushed. The screen is printed as for code 5.
 
+At each poll of a live session, jig wait also reads the unit's context readout in the
+worker account, as jig ctx <tmux session> reads it there, with the limits of jig ctx:
+200000 and 230000 tokens, or JIG_CTX_SOFT and JIG_CTX_HARD. The first reading at or
+above the soft limit sends the unit a line, as jig send does, to start no new step; the
+first at or above the hard limit sends a line to stop after its last pushed commit; a
+first reading at both sends only the second. This is the fallback of the unit's own run
+of jig ctx after each step. Each line goes at most once for each start of the unit, also
+with two waits at once: the file <lock>.ctx beside the lock names the start and each
+line sent, and is written before the send. Each line sent, or refused, is one line
+"ctx: ..." in ~/ws/reviews/<project>/orch/events.log. No reading, or no ssh, sends
+nothing; the lines never end the wait or change its exit code.
+
 That exception holds only while the project's clean room is on: the clean room is the
 setting that keeps reference material away from everyone but the spec writer. The
 project profile in the kickoff record sets it (see lib/jig_profile.py). With "clean
@@ -46,15 +58,21 @@ no value, a line on stderr says so and the screen stays hidden, as with the clea
 """
 
 import datetime
+import fcntl
 import hashlib
+import importlib.machinery
+import importlib.util
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
 
+import jig_context  # noqa: E402
 import jig_profile  # noqa: E402
 import jig_units  # noqa: E402
 from jig_tmux import (DIALOG_POLLS, INPUT_BARS, has_input_bar, non_blank,  # noqa: E402
@@ -75,6 +93,21 @@ SCREEN_WIDTH = 200
 MOVING_LINE = re.compile("|".join([r"…", r" run [0-9]", *map(re.escape, INPUT_BARS)]))
 DIGITS = re.compile(r"[0-9]")
 WHOLE_MINUTES = re.compile(r"[0-9]+")
+
+# The context readout is read in the unit's account by the code of lib/jig_context.py,
+# sent there on stdin; a line is sent to the unit as jig send sends one.
+CONTEXT_LIBRARY = ROOT / "lib" / "jig_context.py"
+SEND_SCRIPT = ROOT / "libexec" / "jig-send"
+READOUT = re.compile(r"(?P<tokens>[0-9]+)/[0-9]+")
+EVENTS_FILE = "events.log"
+CONTEXT_LINES = {
+    "soft": "jig: your context is {tokens} tokens, at or above the soft limit of {limit}: "
+            "start no new step; finish the step in hand, push it, and report STOPPED if "
+            "steps are left.",
+    "hard": "jig: your context is {tokens} tokens, at or above the hard limit of {limit}: "
+            "stop after your last complete pushed commit, with a clean tree, and report "
+            "STOPPED if steps are left.",
+}
 
 
 def setting(name, default):
@@ -136,8 +169,99 @@ def unpushed_clone(running):
     return None
 
 
+def context_tokens(running):
+    """Return the tokens of the unit's context readout, or None for no reading.
+
+    The readout is read in the worker account, as jig ctx <tmux session> reads it there:
+    ssh starts python3, which runs lib/jig_context.py from stdin, so the worker account
+    needs no access to this tree. A reading of none, an account that ssh does not reach
+    and any other failure all give None, and so no line.
+    """
+    words = ["python3", "-I", "-", running.session]
+    try:
+        result = subprocess.run(jig_units.remote_command(running.account, words),
+                                input=CONTEXT_LIBRARY.read_bytes(), capture_output=True,
+                                timeout=jig_units.SSH_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    first = result.stdout.decode("utf-8", "replace").split("\n", 1)[0].strip()
+    matched = READOUT.fullmatch(first)
+    return int(matched["tokens"]) if matched else None
+
+
+def mark_path(lock):
+    return lock.with_name(lock.name + ".ctx")
+
+
+def claim_line(running, kind):
+    """Note in the mark beside the lock that the line of kind soft or hard goes to this
+    start of the unit; return False when it went already, or must not go.
+
+    The mark holds the start of the lock on its first line, then the kind of each line
+    sent. A mark of another start is a mark of an earlier run of the unit and counts as
+    none. Two jig waits can run on one unit, for example the one of jig batch and one of
+    the orchestrator, so the mark is read and written under an exclusive lock of the
+    file: of two waits that reach a limit at the same poll, only the first sends. A sent
+    hard line also stands for the soft one, so the soft line never follows it.
+    """
+    start = f"start={running.start.isoformat()}"
+    descriptor = os.open(mark_path(running.lock), os.O_RDWR | os.O_CREAT, 0o664)
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        lines = stream.read().splitlines()
+        sent = lines[1:] if lines[:1] == [start] else []
+        if kind in sent or "hard" in sent:
+            return False
+        # Written before the send, so that a send that fails is not tried again.
+        stream.seek(0)
+        stream.truncate()
+        stream.write("\n".join([start, *sent, kind]) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return True
+
+
+_sender = None
+
+
+def send_line(running, text):
+    """Send one line to the unit's session as jig send does; return None when it was
+    submitted, or the reason of the refusal."""
+    global _sender
+    if _sender is None:
+        loader = importlib.machinery.SourceFileLoader("jig_send", str(SEND_SCRIPT))
+        _sender = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("jig_send", loader))
+        loader.exec_module(_sender)
+    try:
+        failure = _sender.run_worker(running.account, running.session, text, [])
+    except OSError as error:
+        return f"worker: {error.strerror or error}"
+    return None if failure is None else f"{failure[0]}: {failure[1]}"
+
+
+def announce(project, line):
+    """Append one line to the orchestrator's event file, in one write in append mode, so
+    that a line that jig batch or the supervisor appends at the same time is not mixed
+    into it. A failure costs one line on stderr and does not end the wait."""
+    path = pathlib.Path.home() / "ws" / "reviews" / project / "orch" / EVENTS_FILE
+    data = f"{line}\n".encode("utf-8")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            if os.write(descriptor, data) != len(data):
+                raise OSError(0, "the line was written only in part")
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        print(f"jig wait: cannot append to {path} ({error.strerror or error}): {line}",
+              file=sys.stderr, flush=True)
+
+
 class Wait:
-    def __init__(self, conf, running):
+    def __init__(self, conf, running, limits=(jig_context.SOFT_LIMIT, jig_context.HARD_LIMIT)):
         self.conf = conf
         self.running = running
         # True when the screen must not be printed: a session in the spec account while
@@ -145,6 +269,45 @@ class Wait:
         self.spec = (jig_units.is_spec_account(conf, running.account)
                      and jig_profile.clean_room_on(conf))
         self.began = time.monotonic()
+        self.soft, self.hard = limits
+        # Once the hard line went to this start, no line can go any more, so the
+        # readout is not read again.
+        self.lines_done = False
+        self.mark_failed = False
+
+    def check_context(self):
+        """Send the unit the soft or the hard line when its readout reached a limit and
+        that line has not gone to this start yet, and note the send in the event file.
+
+        This is the fallback of the unit's own run of jig ctx after each step. It never
+        ends the wait and never changes its exit code.
+        """
+        if self.lines_done:
+            return
+        running = self.running
+        tokens = context_tokens(running)
+        if tokens is None or tokens < self.soft:
+            return
+        # A first reading at both limits sends only the hard line.
+        kind = "hard" if tokens >= self.hard else "soft"
+        limit = self.hard if kind == "hard" else self.soft
+        try:
+            claimed = claim_line(running, kind)
+        except OSError as error:
+            # With no mark the line could go at every poll, so it does not go at all.
+            if not self.mark_failed:
+                print(f"jig wait: {running.unit}: no {kind} line sent: cannot write the "
+                      f"mark {mark_path(running.lock)}: {error.strerror or error}",
+                      file=sys.stderr, flush=True)
+            self.mark_failed = True
+            return
+        self.lines_done = kind == "hard"
+        if not claimed:
+            return
+        failure = send_line(running, CONTEXT_LINES[kind].format(tokens=tokens, limit=limit))
+        outcome = f"{kind} line sent" if failure is None else f"{kind} line not sent: {failure}"
+        announce(running.project, f"ctx: {running.unit} {tokens} tokens, at or above "
+                                  f"{limit}: {outcome}")
 
     def end(self, code, word, screen=None):
         unit = self.running.unit
@@ -183,6 +346,7 @@ class Wait:
                 no_bar = 0 if has_input_bar(screen) else no_bar + 1
                 if no_bar >= DIALOG_POLLS:
                     return self.end(DIALOG, f"a dialog in session {running.session}", screen)
+                self.check_context()
                 digest = screen_hash(screen)
                 if last is None:
                     last = digest
@@ -246,6 +410,10 @@ def main(argv):
     try:
         poll = setting("JIG_WAIT_POLL", POLL_SECONDS)
         check = setting("JIG_WAIT_CHECK", CHECK_SECONDS)
+        try:
+            limits = jig_context.limits()
+        except ValueError as error:
+            raise jig_units.Refused(f"refused: setting: {error}") from None
         conf = jig_units.read_conf(project)
         running = find_unit(project, unit)
         if running is None:
@@ -272,7 +440,7 @@ def main(argv):
     except jig_units.Refused as error:
         print(f"jig wait: {error}", file=sys.stderr)
         return REFUSED
-    return Wait(conf, running).run(poll, check)
+    return Wait(conf, running, limits).run(poll, check)
 
 
 if __name__ == "__main__":

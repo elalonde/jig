@@ -42,9 +42,14 @@ PROOF: P1 <positive check>; P2 <evidence that it really ran>; P3 <seeded
   exit 0, trees clean>. A pass that cannot fail proves nothing.
 SESSION ECONOMY: grep first; read by section; cut -c1-200; long output
   to ~/ws/reviews/<project>/<ID>-*.txt; pass or fail from exit codes;
-  the full suite once per product commit, timed. Start no new step
-  above 250k tokens; stop at 280k after the last complete pushed
-  commit, with a clean tree. Wait on CI with a command that exits
+  the full suite once per product commit, timed. After each step, run
+  jig ctx; at exit 3 start no new step; at exit 4 stop after the last
+  complete pushed commit, with a clean tree; a stop with steps left
+  reports "STOPPED: <reason>"; at exit 2 go on, and run jig ctx again
+  after the next step. At exit 3 or 4 still write, commit and push the
+  report: the report is no new step, and its status is OK when every
+  step before the report is done, else not OK, with the steps left.
+  Wait on CI with a command that exits
   when CI ends (for jig, tools/ci-green --wait), not with a watcher
   that you must start again. A test or probe that needs tmux uses its
   own server, tmux -L <name>, never the default server. Edit files

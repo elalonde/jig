@@ -613,7 +613,8 @@ git push -q origin master
         self.assertFalse(path.exists())
         self.assertEqual(self.start().returncode, 0)
         settings = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(settings["permissions"], {"defaultMode": "auto"})
+        self.assertEqual(settings["permissions"],
+                         {"defaultMode": "auto", "allow": ["Bash(jig ctx:*)"]})
 
     def test_start_keeps_a_permission_mode_the_clone_names(self):
         path = self.worker_clone / ".claude" / "settings.local.json"
@@ -624,7 +625,52 @@ git push -q origin master
         self.assertEqual(self.start().returncode, 0)
         settings = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(settings["permissions"],
-                         {"defaultMode": "acceptEdits", "allow": ["Bash(make:*)"]})
+                         {"defaultMode": "acceptEdits",
+                          "allow": ["Bash(make:*)", "Bash(jig ctx:*)"]})
+
+    def test_start_adds_the_jig_ctx_rule_once_and_keeps_every_other_rule_and_key(self):
+        # A clone with its own allow and deny rules gets the rule for jig ctx after them,
+        # and a second start, after the first unit ended, adds no second copy.
+        path = self.worker_clone / ".claude" / "settings.local.json"
+        path.parent.mkdir()
+        permissions = {"allow": ["Bash(make:*)", "Read(~/ws/**)"], "deny": ["Bash(rm:*)"],
+                       "additionalDirectories": ["/tmp"]}
+        path.write_text(json.dumps({"permissions": permissions, "env": {"A": "1"}}),
+                        encoding="utf-8")
+        self.assertEqual(self.start().returncode, 0)
+        self.assertEqual(self.tmux("kill-session", "-t", f"={SESSION}").returncode, 0)
+        self.lock().unlink()
+        self.assertEqual(self.start().returncode, 0)
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["permissions"]["allow"],
+                         ["Bash(make:*)", "Read(~/ws/**)", "Bash(jig ctx:*)"])
+        self.assertEqual(settings["permissions"]["deny"], ["Bash(rm:*)"])
+        self.assertEqual(settings["permissions"]["additionalDirectories"], ["/tmp"])
+        self.assertEqual(settings["env"], {"A": "1"})
+
+    def test_start_keeps_a_jig_ctx_rule_the_clone_already_has_once(self):
+        path = self.worker_clone / ".claude" / "settings.local.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"permissions": {"allow": ["Bash(jig ctx:*)"]}}),
+                        encoding="utf-8")
+        self.assertEqual(self.start().returncode, 0)
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["permissions"]["allow"], ["Bash(jig ctx:*)"])
+
+    def test_start_refuses_an_allow_list_that_is_not_a_list(self):
+        # A rule written as one string is not a list of rules; jig start does not guess
+        # what was meant, refuses with the kind settings, and leaves the file as it was.
+        path = self.worker_clone / ".claude" / "settings.local.json"
+        path.parent.mkdir()
+        text = json.dumps({"permissions": {"allow": "Bash(make:*)"}})
+        path.write_text(text, encoding="utf-8")
+        result = self.start()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refused: settings:", result.stderr)
+        self.assertIn("permissions.allow that is not a list", result.stderr)
+        self.assertEqual(path.read_text(encoding="utf-8"), text)
+        self.assertNotEqual(self.tmux("has-session", "-t", f"={SESSION}").returncode, 0)
+        self.assertFalse(self.worker_file("claude-args").exists())
 
     def test_start_sets_high_effort_by_default(self):
         self.assertEqual(self.start().returncode, 0)

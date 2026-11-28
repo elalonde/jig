@@ -81,8 +81,16 @@ This section holds in a project with `reference` yes in the project profile.
   only the lines you need.
 - After each step, write `~/ws/reviews/@PROJECT@/<ID>-progress.md`. A fresh
   session with the same prompt continues from the first step not marked done.
-- Start no new step above about 250k tokens of context. At about 280k, stop
+- Start no new step above about 200k tokens of context. At about 230k, stop
   after the last complete pushed commit, with a clean tree.
+- After each step, run `jig ctx`: it prints this session's context size, and
+  its exit code says what to do next. At exit 0, go on. At exit 3 (200k),
+  start no new step. At exit 4 (230k), stop after the last complete pushed
+  commit, with a clean tree. At exit 2, no size, go on, and run `jig ctx`
+  again after the next step; the limits above still hold. At exit 3 or 4
+  the unit still writes, commits and pushes its report: the report is no
+  new step, and its status is `OK` when every step before the report is
+  done, else not `OK`, with the steps left.
 - The report is `impl/log/<ID>-report.md` in the form of jig's report
   template. Commit it alone with `<ID>-prompt.md` and, when they exist, the
   progress and findings files, with the subject exactly `log: <ID>`, and

@@ -479,6 +479,42 @@ class ValidatePromptTest(ValidateCase):
                       "because it rewrites .git/index; git --no-optional-locks status is "
                       "allowed.>", read)
 
+    def test_prompt_template_tells_the_unit_to_run_jig_ctx_after_each_step(self):
+        # Every unit learns from its prompt to read its own context size after each step,
+        # what each exit code asks of it, and that it still writes its report at a limit;
+        # the old fixed limits of 250k and 280k are gone.
+        _, blocks, _ = prompt_parts_of((TEMPLATES / "prompt.md").read_text(encoding="utf-8"))
+        economy = " ".join(" ".join(blocks["SESSION ECONOMY"]).split())
+        self.assertIn("After each step, run jig ctx; at exit 3 start no new step; at exit 4 "
+                      "stop after the last complete pushed commit, with a clean tree; a stop "
+                      "with steps left reports \"STOPPED: <reason>\"; at exit 2 go on, and "
+                      "run jig ctx again after the next step.", economy)
+        self.assertIn("At exit 3 or 4 still write, commit and push the report: the report is "
+                      "no new step, and its status is OK when every step before the report "
+                      "is done, else not OK, with the steps left.", economy)
+        self.assertNotIn("250k", economy)
+        self.assertNotIn("280k", economy)
+
+    def test_validate_prompt_refuses_a_session_economy_section_without_jig_ctx(self):
+        # The same prompt without the command fails with one line that names the section,
+        # and passes again with the command, also when its two words wrap onto two lines.
+        text = fixture("good-prompt.md")
+        self.assertIn("run jig ctx;", text)
+        failures = self.assert_invalid("prompt", text.replace("run jig ctx;", "run it;"),
+                                       "SESSION ECONOMY")
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("jig ctx", failures[0])
+        self.assert_valid("prompt", text.replace("run jig ctx;", "run jig\n  ctx;"))
+
+    def test_validate_prompt_takes_jig_ctx_only_from_the_session_economy_section(self):
+        # The words in another section do not count, and a longer word such as jig ctxs
+        # is not the command.
+        text = fixture("good-prompt.md").replace("run jig ctx;", "run jig ctxs;")
+        text = text.replace("AUTHORITY: none beyond the normal rules.",
+                            "AUTHORITY: none beyond the normal rules; jig ctx may run.")
+        failures = self.assert_invalid("prompt", text, "SESSION ECONOMY")
+        self.assertEqual(len(failures), 1, failures)
+
     def test_validate_prompt_accepts_the_template_once_its_names_are_filled(self):
         text = (TEMPLATES / "prompt.md").read_text(encoding="utf-8")
         self.assert_invalid("prompt", text, "'<ID>'")
