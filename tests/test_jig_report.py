@@ -187,6 +187,22 @@ class ReportFillTest(ReportCase):
         self.assertEqual(self.report_on_origin(), report_text())
         self.assertEqual(self.origin_subjects()[0], "report: demo")
 
+    def test_report_accepts_a_stopped_status_with_its_reason(self):
+        # A unit that stopped at its context limit with steps left reports STOPPED and
+        # why; the report passes and is marked done, so that jig batch can start it again.
+        self.begin()
+        self.push_report(report_text(status="STOPPED: context limit, steps 5 to 7 left"))
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.header(1), "STOPPED: context limit, steps 5 to 7 left")
+        self.assertEqual(self.origin_subjects()[0], "report: demo")
+
+    def test_report_refuses_a_stopped_status_with_no_reason(self):
+        # A bare STOPPED gives the orchestrator nothing to act on, so it is refused.
+        self.begin()
+        before = self.push_report(report_text(status="STOPPED"))
+        self.assert_refused_unchanged(self.report(), "report", before)
+
     def test_a_missing_context_file_leaves_context_none(self):
         self.begin()
         self.exit_file("demo-make-check.exit", 0)

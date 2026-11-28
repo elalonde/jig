@@ -346,14 +346,17 @@ def prompt_failures(lines):
 def status_problem(line):
     if line == "OK":
         return None
-    for prefix in ("OK: ", "NEEDS ERIC: "):
+    # STOPPED is a unit that stopped with steps left; like NEEDS ERIC it must say why,
+    # so a bare word is refused.
+    for prefix in ("OK: ", "STOPPED: ", "NEEDS ERIC: "):
         if line.startswith(prefix) and FREE_TEXT.fullmatch(line[len(prefix):]):
             return None
     if line.startswith("NEEDS SPEC: "):
         question = line[len("NEEDS SPEC: "):]
         if question.startswith("IQ-") and jig_ids.RECORD_ID.fullmatch(question):
             return None
-    return f"status is not OK[: note], NEEDS ERIC: reason or NEEDS SPEC: IQ-n: {line!r}"
+    return (f"status is not OK[: note], STOPPED: reason, NEEDS ERIC: reason or "
+            f"NEEDS SPEC: IQ-n: {line!r}")
 
 
 def version_problem(value):

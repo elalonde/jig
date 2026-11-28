@@ -35,6 +35,15 @@ from the prompt and copies the inbox directory beside it. The next row starts on
 jig report passed and the report says OK. A report of NEEDS SPEC blocks only the rows
 that depend on that row.
 
+A report of STOPPED means the session stopped with steps left, mostly at its context
+limit, after its last pushed commit. The rows that depend on it must not start on work
+that is not done, so jig batch closes that worker at once and starts the same row again,
+with the same prompt, ID and expected minutes, before the next row of the file. The
+fresh session goes on from its progress file. A row starts at most 3 times in one run.
+After the third STOPPED the row is not OK: its dependents are blocked as for NEEDS SPEC,
+and the other rows run. A rerun of the same file starts the row again, because its last
+end line is not OK, and counts its starts from 1.
+
 A pre-check or review session writes its findings to impl/log/<ID>-findings.md and
 commits the file with its report. Once such a row has reported OK, and again whenever a
 rerun skips it as closed OK, jig batch reads that file from origin and counts its
@@ -72,7 +81,10 @@ refused: <reason>" when it refuses the batch file or its start, with the reason 
 prints, and "batch: <batch file> ended: <exit code>" when it exits after it began, for
 any reason. SIGTERM, SIGHUP and SIGINT end it with 128 plus the number of the signal.
 A tab or a newline in a field becomes a space. It writes no line at its start or for a
-row, because the supervisor announces each report. When the directory is missing or
+row, because the supervisor announces each report, with one exception: a row that
+reports STOPPED gives "batch: <batch file> restart: <ID> reported STOPPED; start <k> of
+3" before each start again, and "batch: <batch file> not OK: <ID> reported STOPPED 3
+times; its dependents are blocked" after the third. They are printed on stdout too. When the directory is missing or
 the write fails, a line on stderr says so and the exit code stays. The exit codes:
 
   0  every row reported OK or was skipped
@@ -88,7 +100,8 @@ the write fails, a line on stderr says so and the exit code stays. The exit code
  10  jig wait refused (jig wait 1, or any code it does not give)
  11  jig start refused
  12  jig close refused
- 13  no runnable row remains, and some rows did not report OK: NEEDS SPEC or blocked
+ 13  no runnable row remains, and some rows did not report OK: NEEDS SPEC, STOPPED 3
+     times, or blocked
  14  the orchestrator's clone could not read origin
  15  findings: a pre-check row has a must-fix or should-fix finding, or a review row a
      must-fix finding, or the findings file of either holds a finding that jig cannot
@@ -144,6 +157,9 @@ WAIT_NO_CHANGE = 5
 WAIT_UNPUSHED = 8
 
 MAX_UNITS = 6
+# A row that reports STOPPED starts again, up to this many starts in one run in all, so
+# that a unit that can never finish does not restart without end.
+MAX_STARTS = 3
 KINDS = ("unit", "pre-check", "review")
 # The heading lines of a findings file that count. A heading must start its line, as
 # grep -c '^### F-[0-9]* must-fix' counts it, so text that mentions a heading in the
@@ -306,9 +322,11 @@ def close_delay():
 
 
 class Batch:
-    def __init__(self, project, rows):
+    def __init__(self, project, rows, shown):
         self.project = project
         self.rows = rows
+        # The batch file as the event lines name it.
+        self.shown = shown
         try:
             conf = helpers.read_conf(project)
         except helpers.Refused as error:
@@ -323,6 +341,10 @@ class Batch:
         self.reported_ok = set()
         self.not_run = set()
         self.needs_spec = set()
+        # The rows whose last start in this run reported STOPPED, and the rows that
+        # reported it at each of their starts.
+        self.stopped = set()
+        self.stopped_out = set()
         # Workers that reported and are not closed yet: account, ID, and when the
         # close falls due.
         self.pending = []
@@ -467,11 +489,16 @@ class Batch:
         elif status == "NEEDS SPEC":
             self.needs_spec.add(row.unit)
             self.not_run.add(row.unit)
+        elif status == "STOPPED":
+            # The same ID starts again at once, and jig start refuses while the lock
+            # of the stopped worker is held, so the close does not wait for its delay.
+            self.stopped.add(row.unit)
+            self.close(row.account, row.unit)
         elif status == "NEEDS ERIC":
             raise Stop(NEEDS_ERIC, f"stop: {row.unit}: NEEDS ERIC")
         else:
             raise Stop(REPORT_FAILED, f"stop: {row.unit}: status {status!r} is not OK, "
-                                      f"NEEDS ERIC or NEEDS SPEC")
+                                      f"STOPPED, NEEDS ERIC or NEEDS SPEC")
 
     def check_findings(self, row):
         """Stop the batch when the findings of a pre-check or review row must be handled.
@@ -505,6 +532,8 @@ class Batch:
                 continue
             if unit in self.needs_spec:
                 say(f"blocked {row.unit}: {unit} reported NEEDS SPEC")
+            elif unit in self.stopped_out:
+                say(f"blocked {row.unit}: {unit} reported STOPPED {MAX_STARTS} times")
             elif unit in self.not_run:
                 say(f"blocked {row.unit}: {unit} did not run")
             else:
@@ -523,9 +552,33 @@ class Batch:
         if not self.runnable(row):
             self.not_run.add(row.unit)
             return
+        for start in range(1, MAX_STARTS + 1):
+            self.start_once(number, row, start)
+            if row.unit not in self.stopped:
+                break
+        else:
+            self.stopped_out.add(row.unit)
+            self.not_run.add(row.unit)
+            self.event(f"not OK: {row.unit} reported STOPPED {MAX_STARTS} times; "
+                       f"its dependents are blocked")
+            return
+        if row.kind != "unit" and row.unit in self.reported_ok:
+            self.check_findings(row)
+
+    def event(self, text):
+        """Print a line of the batch and append it to the orchestrator's event file."""
+        line = f"batch: {self.shown} {text}"
+        say(line)
+        announce(self.project, line)
+
+    def start_once(self, number, row, start):
+        """Start the row, wait for its report and read it; start is 1 for its first start."""
         if self.hold.exists():
             raise Stop(HOLD, f"stop: {self.project} is held ({self.hold}); {row.unit} "
                              f"did not start")
+        if start > 1:
+            self.event(f"restart: {row.unit} reported STOPPED; start {start} of {MAX_STARTS}")
+        self.stopped.discard(row.unit)
         self.close_account(row.account)
         self.close_due()
         self.progress.parent.mkdir(parents=True, exist_ok=True)
@@ -538,8 +591,6 @@ class Batch:
         say(f"started {row.name()} ({number}/{len(self.rows)}) in {row.account}")
         self.wait_for(row)
         self.report(row)
-        if row.kind != "unit" and row.unit in self.reported_ok:
-            self.check_findings(row)
 
     def run(self):
         for number, row in enumerate(self.rows, 1):
@@ -642,7 +693,7 @@ def main(argv):
     # output file of a detached batch wakes nobody.
     shown = one_line(args.batch_file)
     try:
-        batch = Batch(args.project, read_batch(args.project, args.batch_file))
+        batch = Batch(args.project, read_batch(args.project, args.batch_file), shown)
     except Stop as refused:
         print(f"jig batch: refused: {refused.text}", file=sys.stderr)
         announce(args.project, f"batch: {shown} refused: {one_line(refused.text)}")

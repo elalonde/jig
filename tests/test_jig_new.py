@@ -402,7 +402,10 @@ class JigNewTest(JigNewCase):
                      "At exit 2, no size, go on, and run `jig ctx` again after the next step",
                      "At exit 3 or 4 the unit still writes, commits and pushes its report: "
                      "the report is no new step, and its status is `OK` when every step "
-                     "before the report is done, else not `OK`, with the steps left."):
+                     "before the report is done, else `STOPPED: <reason>`, with the steps "
+                     "left.",
+                     "`OK` in a report means that every step of the prompt is done.",
+                     "after its last complete pushed commit, reports `STOPPED: <reason>`"):
             self.assertIn(rule, text)
         self.assertNotIn("250k", text)
         self.assertNotIn("280k", text)
@@ -459,7 +462,11 @@ class JigNewTest(JigNewCase):
                      "refuses a rerun until you run `jig close`.",
                      "exits only when every worker that reported is closed, which can be up to "
                      "10 minutes later.",
-                     "`NEEDS SPEC` does not stop the batch"):
+                     "`NEEDS SPEC` does not stop the batch",
+                     "`STOPPED` does not stop the batch either",
+                     "`batch: <batch file> restart: <ID> reported STOPPED; start <k> of 3`",
+                     "`batch: <batch file> not OK: <ID> reported STOPPED 3 times; its "
+                     "dependents are blocked`"):
             self.assertIn(line, text)
         self.assertNotIn("phase 1", text)
 

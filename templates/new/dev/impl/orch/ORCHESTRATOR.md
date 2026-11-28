@@ -280,6 +280,17 @@ same file skips the rows that are closed OK already.
 `NEEDS SPEC` does not stop the batch: the rows that depend on that unit are
 blocked, and the others go on. The batch stops when no runnable row remains.
 
+`STOPPED` does not stop the batch either: the unit stopped with steps left.
+`jig batch` starts no row that depends on it, closes its worker at once, and
+starts the same row again, as a fresh session with the same prompt, ID and
+expected minutes, before the next row of the file. The event file gets
+`batch: <batch file> restart: <ID> reported STOPPED; start <k> of 3`. A row
+starts at most 3 times in one run; after the third `STOPPED` the event file gets
+`batch: <batch file> not OK: <ID> reported STOPPED 3 times; its dependents are blocked`,
+its dependents stay blocked as for `NEEDS SPEC`, the other rows run, and the
+batch exits 13. Read its progress file and report, fix the cause, and run the
+same file again: it starts that row again, because the row is not closed OK.
+
 After a stop, `jig batch` prints the stop line at once, but exits only when
 every worker that reported is closed, which can be up to 10 minutes later.
 Act on the stop line and on the `report:` line when they come; do not wait for

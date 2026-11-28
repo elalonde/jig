@@ -90,7 +90,12 @@ This section holds in a project with `reference` yes in the project profile.
   again after the next step; the limits above still hold. At exit 3 or 4
   the unit still writes, commits and pushes its report: the report is no
   new step, and its status is `OK` when every step before the report is
-  done, else not `OK`, with the steps left.
+  done, else `STOPPED: <reason>`, with the steps left.
+- `OK` in a report means that every step of the prompt is done. A unit that
+  stops with steps left, after its last complete pushed commit, reports
+  `STOPPED: <reason>` and names the first step that is not done, never
+  `OK: partial`: `jig batch` takes any `OK` for done and starts the units that
+  depend on it, but starts a `STOPPED` unit again with the same prompt and ID.
 - The report is `impl/log/<ID>-report.md` in the form of jig's report
   template. Commit it alone with `<ID>-prompt.md` and, when they exist, the
   progress and findings files, with the subject exactly `log: <ID>`, and

@@ -431,6 +431,13 @@ class BatchDependsTest(BatchCase):
         self.assertEqual(self.calls(), self.one_unit("u1"))
         self.assertIn("stop: no runnable row remains", result.stdout)
 
+    def test_ok_with_a_note_of_partial_is_ok_and_its_dependent_runs(self):
+        # jig reads no note after "OK:", so "OK: partial" is OK and the dependent starts.
+        self.control("status-u1", "OK:_partial")
+        result = self.batch(self.row("u1"), self.row("u2", depends="u1"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), self.one_unit("u1") + self.one_unit("u2"))
+
     def test_a_unit_of_an_earlier_batch_closed_ok_counts_as_ok(self):
         # e1 was closed OK with its report filled in an earlier batch, so u1 runs.
         # e2 was closed OK but its report was never filled, so u2 does not start.
@@ -440,6 +447,77 @@ class BatchDependsTest(BatchCase):
         self.assertEqual(result.returncode, 13, result.stdout + result.stderr)
         self.assertEqual(self.calls(), self.one_unit("u1"))
         self.assertIn("not started u2: its depends-on ID e2 is not closed OK", result.stdout)
+
+
+class BatchStoppedTest(BatchCase):
+    """A row whose report says STOPPED: the unit stopped with steps left."""
+
+    def setUp(self):
+        super().setUp()
+        self.orch = self.home / "ws" / "reviews" / "jig" / "orch"
+        self.orch.mkdir(parents=True)
+        self.path = self.tmp / "batch.tsv"
+
+    def event_lines(self):
+        path = self.orch / "events.log"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def restart(self, unit, start):
+        return f"batch: {self.path} restart: {unit} reported STOPPED; start {start} of 3"
+
+    def test_a_row_that_stops_once_starts_again_at_once_and_then_its_dependent_runs(self):
+        # u1 reports STOPPED, then OK. Its worker is closed before the second start,
+        # with the same prompt and expected minutes, before u2 of the file; u3, which
+        # depends on u1, runs after the OK. One restart line goes to the event file.
+        self.control("status-u1", "STOPPED:_context_limit OK:_done")
+        result = self.batch(self.row("u1", minutes="45"), self.row("u2"),
+                            self.row("u3", depends="u1"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls()[:9], self.one_unit("u1") * 2 + ["start u2"])
+        self.assertIn("start u3", self.calls())
+        starts = [line for line in self.start_lines() if line.startswith("start u1 ")]
+        self.assertEqual(len(starts), 2)
+        for line in starts:
+            self.assertIn(f"prompt={self.prompts}/u1.md --expected=45 progress=1/3 u1", line)
+        self.assertEqual(self.event_lines(), [self.restart("u1", 2),
+                                              f"batch: {self.path} ended: 0"])
+        self.assertIn(self.restart("u1", 2), result.stdout)
+
+    def test_a_row_that_stops_three_times_blocks_its_dependent_and_others_run(self):
+        # u1 reports STOPPED at each of its 3 starts: 2 restart lines, then the line
+        # not OK. u2 depends on it and never starts; u3 still runs; the batch ends 13.
+        self.control("status-u1", "STOPPED:_a STOPPED:_b STOPPED:_c OK:_never")
+        result = self.batch(self.row("u1"), self.row("u2", depends="u1"), self.row("u3"))
+        self.assertEqual(result.returncode, 13, result.stdout + result.stderr)
+        self.assertEqual(self.calls(), self.one_unit("u1") * 3 + self.one_unit("u3"))
+        self.assertEqual(self.event_lines(), [
+            self.restart("u1", 2), self.restart("u1", 3),
+            f"batch: {self.path} not OK: u1 reported STOPPED 3 times; its dependents "
+            f"are blocked",
+            f"batch: {self.path} ended: 13"])
+        self.assertIn("blocked u2: u1 reported STOPPED 3 times", result.stdout)
+        self.assertIn("not OK: u1 u2", result.stdout)
+
+    def test_a_rerun_starts_a_row_whose_last_end_was_stopped_and_counts_from_one(self):
+        # After 3 STOPPED reports the row is not closed OK, so the same file starts it
+        # again, with 3 starts again; this time it reports OK and its dependent runs.
+        self.control("status-u1", "STOPPED:_a STOPPED:_b STOPPED:_c")
+        rows = (self.row("u1"), self.row("u2", depends="u1"))
+        self.assertEqual(self.batch(*rows).returncode, 13)
+        (self.fake / "calls").unlink()
+        self.control("status-u1", "STOPPED:_d STOPPED:_e OK:_done")
+        again = self.batch(*rows)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(self.calls(), self.one_unit("u1") * 3 + self.one_unit("u2"))
+
+    def test_a_hold_before_a_start_again_stops_the_batch(self):
+        # The hold comes while the first start runs: the row does not start again.
+        self.control("status-u1", "STOPPED:_a OK:_done")
+        self.control("hold-after-u1", "")
+        result = self.batch(self.row("u1"), self.row("u2"))
+        self.assert_stopped(result, 5, "u1 did not start")
+        self.assertEqual(self.calls(), self.one_unit("u1"))
+        self.assertEqual(self.event_lines(), [f"batch: {self.path} ended: 5"])
 
 
 class BatchFindingsTest(BatchCase):

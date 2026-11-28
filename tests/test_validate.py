@@ -25,7 +25,9 @@ WRONG_HEADERS = {
     1: ("", "ok", "OK:", "OK: ", "OK note", "OK[: note]", "OK: <note>", "OK | NEEDS ERIC: x",
         "DONE: x", "NEEDS ERIC", "NEEDS ERIC:", "NEEDS ERIC: ", "NEEDS ERIC: <reason>",
         "NEEDS ERIC x", "needs eric: x", "NEEDS SPEC", "NEEDS SPEC: why", "NEEDS SPEC: IQ-",
-        "NEEDS SPEC: IQ-n", "NEEDS SPEC: Q-3", "NEEDS SPEC: IQ-3 why", " OK"),
+        "NEEDS SPEC: IQ-n", "NEEDS SPEC: Q-3", "NEEDS SPEC: IQ-3 why", " OK",
+        "STOPPED", "STOPPED:", "STOPPED: ", "STOPPED: <reason>", "STOPPED x",
+        "stopped: x"),
     2: ("", "jig-report: 2", "jig-report:1", "jig-report: ", "report: 1", "jig-report: 1 "),
     3: ("", "id:", "id: ", "id: Demo", "id: sevench", "id: a b", "ID: demo", "id: <ID>",
         "id: demo ", "id:  demo"),
@@ -491,9 +493,20 @@ class ValidatePromptTest(ValidateCase):
                       "run jig ctx again after the next step.", economy)
         self.assertIn("At exit 3 or 4 still write, commit and push the report: the report is "
                       "no new step, and its status is OK when every step before the report "
-                      "is done, else not OK, with the steps left.", economy)
+                      "is done, else STOPPED: <reason>, with the steps left.", economy)
+        self.assertNotIn("not OK", economy)
         self.assertNotIn("250k", economy)
         self.assertNotIn("280k", economy)
+
+    def test_prompt_template_says_ok_means_every_step_and_stopped_names_the_reason(self):
+        # A unit that stops at its context limit with steps left must not write
+        # "OK: partial", which a batch takes for OK; the template tells it what OK
+        # means and to write STOPPED with its reason in its place.
+        _, blocks, _ = prompt_parts_of((TEMPLATES / "prompt.md").read_text(encoding="utf-8"))
+        economy = " ".join(" ".join(blocks["SESSION ECONOMY"]).split())
+        self.assertIn("OK means that every step is done; a unit that stops with steps left, "
+                      "after its last complete pushed commit, writes \"STOPPED: <reason>\"",
+                      economy)
 
     def test_validate_prompt_refuses_a_session_economy_section_without_jig_ctx(self):
         # The same prompt without the command fails with one line that names the section,
@@ -569,7 +582,8 @@ class ValidateReportTest(ValidateCase):
     def test_validate_report_accepts_each_status(self):
         for line in ("OK", "OK: a note", "OK: note: with a colon", "NEEDS ERIC: a reason",
                      "NEEDS ERIC: model is Sonnet, not Opus", "NEEDS SPEC: IQ-7",
-                     "NEEDS SPEC: IQ-120"):
+                     "NEEDS SPEC: IQ-120", "OK: partial", "STOPPED: context limit",
+                     "STOPPED: at the hard limit: steps 6 and 7 left"):
             with self.subTest(line):
                 self.assert_valid("report", report_with(1, line))
 
@@ -642,7 +656,8 @@ class ValidateReportTest(ValidateCase):
 
     def test_validate_report_template_has_the_header_lines_in_order(self):
         lines = (TEMPLATES / "report.md").read_text(encoding="utf-8").splitlines()
-        self.assertTrue(lines[0].startswith("OK[: <note>] | NEEDS ERIC: <reason>"), lines[0])
+        self.assertEqual(lines[0], "OK[: <note>] | STOPPED: <reason> | NEEDS ERIC: <reason> "
+                                   "| NEEDS SPEC: IQ-n")
         self.assertEqual(tuple(line.split(":", 1)[0] for line in lines[1:9]), HEADER_LABELS)
         self.assertEqual(lines[9], "---")
 

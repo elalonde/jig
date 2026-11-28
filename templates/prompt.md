@@ -48,7 +48,10 @@ SESSION ECONOMY: grep first; read by section; cut -c1-200; long output
   reports "STOPPED: <reason>"; at exit 2 go on, and run jig ctx again
   after the next step. At exit 3 or 4 still write, commit and push the
   report: the report is no new step, and its status is OK when every
-  step before the report is done, else not OK, with the steps left.
+  step before the report is done, else STOPPED: <reason>, with the
+  steps left. OK means that every step is done; a unit that stops with
+  steps left, after its last complete pushed commit, writes
+  "STOPPED: <reason>", never "OK: partial".
   Wait on CI with a command that exits
   when CI ends (for jig, tools/ci-green --wait), not with a watcher
   that you must start again. A test or probe that needs tmux uses its
