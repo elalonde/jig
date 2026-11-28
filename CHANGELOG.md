@@ -5,6 +5,39 @@ which files or formats changed, the migration steps for a project or a host that
 moves to the version, and who requested the change. `jig changelog --since
 <X.Y.Z>` prints the entries after the version a project is pinned to.
 
+## 0.10.7
+
+What changed: line 1 of the status line, `jig-statusline`, starts with the
+name of the pane's tmux session, then the user name. In an orchestrator pane it
+reads `jig-orch · orchestrator · 0.10 · <model> (<effort>)`. Line 1 shows the
+name of any tmux session, also one that jig did not name. Outside tmux, or when
+the tmux call fails, prints nothing or takes longer than 2 s, line 1 starts with
+the policy role and then the user name, or with the user name when no rule
+gives a role. The role is never shown beside a tmux session name. Up to 0.10.6,
+line 1 started with the user name, then the role. One tmux call gives the
+session name for line 1 and for the context file, and every call of tmux has
+the limit of 2 s. The name of the tmux window is unchanged.
+
+Files and formats: changed file: `libexec/jig-statusline`. Changed output:
+line 1 of the status line. The context file, the ledger, the trace and the conf
+file are unchanged.
+
+Migration: a host and its projects move from 0.10.6 to 0.10.7 in this order. A
+host still on 0.10.5 first takes the migration of 0.10.6, or takes both at once
+with `jig upgrade 0.10.7` and the steps of 0.10.6 after it.
+
+1. As the orchestrator account, run `jig upgrade 0.10.7`. It installs 0.10.7
+   under `/opt/jig/0.10.7/` and points `/opt/jig/current` to it.
+2. For each project, run `jig upgrade <project> 0.10.7` as the orchestrator
+   account. Check in each account that the conf file of the project reads
+   `JIG_VERSION=0.10.7`.
+3. Nothing else changes for a host or a project.
+
+Requested by: Eric, so that line 1 of the status line names the tmux session
+of the pane first.
+
+Units: 0 minor, 1 patch, 6 none
+
 ## 0.10.6
 
 What changed: `jig release <project> publish` gives each release upload a time
