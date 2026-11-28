@@ -566,10 +566,10 @@ class LinesTest(StatuslineTestCase):
 
     def test_wrong_model_warns_on_line_two_and_detached_head_shows_the_commit(self):
         repo = self.git_repo("0123456789abcdef\n")
-        self.write_policy("Sonnet", role="implementer", cwd=repo)
+        self.write_policy("Sonnet", role="spec writer", cwd=repo)
         data = dict(sample(rate_limits=False), cwd=str(repo))
         self.assertEqual(self.statusline(data),
-                         f"implementer · {USER} · 0123456 · Opus\nmodel: Opus ≠ Sonnet\n")
+                         f"spec writer · {USER} · 0123456 · Opus\nmodel: Opus ≠ Sonnet\n")
 
     def test_rule_without_role_shows_no_role(self):
         repo = self.git_repo("ref: refs/heads/main\n")
@@ -612,18 +612,20 @@ class HostConfigTest(StatuslineTestCase):
     def setUp(self):
         super().setUp()
         self.write_failing_health()
-        self.write_policy("Sonnet", role="implementer")
+        # A role that is no account's user name, so that line 1 shows whether the
+        # role is there wherever the tests run.
+        self.write_policy("Sonnet", role="reviewer")
         self.data = dict(sample(rate_limits=False), cwd=str(self.dir))
 
     def parts(self, **extra):
         """Return (role shown, health note shown, model warning shown) for one run."""
         out = self.statusline(self.data, **extra)
-        return (" · implementer · " in out, "health: 1 FAIL" in out,
+        return (out.startswith("reviewer · "), "health: 1 FAIL" in out,
                 "model: Opus ≠ Sonnet" in out)
 
     def test_both_keys_in_the_file_give_every_part(self):
         self.assertEqual(self.statusline(self.data),
-                         f"{USER} · implementer · no git · Opus\n"
+                         f"reviewer · {USER} · no git · Opus\n"
                          "health: 1 FAIL · model: Opus ≠ Sonnet\n")
 
     def test_missing_health_key_leaves_out_only_the_health_note(self):
