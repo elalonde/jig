@@ -9,9 +9,11 @@ touches the account's own files, window or context file.
 """
 
 import ast
+import contextlib
 import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pwd
@@ -19,6 +21,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import unittest.mock
 
@@ -559,14 +562,14 @@ class LinesTest(StatuslineTestCase):
         repo = self.git_repo("ref: refs/heads/feature/x\n")
         self.write_policy("Opus", role="reviewer", cwd=repo)
         data = dict(sample(rate_limits=False), cwd=str(repo / "sub"))
-        self.assertEqual(self.statusline(data), f"{USER} · reviewer · feature/x · Opus\n")
+        self.assertEqual(self.statusline(data), f"reviewer · {USER} · feature/x · Opus\n")
 
     def test_wrong_model_warns_on_line_two_and_detached_head_shows_the_commit(self):
         repo = self.git_repo("0123456789abcdef\n")
         self.write_policy("Sonnet", role="implementer", cwd=repo)
         data = dict(sample(rate_limits=False), cwd=str(repo))
         self.assertEqual(self.statusline(data),
-                         f"{USER} · implementer · 0123456 · Opus\nmodel: Opus ≠ Sonnet\n")
+                         f"implementer · {USER} · 0123456 · Opus\nmodel: Opus ≠ Sonnet\n")
 
     def test_rule_without_role_shows_no_role(self):
         repo = self.git_repo("ref: refs/heads/main\n")
@@ -745,6 +748,10 @@ class UsageFileTest(StatuslineTestCase):
 
 CTX_SESSION = "ctx-demo"
 FIGURES = {"total_input_tokens": 84213, "context_window_size": 200000, "used_percentage": 42.1}
+# A tmux limit short enough that a test with a stuck fake tmux takes a fraction of a
+# second, and far enough below the real limit that a call still on the real limit
+# shows in the time.
+SHORT_LIMIT = 0.25
 
 
 class TmuxTest(StatuslineTestCase):
@@ -826,6 +833,112 @@ class TmuxTest(StatuslineTestCase):
         self.assertEqual((result.returncode, result.stdout), (0, "84213/200000\n"), result.stderr)
 
 
+class SessionNameTest(StatuslineTestCase):
+    """Line 1 names the tmux session, else the policy role, and then the user."""
+
+    def setUp(self):
+        super().setUp()
+        self.ctx = self.tmp / "ctx"
+        self.ctx.mkdir()
+        self.data = dict(sample(rate_limits=False), cwd=str(self.dir))
+
+    fake_tmux = TmuxTest.fake_tmux
+
+    def fake_tmux_that(self, action):
+        """Write a fake tmux that logs each call and then runs the shell line action."""
+        log = self.tmp / "tmux.log"
+        log.unlink(missing_ok=True)
+        fake = self.tmp / "tmux"
+        fake.write_text(f"#!/bin/sh\necho \"$@\" >> '{log}'\n{action}\n")
+        fake.chmod(0o755)
+        return fake, log
+
+    def first_line(self, tmux, data=None):
+        out = self.statusline(data or self.data, TMUX="/tmp/x,1,0", TMUX_PANE="%7",
+                              TMUX_BIN=str(tmux), CTX_DIR=str(self.ctx))
+        return out.split("\n")[0]
+
+    def name_calls(self, log):
+        return [call for call in log.read_text().splitlines() if call.endswith("#S")]
+
+    def test_session_name_comes_first_and_the_role_is_left_out(self):
+        # In the pane of an orchestrator whose policy rule gives a role, line 1 starts
+        # with the session name and the user; the role only names the window.
+        self.write_policy("Opus", role="reviewer")
+        tmux, log = self.fake_tmux("jig-orch")
+        line = self.first_line(tmux)
+        self.assertEqual(line, f"jig-orch · {USER} · no git · Opus")
+        self.assertNotIn("reviewer", line)
+        self.assertEqual(self.name_calls(log), ["display-message -p -t %7 #S"])
+        self.assertIn("rename-window -t %7 rev:no git", log.read_text().splitlines())
+
+    def test_a_units_session_name_names_line_one_and_the_context_file_from_one_call(self):
+        # A unit's session, with the context figures in the input: the one call for the
+        # name gives both line 1 and the name of the context file.
+        session = "-".join(["demo", "impl", "u" + "4k"])
+        self.write_policy("Opus", role="implementer")
+        tmux, log = self.fake_tmux(session)
+        line = self.first_line(tmux, dict(self.data, context_window=FIGURES))
+        self.assertEqual(line, f"{session} · {USER} · no git · Opus")
+        self.assertEqual(json.loads((self.ctx / f"{session}.json").read_text())["session"],
+                         session)
+        self.assertEqual(len(self.name_calls(log)), 1)
+
+    def test_no_name_from_tmux_gives_the_role_then_the_user(self):
+        # A call that fails even though it printed a name, one that prints nothing or
+        # only white space, and a tmux command that does not exist each leave out the
+        # session name; the tool still exits 0, which the run checks.
+        self.write_policy("Opus", role="reviewer")
+        for action in ("echo jig-orch; exit 1", "exit 0", "echo '  '"):
+            tmux, _ = self.fake_tmux_that(action)
+            self.assertEqual(self.first_line(tmux), f"reviewer · {USER} · no git · Opus", action)
+        missing = self.tmp / "no-such-tmux"
+        self.assertEqual(self.first_line(missing), f"reviewer · {USER} · no git · Opus")
+
+    def test_no_name_and_no_role_starts_with_the_user(self):
+        # No policy rule matches and tmux fails: line 1 starts with the user name.
+        tmux, _ = self.fake_tmux_that("echo jig-orch; exit 1")
+        self.assertEqual(self.first_line(tmux), f"{USER} · no git · Opus")
+
+    def test_outside_tmux_the_role_comes_first_and_tmux_is_never_called(self):
+        # With TMUX not set, a fake tmux that would name a session is never run, and
+        # line 1 starts with the role and then the user.
+        self.write_policy("Opus", role="reviewer")
+        tmux, log = self.fake_tmux("jig-orch")
+        out = self.statusline(self.data, TMUX_BIN=str(tmux), CTX_DIR=str(self.ctx))
+        self.assertEqual(out.split("\n")[0], f"reviewer · {USER} · no git · Opus")
+        self.assertFalse(log.exists())
+
+    def test_a_stuck_tmux_holds_the_status_line_no_longer_than_its_limit_per_call(self):
+        # Two tmux fakes that stop answering, run with the limit lowered in the loaded
+        # tool: one never answers, so the window name and the session name each wait
+        # out the limit; the other gives the window name and then hangs on the rename
+        # and the session name. Each run makes two calls that wait out the limit, line
+        # 1 falls back to the role, and the tool returns normally, so its script exits
+        # 0. A call still on the real limit of 2 s would take far longer than the bound.
+        self.write_policy("Opus", role="reviewer")
+        stuck = "exec sleep 30"
+        stuck_after_the_window_name = (
+            f'case "$*" in *window_name*) echo zsh ;; *) {stuck} ;; esac')
+        for action in (stuck, stuck_after_the_window_name):
+            tmux, _ = self.fake_tmux_that(action)
+            env = self.tool_env(TMUX="/tmp/x,1,0", TMUX_PANE="%7", TMUX_BIN=str(tmux),
+                                CTX_DIR=str(self.ctx))
+            out = io.StringIO()
+            stdin = io.StringIO(json.dumps(self.data))
+            with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                    unittest.mock.patch.object(statusline, "TMUX_LIMIT_S", SHORT_LIMIT), \
+                    unittest.mock.patch.object(sys, "stdin", stdin), \
+                    contextlib.redirect_stdout(out):
+                start = time.monotonic()
+                statusline.main()
+                took = time.monotonic() - start
+            self.assertEqual(out.getvalue().split("\n")[0],
+                             f"reviewer · {USER} · no git · Opus", action)
+            waits = 2
+            self.assertLess(took, waits * SHORT_LIMIT + 1.0, f"{action}: {took:.2f} s")
+
+
 class UsageTextTest(unittest.TestCase):
     """The usage text shows placeholders where a sample line would show values."""
 
@@ -836,6 +949,13 @@ class UsageTextTest(unittest.TestCase):
         text = self.usage_text()
         for placeholder in ("$username", "$role", "$branch", "$model", "$effort"):
             self.assertIn(placeholder, text)
+
+    def test_usage_text_gives_line_one_with_the_name_first(self):
+        # The sample of line 1 starts with the name and then the user, and the text
+        # says where the name comes from.
+        text = self.usage_text()
+        self.assertIn("\n    $name · $username · $branch · $model ($effort)\n", text)
+        self.assertIn("display-message -p '#S'", text)
 
     def test_usage_text_shows_no_real_or_invented_value(self):
         # No sample percentage, clock time or model family stands in for a

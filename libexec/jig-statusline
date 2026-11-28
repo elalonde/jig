@@ -6,14 +6,18 @@ usage: jig-statusline < <status JSON>
 Claude Code runs this as the statusLine command of its settings, with no
 arguments, and passes the status JSON on stdin. It prints two lines:
 
-    $username · $role · $branch · $model ($effort)
+    $name · $username · $branch · $model ($effort)
     run $run_time · 5h $five_hour_use ($time_left · $reset_time) · wk $week_use
       · pace $pace · health: $fail_count FAIL · model: $model ≠ $expected_model
 
 (the second line is shown here on two lines; the tool prints it on one).
 
-Line 1 is the account's user name, the role (from the matching policy rule;
-left out without one), the git branch of the session's directory ("no git"
+Line 1 starts with $name, the name of the session as jig names it: inside tmux
+(TMUX set), the name of the pane's tmux session, whatever that name is; else,
+or when tmux gives no name, the role from the matching policy rule; left out
+when there is neither. The role is shown only as $name, never beside a tmux
+session name, so outside tmux the role comes before the user name. Then come
+the account's user name, the git branch of the session's directory ("no git"
 outside a repository, the short commit when detached), the model and the
 effort (left out when the input has none). Line 2 is left out when it would be
 empty. Each line is cut to 99 columns; a long branch is shortened first, so
@@ -38,8 +42,9 @@ breaks the host's model policy, a TOML file of [[rule]] tables. The first rule
 whose user, cwd (a path prefix of the session's resolved directory) and
 optional phase (the PHASE file at or above that directory) match decides; the
 model's display name must contain one of its expect strings. The rule's
-optional role string is shown on line 1. No file, no matching rule or an
-invalid file means no role and no warning.
+optional role string is $name on line 1 when tmux gives no session name, and
+names the tmux window. No file, no matching rule or an invalid file means no
+role and no warning.
 
 Host config: the two host paths come from /srv/jig/statusline.conf, one
 KEY=value per line, with the keys HEALTH_FILE (the result file of the health
@@ -77,6 +82,11 @@ Files it writes:
   user name without a role), only when the name differs, and writes the
   context file /run/jig/ctx/$tmux_session.json (CTX_DIR overrides the
   directory), which jig ctx reads. TMUX_BIN overrides the tmux command.
+  One call, tmux display-message -p '#S' (with -t $TMUX_PANE when TMUX_PANE
+  is set), gives the session name for both line 1 and the context file. A
+  call that fails, prints nothing or takes longer than 2 s gives no name, and
+  every call of the tmux command has that limit. Outside tmux the tool never
+  runs the tmux command.
 
 Exit code: 0 always. A status line that fails would leave the session without
 one, so a bad input, a bad config file or a file it cannot write still gives
@@ -103,6 +113,10 @@ ROLE_SHORT = {"spec writer": "spec", "implementer": "impl", "reviewer": "rev"}
 CONFIG_FILE = "/srv/jig/statusline.conf"
 CONFIG_KEYS = ("HEALTH_FILE", "MODEL_POLICY")
 CTX_DIR = "/run/jig/ctx"
+# Each call of the tmux command gives up after this many seconds. Claude Code waits
+# for the status line, so a stuck tmux server must not hold it; every call shares
+# this one value, which the tests lower.
+TMUX_LIMIT_S = 2.0
 
 
 def read_config(path: str) -> dict:
@@ -412,10 +426,13 @@ def fit(text: str) -> str:
     return text if len(text) <= MAX_COLS else text[:MAX_COLS - 1] + "…"
 
 
-def identity(user: str, role: str, branch: str, model: str) -> str:
-    """Return line 1; a long branch is shortened so that the model stays visible."""
+def identity(name: str, user: str, branch: str, model: str) -> str:
+    """Return line 1; a long branch is shortened so that the model stays visible.
+
+    name is the tmux session name, or else the policy role, or empty.
+    """
     def build(b):
-        return " · ".join(p for p in (user, role, b, model) if p)
+        return " · ".join(p for p in (name, user, b, model) if p)
     line = build(branch)
     over = len(line) - MAX_COLS
     if over > 0 and len(branch) > over + 1:
@@ -430,11 +447,32 @@ def rename_window(name: str, tmux: str) -> None:
     t = ["-t", target] if target else []
     try:
         cur = subprocess.run([tmux, "display-message", "-p", *t, "#{window_name}"],
-                             capture_output=True, text=True, timeout=2)
+                             capture_output=True, text=True, errors="replace",
+                             timeout=TMUX_LIMIT_S)
         if cur.returncode == 0 and cur.stdout.rstrip("\n") != name:
-            subprocess.run([tmux, "rename-window", *t, name], capture_output=True, timeout=2)
-    except (OSError, subprocess.SubprocessError):
+            subprocess.run([tmux, "rename-window", *t, name], capture_output=True,
+                           timeout=TMUX_LIMIT_S)
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass  # a status line must not fail over tmux
+
+
+def tmux_session(tmux: str) -> str:
+    """Return the name of this pane's tmux session, or "" when tmux gives none.
+
+    tmux answers for the pane in TMUX_PANE; without it, for the session that tmux
+    picks. A call that fails, prints nothing, cannot start or takes longer than
+    TMUX_LIMIT_S gives "", so that line 1 falls back to the policy role.
+    """
+    import subprocess  # only paid inside tmux
+    target = os.environ.get("TMUX_PANE")
+    t = ["-t", target] if target else []
+    try:
+        r = subprocess.run([tmux, "display-message", "-p", *t, "#S"],
+                           capture_output=True, text=True, errors="replace",
+                           timeout=TMUX_LIMIT_S)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def render(data: dict, now: float, previous: dict | None = None) -> tuple[str, dict | None]:
@@ -497,8 +535,8 @@ def render(data: dict, now: float, previous: dict | None = None) -> tuple[str, d
     return " · ".join(parts), usage
 
 
-def write_ctx(data: dict, ctx_dir: str, tmux: str) -> None:
-    """Write jig's context file, <ctx_dir>/<tmux session>.json.
+def write_ctx(data: dict, ctx_dir: str, session: str) -> None:
+    """Write jig's context file, <ctx_dir>/<session>.json, for the tmux session named.
 
     jig ctx reads this file to see how full a session's context is, so that a
     session can stop before the harness compacts it. The shape is the one jig
@@ -517,19 +555,9 @@ def write_ctx(data: dict, ctx_dir: str, tmux: str) -> None:
         return
     if not os.path.isdir(ctx_dir):
         return
-    import subprocess  # only paid inside tmux
-    target = os.environ.get("TMUX_PANE")
-    t = ["-t", target] if target else []
-    try:
-        r = subprocess.run([tmux, "display-message", "-p", *t, "#S"],
-                           capture_output=True, text=True, timeout=2)
-    except (OSError, subprocess.SubprocessError):
-        return
-    session = r.stdout.strip()
     # The name becomes a file name, so it may not climb out of the directory or
     # hide as a dot file.
-    if r.returncode != 0 or not session or "/" in session \
-            or session.startswith("."):
+    if not session or "/" in session or session.startswith("."):
         return
     zone = time.strftime("%z")
     record = {"session": session, "total_input_tokens": int(tokens),
@@ -583,16 +611,21 @@ def main() -> None:
     model = model_name(data)
     cwd = data.get("cwd") or workspace_dir(data)
     branch = git_branch(os.path.realpath(cwd)) if isinstance(cwd, str) else "no git"
-    print(identity(user, role, branch, model))
+    session = ""
+    in_tmux = bool(os.environ.get("TMUX"))
+    if in_tmux:
+        tmux = os.environ.get("TMUX_BIN") or "tmux"
+        # The window keeps its name from the role, whatever line 1 shows.
+        short = ROLE_SHORT.get(role, role) or user
+        rename_window(f"{short}:{branch}", tmux)
+        session = tmux_session(tmux)
+    print(identity(session or role, user, branch, model))
     h = health(paths["HEALTH_FILE"], now) if paths["HEALTH_FILE"] else ""
     second = " · ".join(p for p in (run_time(data), line, h, warning) if p)
     if second:
         print(fit(second))
-    if os.environ.get("TMUX"):
-        short = ROLE_SHORT.get(role, role) or user
-        tmux = os.environ.get("TMUX_BIN") or "tmux"
-        rename_window(f"{short}:{branch}", tmux)
-        write_ctx(data, os.environ.get("CTX_DIR") or CTX_DIR, tmux)
+    if in_tmux:
+        write_ctx(data, os.environ.get("CTX_DIR") or CTX_DIR, session)
 
 
 if __name__ == "__main__":
