@@ -915,21 +915,38 @@ class SessionNameTest(StatuslineTestCase):
         # Two tmux fakes that stop answering, run with the limit lowered in the loaded
         # tool: one never answers, so the window name and the session name each wait
         # out the limit; the other gives the window name and then hangs on the rename
-        # and the session name. Each run makes two calls that wait out the limit, line
-        # 1 falls back to the role, and the tool returns normally, so its script exits
-        # 0. A call still on the real limit of 2 s would take far longer than the bound.
+        # and the session name. Each run makes two calls that are cut at the lowered
+        # limit, line 1 falls back to the role, and the tool returns normally, so its
+        # script exits 0. Every tmux call is watched: each must carry the limit in
+        # force, so a call still on the real limit of 2 s, or on none, fails at once,
+        # whatever the load of the host. A fake tmux hangs for 60 s; the cap of 30 s is
+        # reached only when a call is not cut at all.
         self.write_policy("Opus", role="reviewer")
-        stuck = "exec sleep 30"
+        stuck = "exec sleep 60"
         stuck_after_the_window_name = (
             f'case "$*" in *window_name*) echo zsh ;; *) {stuck} ;; esac')
+        real_run = subprocess.run
         for action in (stuck, stuck_after_the_window_name):
             tmux, _ = self.fake_tmux_that(action)
             env = self.tool_env(TMUX="/tmp/x,1,0", TMUX_PANE="%7", TMUX_BIN=str(tmux),
                                 CTX_DIR=str(self.ctx))
             out = io.StringIO()
             stdin = io.StringIO(json.dumps(self.data))
+            calls = []
+
+            def watched(command, *args, **kwargs):
+                # Notes the limit of each tmux call and whether it answered or was cut.
+                try:
+                    result = real_run(command, *args, **kwargs)
+                except subprocess.TimeoutExpired:
+                    calls.append((kwargs.get("timeout"), "cut"))
+                    raise
+                calls.append((kwargs.get("timeout"), "answered"))
+                return result
+
             with unittest.mock.patch.dict(os.environ, env, clear=True), \
                     unittest.mock.patch.object(statusline, "TMUX_LIMIT_S", SHORT_LIMIT), \
+                    unittest.mock.patch.object(subprocess, "run", watched), \
                     unittest.mock.patch.object(sys, "stdin", stdin), \
                     contextlib.redirect_stdout(out):
                 start = time.monotonic()
@@ -937,8 +954,10 @@ class SessionNameTest(StatuslineTestCase):
                 took = time.monotonic() - start
             self.assertEqual(out.getvalue().split("\n")[0],
                              f"reviewer · {USER} · no git · Opus", action)
-            waits = 2
-            self.assertLess(took, waits * SHORT_LIMIT + 1.0, f"{action}: {took:.2f} s")
+            self.assertTrue(calls, action)
+            self.assertEqual({limit for limit, _ in calls}, {SHORT_LIMIT}, action)
+            self.assertEqual([how for _, how in calls].count("cut"), 2, (action, calls))
+            self.assertLess(took, 30, f"{action}: {took:.2f} s")
 
 
 class UsageTextTest(unittest.TestCase):

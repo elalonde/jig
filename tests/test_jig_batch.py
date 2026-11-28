@@ -391,8 +391,10 @@ class BatchCloseTest(BatchCase):
     def test_a_close_in_another_account_ends_jig_wait_and_starts_it_again(self):
         # The first unit runs as specwriter, the second as implementer. The first's
         # close falls due during the second's wait: that wait is ended, the close
-        # runs, and a new wait sees the report. The first wait would have slept 5 s.
-        self.control("sleep/wait-u2", "5 0")
+        # runs, and a new wait sees the report. The first wait would have slept 60 s, so
+        # a batch that ends well within that cannot have waited it out; the cap of 30 s
+        # leaves room for a loaded host and is reached only when the wait is not ended.
+        self.control("sleep/wait-u2", "60 0")
         began = time.monotonic()
         result = self.batch(self.row("u1", account="specwriter", role="spec"),
                             self.row("u2"), delay="1")
@@ -400,7 +402,7 @@ class BatchCloseTest(BatchCase):
         self.assertEqual(self.calls(), ["start u1", "wait u1", "report u1",
                                         "start u2", "wait u2", "ended wait u2", "close u1",
                                         "wait u2", "report u2", "close u2"])
-        self.assertLess(time.monotonic() - began, 5)
+        self.assertLess(time.monotonic() - began, 30)
         self.assertIn("ended jig wait on u2 for a close that fell due", result.stdout)
         start_u2 = self.start_lines()[1]
         self.assertIn("role=impl", start_u2)
